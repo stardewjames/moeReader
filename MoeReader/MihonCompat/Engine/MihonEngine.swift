@@ -401,7 +401,14 @@ final class MihonEngine: @unchecked Sendable {
         guard let cls = runtime.classOf(source), let method = cls.lookupVirtual(key: "getFilterList()Leu/kanade/tachiyomi/source/model/FilterList;") else {
             return runtime.makeFilterList([])
         }
-        return (try? runtime.invoke(method, [source])) ?? runtime.makeFilterList([])
+        let launched = runtime.launchedCoroutines
+        let list = (try? runtime.invoke(method, [source])) ?? runtime.makeFilterList([])
+        // Sources that fetch filter data from `getFilterList` launch the fetch
+        // and return a placeholder list. Launched coroutines finish before
+        // `launch` returns here, so read the list once more to pick up the
+        // fetched data; filter tree and search then see the same filters.
+        guard runtime.launchedCoroutines != launched else { return list }
+        return (try? runtime.invoke(method, [source])) ?? list
     }
 
     private func mangasPage(_ value: VMValue, source: VMValue) throws -> (items: [MihonManga], hasMore: Bool) {

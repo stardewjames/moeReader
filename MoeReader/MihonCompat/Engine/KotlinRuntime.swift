@@ -531,10 +531,21 @@ enum KotlinRuntime {
         buildScope.staticMethod("delay", "(JLjava/util/concurrent/TimeUnit;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .zero }
         buildScope.staticMethod("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .zero }
         buildScope.staticMethod("launch$default", "(Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lkotlinx/coroutines/CoroutineStart;Lkotlin/jvm/functions/Function2;ILjava/lang/Object;)Lkotlinx/coroutines/Job;") { runtime, args, _ in
+            runtime.launchedCoroutines += 1
             _ = try runtime.callSuspend(args[3], args[0])
             return runtime.makeNative("Lkotlinx/coroutines/JobImpl;", payload: NSNull())
         }
         result.append(buildScope)
+
+        let globalScope = NativeClass("Lkotlinx/coroutines/GlobalScope;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/coroutines/CoroutineScope;"])
+        globalScope.staticField("INSTANCE", "Lkotlinx/coroutines/GlobalScope;")
+        globalScope.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lkotlinx/coroutines/GlobalScope;", payload: NSNull())
+        }
+        globalScope.method("getCoroutineContext", "()Lkotlin/coroutines/CoroutineContext;") { runtime, _, _ in
+            runtime.findClass("Lkotlin/coroutines/EmptyCoroutineContext;").map { $0.staticValues[0] } ?? .null
+        }
+        result.append(globalScope)
 
         let scopeKt = NativeClass("Lkotlinx/coroutines/CoroutineScopeKt;")
         scopeKt.staticMethod("coroutineScope", "(Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in

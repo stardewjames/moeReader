@@ -56,6 +56,16 @@ final class VMHttpUrlPayload {
     }
     init(components: URLComponents) { self.components = components }
 
+    /// `HttpUrl.parse` semantics: only absolute http(s) URLs with a host are
+    /// URLs; anything else (a search term, a relative path) is not.
+    static func parse(_ text: String) -> VMHttpUrlPayload? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = components.host, !host.isEmpty else { return nil }
+        return VMHttpUrlPayload(components: components)
+    }
+
     var string: String { components.string ?? "" }
     var host: String { components.host ?? "" }
     var scheme: String { components.scheme ?? "https" }
@@ -531,24 +541,24 @@ enum OkHttpRuntime {
         let urlKt = NativeClass("Lokhttp3/HttpUrlKt;")
         urlKt.staticMethod("toHttpUrl", "(Ljava/lang/String;)Lokhttp3/HttpUrl;") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
-            guard URL(string: text) != nil else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Invalid URL: \(text)") }
-            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: VMHttpUrlPayload(text))
+            guard let payload = VMHttpUrlPayload.parse(text) else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Invalid URL: \(text)") }
+            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: payload)
         }
         urlKt.staticMethod("toHttpUrlOrNull", "(Ljava/lang/String;)Lokhttp3/HttpUrl;") { runtime, args, _ in
-            guard let text = runtime.stringValue(args[0]), URL(string: text) != nil else { return .null }
-            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: VMHttpUrlPayload(text))
+            guard let payload = VMHttpUrlPayload.parse(runtime.stringValue(args[0]) ?? "") else { return .null }
+            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: payload)
         }
         let companion = NativeClass("Lokhttp3/HttpUrl$Companion;", superclass: "Ljava/lang/Object;")
         companion.method("get", "(Ljava/lang/String;)Lokhttp3/HttpUrl;") { runtime, args, _ in
             let text = runtime.stringValue(args[1]) ?? ""
-            guard URL(string: text) != nil else {
+            guard let payload = VMHttpUrlPayload.parse(text) else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Invalid URL: \(text)")
             }
-            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: VMHttpUrlPayload(text))
+            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: payload)
         }
         companion.method("parse", "(Ljava/lang/String;)Lokhttp3/HttpUrl;") { runtime, args, _ in
-            guard let text = runtime.stringValue(args[1]), URL(string: text) != nil else { return .null }
-            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: VMHttpUrlPayload(text))
+            guard let payload = VMHttpUrlPayload.parse(runtime.stringValue(args[1]) ?? "") else { return .null }
+            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: payload)
         }
         return [url, builder, companion, urlKt]
     }

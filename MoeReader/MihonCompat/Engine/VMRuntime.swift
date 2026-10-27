@@ -16,12 +16,13 @@ protocol VMHost: AnyObject {
     /// Called once when a response looks like a Cloudflare interstitial. Return
     /// true after the challenge has been cleared (cookies now available).
     func solveChallenge(_ request: VMHTTPRequest) throws -> Bool
+    /// Per-extension writable directory used by `java.io.File` and okio.
+    func extensionFileRoot() -> String
 }
 
 extension VMHost {
     func solveChallenge(_ request: VMHTTPRequest) throws -> Bool { false }
-    /// Per-extension writable directory used by `java.io.File` and okio.
-    /// Hosts may override this to keep extension data inside the app sandbox.
+    /// Default file root for hosts without their own sandbox location.
     func extensionFileRoot() -> String {
         (NSTemporaryDirectory() as NSString).appendingPathComponent("mihoncompat")
     }
@@ -88,6 +89,9 @@ final class VMRuntime: @unchecked Sendable {
 
     private var fallbackClass: VMClass?
     var coroutineSuspendedValue: VMValue?
+    /// Coroutines started with `launch`. They run to completion before
+    /// `launch` returns, so a caller can tell when a call did background work.
+    var launchedCoroutines = 0
     var currentFrame = ""
     var genericDescriptorValue: VMValue?
     var jsonKindValue: VMValue?

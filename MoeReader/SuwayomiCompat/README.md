@@ -98,6 +98,10 @@ struct MyRuntime: MihonSourceRuntime {
 extension record already carries the verified package, version, and source
 languages; a runtime uses those values rather than trusting loose metadata.
 
+Page numbers follow the Mihon source API: the browse screen requests page 1
+first and increments from there. Sources commonly derive offsets as
+`(page - 1) * limit`, so page 0 produces invalid requests.
+
 Runtimes may also implement `MihonSourceFilterProviding` to expose the
 extension's filters and accept selected values for a search. The engine runtime
 implements it; the browse screen falls back to plain search when a runtime does

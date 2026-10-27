@@ -18,10 +18,25 @@ final class VMFilePayload {
 final class VMOkioSinkPayload {
     let path: String?
     let append: Bool
+    /// Filtering sinks (e.g. zstd) encode pending bytes into `downstream` on
+    /// flush instead of writing a file.
+    let downstream: VMOkioSinkPayload?
+    let encode: ((Data) -> Data)?
+    /// A non-appending file sink truncates on its first flush only; later
+    /// flushes append, matching an open FileOutputStream.
+    var truncated = false
     var data = Data()
     init(path: String?, append: Bool) {
         self.path = path
         self.append = append
+        self.downstream = nil
+        self.encode = nil
+    }
+    init(downstream: VMOkioSinkPayload, encode: @escaping (Data) -> Data) {
+        self.path = nil
+        self.append = true
+        self.downstream = downstream
+        self.encode = encode
     }
 }
 
@@ -519,13 +534,24 @@ enum FileRuntime {
     }
 
     private static func write(_ sink: VMOkioSinkPayload) {
+        if let downstream = sink.downstream {
+            if !sink.data.isEmpty, let encode = sink.encode {
+                downstream.data.append(encode(sink.data))
+            }
+            write(downstream)
+            downstream.data.removeAll()
+            return
+        }
         guard let path = sink.path else { return }
         let url = URL(fileURLWithPath: path)
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        if sink.append, let existing = try? Data(contentsOf: url) {
+        let replaces = !sink.append && !sink.truncated
+        sink.truncated = true
+        if !replaces, let existing = try? Data(contentsOf: url) {
+            guard !sink.data.isEmpty else { return }
             try? (existing + sink.data).write(to: url, options: .atomic)
         } else {
             try? sink.data.write(to: url, options: .atomic)

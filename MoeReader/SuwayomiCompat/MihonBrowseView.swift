@@ -10,7 +10,8 @@ struct MihonBrowseView: View {
     @State private var query = ""
     @State private var searchGeneration = 0
     @State private var items: [MihonManga] = []
-    @State private var page = 0
+    /// Next page to request. Mihon sources number pages from 1.
+    @State private var page = 1
     @State private var hasMore = true
     @State private var isLoading = false
     @State private var errorMessage: String?
@@ -231,7 +232,7 @@ struct MihonBrowseView: View {
 
     private func load(reset: Bool, runtime: any MihonSourceRuntime) async {
         if reset {
-            page = 0
+            page = 1
             hasMore = true
             errorMessage = nil
         }

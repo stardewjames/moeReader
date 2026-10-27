@@ -534,6 +534,70 @@ final class MihonAPIContractTests: XCTestCase {
         XCTAssertTrue(updated[3].ascending)
     }
 
+    func testFilterObjectStateIsBoxedAndDefaultArgumentsApply() throws {
+        let runtime = VMRuntime()
+        func construct(_ descriptor: String, _ signature: String, _ arguments: [VMValue]) throws -> VMValue {
+            let cls = try runtime.linkClass(descriptor)
+            let value = VMValue.reference(runtime.allocateObject(cls))
+            let constructor = try XCTUnwrap(cls.lookupVirtual(key: "<init>" + signature))
+            _ = try runtime.invoke(constructor, [value] + arguments)
+            return value
+        }
+
+        // Kotlin compiles `Filter.Text("Year")` to the default-argument
+        // constructor with mask bit 1 set and a null `state` slot.
+        let text = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$Text;",
+            "(Ljava/lang/String;Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V",
+            [runtime.newString("Year"), .null, .int32(2), .null]
+        )
+        let triState = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$TriState;",
+            "(Ljava/lang/String;I)V",
+            [runtime.newString("Genre"), .int32(2)]
+        )
+        let checkBox = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$CheckBox;",
+            "(Ljava/lang/String;Z)V",
+            [runtime.newString("Adult"), .boolean(true)]
+        )
+        let getState = "getState()Ljava/lang/Object;"
+
+        XCTAssertEqual(runtime.stringValue(try invoke(runtime, text, getState, [])), "")
+        let triValue = try invoke(runtime, triState, getState, [])
+        XCTAssertEqual(runtime.classOf(triValue)?.descriptor, "Ljava/lang/Integer;")
+        XCTAssertEqual(triValue.asBoxedInt(runtime), 2)
+        let checkValue = try invoke(runtime, checkBox, getState, [])
+        XCTAssertEqual(runtime.classOf(checkValue)?.descriptor, "Ljava/lang/Boolean;")
+        XCTAssertTrue(checkValue.asBoolean2())
+
+        _ = try invoke(runtime, triState, "setState(Ljava/lang/Object;)V", [runtime.boxInt(1)])
+        _ = try invoke(runtime, checkBox, "setState(Ljava/lang/Object;)V", [runtime.boxBoolean(false)])
+        let tree = MihonFilters.tree(runtime: runtime, list: runtime.makeFilterList([text, triState, checkBox]))
+        XCTAssertEqual(tree.map(\.value), ["", "1", "false"])
+    }
+
+    func testHttpUrlParsingAcceptsOnlyAbsoluteHttpURLs() throws {
+        let runtime = VMRuntime()
+        let urlClass = try runtime.linkClass("Lokhttp3/HttpUrl;")
+        try runtime.ensureInitialized(urlClass)
+        let companion = urlClass.staticValues[0]
+        let parse = "parse(Ljava/lang/String;)Lokhttp3/HttpUrl;"
+
+        for text in ["solo leveling", "solo", "/manga/1", "ftp://example.test/a", ""] {
+            XCTAssertEqual(try invoke(runtime, companion, parse, [runtime.newString(text)]).bits, 0, text)
+        }
+        let parsed = try invoke(runtime, companion, parse, [runtime.newString(" https://example.test/manga/1?x=y ")])
+        XCTAssertEqual(runtime.payload(parsed, as: VMHttpUrlPayload.self)?.host, "example.test")
+        XCTAssertEqual(runtime.payload(parsed, as: VMHttpUrlPayload.self)?.pathSegments, ["manga", "1"])
+
+        let urlKt = try runtime.linkClass("Lokhttp3/HttpUrlKt;")
+        let toHttpUrl = try XCTUnwrap(urlKt.lookupStatic("toHttpUrl", "(Ljava/lang/String;)Lokhttp3/HttpUrl;"))
+        XCTAssertThrowsError(try runtime.invoke(toHttpUrl, [runtime.newString("solo")])) { error in
+            XCTAssertEqual((error as? VMJavaException)?.classDescriptor, "Ljava/lang/IllegalArgumentException;")
+        }
+    }
+
     // MARK: - Preferences, files, serialization
 
     func testStringSetPreferencesRoundTrip() throws {
@@ -628,6 +692,58 @@ final class MihonAPIContractTests: XCTestCase {
             [file]
         )
         XCTAssertTrue(deleted.asBoolean)
+    }
+
+    func testZstdFileCacheRoundTripsAcrossFlushes() throws {
+        let runtime = VMRuntime()
+        let host = Host()
+        host.root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("MihonAPIContractTests-\(UUID().uuidString)")
+        runtime.host = host
+        defer { try? FileManager.default.removeItem(atPath: host.root) }
+
+        let fileClass = try runtime.linkClass("Ljava/io/File;")
+        let file = VMValue.reference(runtime.allocateObject(fileClass))
+        _ = try runtime.invoke(
+            try XCTUnwrap(fileClass.lookupVirtual(key: "<init>(Ljava/lang/String;)V")),
+            [file, runtime.newString("cache/data.json.zst")]
+        )
+        let okio = try runtime.linkClass("Lokio/Okio;")
+        let zstd = try runtime.linkClass("Lcom/squareup/zstd/okio/OkioZstd;")
+        let fileSink = try runtime.invoke(try XCTUnwrap(okio.lookupStatic("sink", "(Ljava/io/File;)Lokio/Sink;")), [file])
+        let compressing = try runtime.invoke(try XCTUnwrap(zstd.lookupStatic("zstdCompress", "(Lokio/Sink;)Lokio/Sink;")), [fileSink])
+        let sink = try runtime.invoke(try XCTUnwrap(okio.lookupStatic("buffer", "(Lokio/Sink;)Lokio/BufferedSink;")), [compressing])
+        let sinkClass = try XCTUnwrap(runtime.classOf(sink))
+        let write = try XCTUnwrap(sinkClass.lookupVirtual(key: "writeUtf8(Ljava/lang/String;)Lokio/BufferedSink;"))
+        _ = try runtime.invoke(write, [sink, runtime.newString("{\"a\":")])
+        _ = try runtime.invoke(try XCTUnwrap(sinkClass.lookupVirtual(key: "flush()V")), [sink])
+        _ = try runtime.invoke(write, [sink, runtime.newString("1}")])
+        _ = try runtime.invoke(try XCTUnwrap(sinkClass.lookupVirtual(key: "close()V")), [sink])
+
+        let stored = try Data(contentsOf: URL(fileURLWithPath: host.root).appendingPathComponent("cache/data.json.zst"))
+        XCTAssertEqual(Array(stored.prefix(4)), [0x28, 0xB5, 0x2F, 0xFD])
+
+        let fileSource = try runtime.invoke(try XCTUnwrap(okio.lookupStatic("source", "(Ljava/io/File;)Lokio/Source;")), [file])
+        let decompressing = try runtime.invoke(
+            try XCTUnwrap(zstd.lookupStatic("zstdDecompress", "(Lokio/Source;)Lokio/Source;")),
+            [fileSource]
+        )
+        let source = try runtime.invoke(
+            try XCTUnwrap(okio.lookupStatic("buffer", "(Lokio/Source;)Lokio/BufferedSource;")),
+            [decompressing]
+        )
+        let read = try XCTUnwrap(runtime.classOf(source)?.lookupVirtual(key: "readUtf8()Ljava/lang/String;"))
+        XCTAssertEqual(runtime.stringValue(try runtime.invoke(read, [source])), "{\"a\":1}")
+    }
+
+    func testZstdDecoderReadsRLEBlocksAndRejectsCompressedBlocks() throws {
+        // Single-segment frame, content size 5, one last RLE block of "a".
+        let rle = Data([0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05, 0x2B, 0x00, 0x00, 0x61])
+        XCTAssertEqual(try ZstdFrame.decode(rle), Data("aaaaa".utf8))
+        // Same frame shape with an entropy-coded block.
+        let compressed = Data([0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x0D, 0x00, 0x00, 0x00])
+        XCTAssertThrowsError(try ZstdFrame.decode(compressed))
+        XCTAssertEqual(try ZstdFrame.decode(ZstdFrame.encode(Data())), Data())
     }
 
     // MARK: - Surface audit

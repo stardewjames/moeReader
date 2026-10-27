@@ -42,6 +42,7 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/MihonAPI.swift` | `Source`, `HttpSource`, `ParsedHttpSource`, models, filters, `SourceFactory`, network helpers |
 | `Engine/MihonFilters.swift` | FilterList → plain filter tree, selection replay for searches |
 | `Engine/FileRuntime.swift` | `java.io.File`, okio file source/sink/buffer, `kotlin.io.FilesKt.resolve` |
+| `Engine/ZstdRuntime.swift` | `OkioZstd` sink/source over zstd frames (raw-block encoder, raw/RLE decoder) |
 | `Engine/JavaTimeRuntime.swift` | `java.time` subset used for chapter dates |
 | `Engine/SerializationRuntime.swift` | kotlinx.serialization decode: JSON parser, generated/plugin descriptors, builtins, collections, enums, polymorphic fallback |
 | `Engine/PreferencesRuntime.swift` | androidx.preference model exposed to the source settings UI |
@@ -89,14 +90,25 @@ and the suspend lib-1.6 API in practice:
   `Regex` with iterable `MatchResult` and `IntRange` groups, sequences,
   `Duration`, `Instant` (including `parseOrNull`), `kotlin.coroutines`
   internals, and the `kotlinx.coroutines` builders needed by sources
-  (`coroutineScope`, `async`/`await`, `withContext`, `launch`, `delay`).
+  (`coroutineScope`, `async`/`await`, `withContext`, `launch`, `delay`,
+  `GlobalScope`). A launched coroutine runs to completion before `launch`
+  returns. When `getFilterList` launches work (sources that fetch filter data
+  in the background and return a placeholder list), the engine reads the list
+  again so the filter sheet and the search call see the fetched filters.
 - **Android**: `android.net.Uri`, `android.text.Html`, `android.util.Base64`,
   `android.content` shared preferences (including string sets),
   `androidx.preference` controls for source preference screens.
 - **okhttp3**: `Request`/`Response`/`Headers`/`HttpUrl`, calls, client builders,
   interceptor chains, form bodies, cache control, compression markers.
+  `HttpUrl.parse`/`toHttpUrlOrNull` return null (and `get`/`toHttpUrl` throw)
+  for anything but an absolute `http`/`https` URL with a host, so sources that
+  treat a parseable search query as a deep link only do so for real URLs.
 - **okio**: `BufferedSource`, `BufferedSink`, `Source`, `Sink`, `Buffer`, and
-  `Okio` factories over `java.io.File`.
+  `Okio` factories over `java.io.File`. A non-appending file sink truncates on
+  its first flush and appends afterwards. `com.squareup.zstd.okio.OkioZstd`
+  compresses into spec-compliant zstd frames of raw blocks and decompresses
+  raw/RLE-block frames, which covers zstd-framed caches the extension writes
+  itself.
 - **jsoup**: tolerant HTML parser, `Document`/`Element`/`Elements`, text and
   attribute access, a CSS selector engine (`>`, `+`, `~`, `:has`,
   `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), and the
@@ -135,8 +147,10 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   a fresh runtime instead of reusing the removed package.
 - `MihonAPIContractTests` covers the deprecated `HttpSource` request/parse
   defaults, `ParsedHttpSource` selector parsers, legacy `imageUrlParse`
-  resolution, filter tree rehydration, string-set preferences, `java.io.File`
-  with okio, JSON element conversion, and the `HttpSourceKt`/companion helpers.
+  resolution, filter tree rehydration, boxed filter state and default-argument
+  constructors, `HttpUrl` parsing, string-set preferences, `java.io.File` with
+  okio, zstd file caches, JSON element conversion, and the
+  `HttpSourceKt`/companion helpers.
 - `MihonCollectionSemanticsTests` covers live map key/value/entry views,
   array-backed `Arrays.asList`, live sublists and fixed-size mutation errors.
 - `MihonTimeSemanticsTests` covers formatter widths/names/offsets, zoned and
@@ -194,7 +208,7 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 | Image loading inside extensions | `Page.imageUrl`, `getImageUrl`, legacy `imageUrlParse`, and `imageRequest` headers are honoured for reader pages. Extensions that decode or transcode images themselves are not. |
 | Source preference screens | `setupPreferenceScreen` is executed and its controls are rendered by `MihonSourceSettingsView` (headers, toggles, single-choice lists, text, multi-select). Multi-select values persist as string sets in `SharedPreferences`; `setDialogTitle` is used as the text field's placeholder. |
 | Extension lib 1.4/1.5 API | Request/parse-style sources are supported through native `HttpSource` and `ParsedHttpSource` defaults, even when they predate the suspend API. Extensions that override only the RxJava `fetch*` methods still need an Rx host and are not executed. |
-| Zstd response bodies | `com.squareup.zstd.okio` is not linked; servers that require zstd transcoding fail closed with a typed error. |
+| Zstd response bodies | `OkioZstd` reads only raw/RLE-block frames. Entropy-coded zstd (what servers send) fails closed with an `IOException`. |
 | Duplicate response headers | URLSession merges repeated response headers (notably `Set-Cookie`) into one value before the engine sees them; request headers keep duplicates. |
 | Preference change listeners | `setOnPreferenceChangeListener` callbacks are accepted but not invoked; the extension’s next source call sees the stored value instead. |
 | `NetworkHelper.cookieJar` | The Suwayomi-specific `McCookieJar` type is not exposed; `cloudflareClient` and the shared URLSession cookie jar are available. |

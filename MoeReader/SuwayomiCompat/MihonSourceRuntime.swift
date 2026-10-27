@@ -197,6 +197,7 @@ protocol MihonSourceFilterProviding: Sendable {
     ) async throws -> MihonMangaPage
 }
 
+/// Page numbers follow the Mihon source API: the first page is 1.
 protocol MihonSourceRuntime: Sendable {
     var descriptor: MihonRuntimeDescriptor { get }
     func popular(source: MihonSource, page: Int) async throws -> MihonMangaPage

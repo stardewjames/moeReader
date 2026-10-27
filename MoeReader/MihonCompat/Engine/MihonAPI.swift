@@ -80,6 +80,8 @@ final class VMFilterPayload {
 
     var kind: Kind = .header
     var name: VMValue = .null
+    /// Check box, tri-state and select states are stored as primitives
+    /// (`Z`/`I`); `Filter.getState()`/`setState(Object)` box and unbox them.
     var state: VMValue = .null
     var values: VMValue = .null
     var sortSelection: VMValue = .null
@@ -884,7 +886,8 @@ enum MihonAPI {
         cls.method("<init>", "(ILjava/lang/String;Ljava/lang/String;Landroid/net/Uri;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMPagePayload()
             payload.index = args[1].asInt32
-            payload.url = args[2]
+            // Kotlin default-argument mask: bit 1 means `url` was omitted ("").
+            payload.url = args[5].asInt32 & 0x2 != 0 ? runtime.newString("") : args[2]
             payload.imageUrl = args[3]
             payload.uri = args[4]
             runtime.setPayload(args[0], payload)
@@ -1002,10 +1005,20 @@ enum MihonAPI {
             runtime.payload(args[0], as: VMFilterPayload.self)?.name ?? .null
         }
         filter.method("getState", "()Ljava/lang/Object;") { runtime, args, _ in
-            runtime.payload(args[0], as: VMFilterPayload.self)?.state ?? .null
+            guard let payload = runtime.payload(args[0], as: VMFilterPayload.self) else { return .null }
+            switch payload.kind {
+            case .checkbox: return runtime.boxBoolean(payload.state.asBoolean)
+            case .tristate, .select: return runtime.boxInt(payload.state.asInt32)
+            default: return payload.state
+            }
         }
         filter.method("setState", "(Ljava/lang/Object;)V") { runtime, args, _ in
-            try runtime.payloadBox(args[0], as: VMFilterPayload.self).state = args[1]
+            let payload = try runtime.payloadBox(args[0], as: VMFilterPayload.self)
+            switch payload.kind {
+            case .checkbox: payload.state = .boolean(args[1].asBoolean2())
+            case .tristate, .select: payload.state = .int32(args[1].asBoxedInt(runtime))
+            default: payload.state = args[1]
+            }
             return .zero
         }
         filter.method("<init>", "(Ljava/lang/String;Ljava/lang/Object;)V") { runtime, args, _ in
@@ -1056,7 +1069,8 @@ enum MihonAPI {
         separator.method("<init>", "(Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
             payload.kind = .separator
-            payload.name = args[1]
+            // Kotlin default-argument mask: bit 0 means `name` was omitted ("").
+            payload.name = args[2].asInt32 & 0x1 != 0 ? runtime.newString("") : args[1]
             runtime.setPayload(args[0], payload)
             return .zero
         }
@@ -1082,7 +1096,8 @@ enum MihonAPI {
             let payload = VMFilterPayload()
             payload.kind = .text
             payload.name = args[1]
-            payload.state = args[2]
+            // Kotlin default-argument mask: bit 1 means `state` was omitted ("").
+            payload.state = args[3].asInt32 & 0x2 != 0 ? runtime.newString("") : args[2]
             runtime.setPayload(args[0], payload)
             return .zero
         }

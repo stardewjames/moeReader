@@ -36,6 +36,7 @@ enum NativeLibrary {
         result += JavaTimeRuntime.classes()
         result += JavaShared.classes()
         result += FileRuntime.classes()
+        result += ZstdRuntime.classes()
         return result
     }
 }
