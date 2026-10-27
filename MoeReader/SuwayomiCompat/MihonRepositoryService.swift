@@ -53,7 +53,11 @@ struct MihonRepositoryService: Sendable {
         }
 
         let response = try await http.fetch(
-            MihonHTTPRequest(url: indexURL, headers: headers)
+            MihonHTTPRequest(
+                url: indexURL,
+                headers: headers,
+                maxBytes: MihonIndexDecoder.maximumIndexBytes
+            )
         )
         if response.statusCode == 304 {
             return (MihonIndex(), response.headers["etag"] ?? etag, response.headers["last-modified"] ?? lastModified, true)
@@ -70,9 +74,20 @@ struct MihonRepositoryService: Sendable {
 
         var index = try MihonIndexDecoder.decode(response.data, indexURL: indexURL)
         if index.extensions.isEmpty, let listURL = index.extensionListURL {
-            let listResponse = try await http.fetch(MihonHTTPRequest(url: listURL))
+            guard listURL.scheme?.lowercased() == "https" else {
+                throw MihonError.invalidRepositoryURL(listURL.absoluteString)
+            }
+            let listResponse = try await http.fetch(
+                MihonHTTPRequest(url: listURL, maxBytes: MihonIndexDecoder.maximumIndexBytes)
+            )
             guard listResponse.isSuccess else {
                 throw MihonError.httpStatus(listResponse.statusCode)
+            }
+            guard listResponse.url.scheme?.lowercased() == "https" else {
+                throw MihonError.invalidRepositoryURL(listResponse.url.absoluteString)
+            }
+            guard listResponse.data.count <= MihonIndexDecoder.maximumIndexBytes else {
+                throw MihonError.indexTooLarge(listResponse.data.count)
             }
             let listIndex = try MihonIndexDecoder.decode(listResponse.data, indexURL: listURL)
             index.extensions = listIndex.extensions
@@ -147,7 +162,7 @@ struct MihonRepositoryService: Sendable {
             throw MihonError.untrustedRepository
         }
         let response = try await http.fetch(
-            MihonHTTPRequest(url: extensionValue.apkURL)
+            MihonHTTPRequest(url: extensionValue.apkURL, maxBytes: MihonAPKVerifier.maxAPKBytes)
         )
         guard response.isSuccess else {
             throw MihonError.httpStatus(response.statusCode)

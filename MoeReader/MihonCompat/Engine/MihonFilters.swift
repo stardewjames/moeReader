@@ -14,7 +14,7 @@ enum MihonFilters {
     static func tree(runtime: VMRuntime, list: VMValue) -> [MihonFilter] {
         let items = runtime.listItems(list) ?? []
         return items.enumerated().compactMap { index, item in
-            convert(runtime, value: item, path: String(index))
+            convert(runtime, value: item, path: String(index), depth: 0)
         }
     }
 
@@ -26,11 +26,12 @@ enum MihonFilters {
         guard !selections.isEmpty else { return }
         let items = runtime.listItems(list) ?? []
         for (index, item) in items.enumerated() {
-            apply(runtime, value: item, path: String(index), selections: selections)
+            apply(runtime, value: item, path: String(index), selections: selections, depth: 0)
         }
     }
 
-    private static func convert(_ runtime: VMRuntime, value: VMValue, path: String) -> MihonFilter? {
+    private static func convert(_ runtime: VMRuntime, value: VMValue, path: String, depth: Int) -> MihonFilter? {
+        guard depth < 32 else { return nil }
         guard let payload: VMFilterPayload = runtime.payload(value, as: VMFilterPayload.self) else { return nil }
         let name = runtime.stringValue(payload.name) ?? ""
         var filter = MihonFilter(id: path, name: name, kind: MihonFilter.Kind(rawValue: payload.kind.rawValue) ?? .header)
@@ -62,7 +63,7 @@ enum MihonFilters {
         case .group:
             let children = runtime.listItems(payload.state) ?? []
             filter.children = children.enumerated().compactMap { index, child in
-                convert(runtime, value: child, path: "\(path).\(index)")
+                convert(runtime, value: child, path: "\(path).\(index)", depth: depth + 1)
             }
         }
         return filter
@@ -72,13 +73,14 @@ enum MihonFilters {
         _ runtime: VMRuntime,
         value: VMValue,
         path: String,
-        selections: [String: MihonFilterSelection]
+        selections: [String: MihonFilterSelection],
+        depth: Int
     ) {
-        guard let payload: VMFilterPayload = runtime.payload(value, as: VMFilterPayload.self) else { return }
+        guard depth < 32, let payload: VMFilterPayload = runtime.payload(value, as: VMFilterPayload.self) else { return }
         if payload.kind == .group {
             let children = runtime.listItems(payload.state) ?? []
             for (index, child) in children.enumerated() {
-                apply(runtime, value: child, path: "\(path).\(index)", selections: selections)
+                apply(runtime, value: child, path: "\(path).\(index)", selections: selections, depth: depth + 1)
             }
             return
         }

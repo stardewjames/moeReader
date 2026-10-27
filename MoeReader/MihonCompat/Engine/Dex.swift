@@ -283,8 +283,14 @@ final class DexFile: @unchecked Sendable {
             }
             var parameters: [String] = []
             if parametersOffset != 0 {
+                guard parametersOffset >= 0, parametersOffset + 4 <= buffer.count else {
+                    throw DexError("\(name): truncated proto parameter list")
+                }
                 let parameterCount = Int(buffer.u32(parametersOffset))
-                guard parameterCount >= 0, parameterCount < 255 * 8 else { throw DexError("\(name): bad proto parameters") }
+                guard parameterCount >= 0, parameterCount < 255 * 8,
+                      parametersOffset + 4 + parameterCount * 2 <= buffer.count else {
+                    throw DexError("\(name): bad proto parameters")
+                }
                 parameters.reserveCapacity(parameterCount)
                 for parameter in 0..<parameterCount {
                     let typeIndex = Int(buffer.u16(parametersOffset + 4 + parameter * 2))
@@ -402,13 +408,17 @@ final class DexFile: @unchecked Sendable {
         let classDataOffset = Int(buffer.u32(base + 24))
 
         let descriptor = types[classIndex]
-        let superclass: String? = superclassIndex == Int(UInt32.max) ? nil : types[superclassIndex]
+        let superclass: String? = superclassIndex == Int(UInt32.max) || superclassIndex >= types.count
+            ? nil
+            : types[superclassIndex]
         var interfaces: [String] = []
-        if interfacesOffset != 0 {
+        if interfacesOffset != 0, interfacesOffset + 4 <= buffer.count {
             let count = Int(buffer.u32(interfacesOffset))
-            if count > 0 {
-                interfaces.reserveCapacity(min(count, 256))
-                for item in 0..<count {
+            let available = max(0, (buffer.count - interfacesOffset - 4) / 2)
+            let safeCount = min(min(count, available), 256)
+            if safeCount > 0 {
+                interfaces.reserveCapacity(safeCount)
+                for item in 0..<safeCount {
                     let typeIndex = Int(buffer.u16(interfacesOffset + 4 + item * 2))
                     if typeIndex < types.count { interfaces.append(types[typeIndex]) }
                 }
@@ -522,6 +532,7 @@ final class DexFile: @unchecked Sendable {
             for _ in 0..<max(0, min(listCount, 4096)) {
                 let listStart = listCursor
                 let size = readSleb(&listCursor)
+                guard abs(size) <= 4096 else { break }
                 var typed: [(String?, Int)] = []
                 typed.reserveCapacity(abs(size))
                 for _ in 0..<abs(size) {

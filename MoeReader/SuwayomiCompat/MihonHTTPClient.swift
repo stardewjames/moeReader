@@ -8,6 +8,8 @@ struct MihonHTTPRequest: Sendable {
     var method: String = "GET"
     var headers: [String: String] = [:]
     var body: Data?
+    /// Reject responses larger than this many bytes before buffering them.
+    var maxBytes: Int? = nil
 }
 
 struct MihonHTTPResponse: Sendable {
@@ -34,6 +36,8 @@ struct MihonHTTPClient: MihonHTTPFetching {
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout * 2
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.httpCookieStorage = .shared
+        configuration.httpShouldSetCookies = true
         configuration.httpAdditionalHeaders = [
             "User-Agent": "MoeReader/1.0 (iOS; MihonCompat)",
             "Accept": "application/octet-stream, application/x-protobuf, application/json;q=0.9, */*;q=0.8",
@@ -42,6 +46,11 @@ struct MihonHTTPClient: MihonHTTPFetching {
     }
 
     func fetch(_ request: MihonHTTPRequest) async throws -> MihonHTTPResponse {
+        guard let scheme = request.url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              request.url.host() != nil else {
+            throw MihonError.network("Unsupported URL: \(request.url.absoluteString)")
+        }
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
         urlRequest.httpBody = request.body
@@ -52,7 +61,23 @@ struct MihonHTTPClient: MihonHTTPFetching {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: urlRequest)
+            if let maxBytes = request.maxBytes {
+                // Download to a temporary file first so a chunked or lying
+                // server cannot force the app to buffer an unbounded body.
+                let (fileURL, downloaded) = try await session.download(for: urlRequest)
+                defer { try? FileManager.default.removeItem(at: fileURL) }
+                let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+                let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+                guard size <= maxBytes else {
+                    throw MihonError.responseTooLarge(size)
+                }
+                data = try Data(contentsOf: fileURL)
+                response = downloaded
+            } else {
+                (data, response) = try await session.data(for: urlRequest)
+            }
+        } catch let error as MihonError {
+            throw error
         } catch let error as URLError where error.code == .cancelled {
             throw CancellationError()
         } catch {

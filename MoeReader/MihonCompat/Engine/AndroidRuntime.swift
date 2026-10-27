@@ -240,7 +240,8 @@ enum AndroidRuntime {
             runtime.makeNative("Lmihoncompat/EditorImpl;", payload: VMEditorPayload(preferences: runtime.host?.preferences() ?? VMInMemoryPreferences()))
         }
         application.method("contains", "(Ljava/lang/String;)Z") { runtime, args, _ in
-            .boolean((runtime.host?.preferences() ?? VMInMemoryPreferences()).string(forKey: runtime.stringValue(args[1]) ?? "") != nil)
+            let prefs = runtime.host?.preferences() ?? VMInMemoryPreferences()
+            return .boolean(prefs.allKeys().contains(runtime.stringValue(args[1]) ?? ""))
         }
         application.method("getAll", "()Ljava/util/Map;") { runtime, _, _ in
             let prefs = runtime.host?.preferences() ?? VMInMemoryPreferences()

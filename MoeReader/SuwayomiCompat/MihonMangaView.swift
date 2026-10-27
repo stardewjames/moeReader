@@ -151,6 +151,7 @@ struct MihonMangaView: View {
 
     private func load() async {
         isLoading = true
+        defer { isLoading = false }
         errorMessage = nil
         do {
             async let details = runtime.manga(id: manga.id, source: source)
@@ -163,6 +164,5 @@ struct MihonMangaView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
-        isLoading = false
     }
 }

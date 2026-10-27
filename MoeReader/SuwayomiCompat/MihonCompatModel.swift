@@ -110,6 +110,7 @@ final class MihonCompatModel {
     func uninstall(_ installedExtension: MihonInstalledExtension) async {
         do {
             try await store.uninstall(packageName: installedExtension.packageName)
+            MihonEnginePool.shared.evict(packageName: installedExtension.packageName)
             await reload()
         } catch {
             errorMessage = error.localizedDescription
@@ -149,7 +150,7 @@ final class MihonCompatModel {
         for repository in repositories {
             for extensionValue in repository.extensions {
                 guard !seen.contains(extensionValue.packageName) else { continue }
-                if !showNSFW, extensionValue.contentWarning == .nsfw { continue }
+                if !showNSFW, extensionValue.contentWarning.isNSFW { continue }
                 if !matchesLanguage(extensionValue) { continue }
                 if !searchText.isEmpty,
                    !extensionValue.name.localizedCaseInsensitiveContains(searchText),

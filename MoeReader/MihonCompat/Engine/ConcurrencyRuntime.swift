@@ -8,6 +8,10 @@
 
 import Foundation
 
+final class VMLockPayload {
+    var locked = false
+}
+
 final class VMAtomicPayload {
     var intValue: Int64
     var boolValue: Bool
@@ -46,6 +50,28 @@ enum ConcurrencyRuntime {
             let payload = runtime.mutableAtomic(args[0])
             payload.intValue += Int64(args[1].asInt32)
             return .int32(Int32(payload.intValue))
+        }
+        atomicInteger.method("getAndAdd", "(I)I") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue += Int64(args[1].asInt32)
+            return .int32(Int32(previous))
+        }
+        atomicInteger.method("getAndSet", "(I)I") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue = Int64(args[1].asInt32)
+            return .int32(Int32(previous))
+        }
+        atomicInteger.method("getAndDecrement", "()I") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue -= 1
+            return .int32(Int32(previous))
+        }
+        atomicInteger.method("lazySet", "(I)V") { runtime, args, _ in
+            runtime.mutableAtomic(args[0]).intValue = Int64(args[1].asInt32)
+            return .zero
         }
         atomicInteger.method("compareAndSet", "(II)Z") { runtime, args, _ in
             let payload = runtime.mutableAtomic(args[0])
@@ -94,6 +120,43 @@ enum ConcurrencyRuntime {
             payload.intValue += args[1].asInt64
             return .int64(payload.intValue)
         }
+        atomicLong.method("getAndAdd", "(J)J") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue += args[1].asInt64
+            return .int64(previous)
+        }
+        atomicLong.method("getAndSet", "(J)J") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue = args[1].asInt64
+            return .int64(previous)
+        }
+        atomicLong.method("getAndIncrement", "()J") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue += 1
+            return .int64(previous)
+        }
+        atomicLong.method("getAndDecrement", "()J") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            let previous = payload.intValue
+            payload.intValue -= 1
+            return .int64(previous)
+        }
+        atomicLong.method("decrementAndGet", "()J") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            payload.intValue -= 1
+            return .int64(payload.intValue)
+        }
+        atomicLong.method("compareAndSet", "(JJ)Z") { runtime, args, _ in
+            let payload = runtime.mutableAtomic(args[0])
+            if payload.intValue == args[1].asInt64 {
+                payload.intValue = args[2].asInt64
+                return .boolean(true)
+            }
+            return .boolean(false)
+        }
         result.append(atomicLong)
 
         let concurrentMap = NativeClass("Ljava/util/concurrent/ConcurrentHashMap;", superclass: "Ljava/util/AbstractMap;", interfaces: ["Ljava/util/Map;", "Ljava/util/concurrent/ConcurrentMap;"])
@@ -124,11 +187,38 @@ enum ConcurrencyRuntime {
         result.append(NativeClass("Ljava/util/concurrent/ConcurrentMap;", superclass: nil, interfaces: ["Ljava/util/Map;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
 
         let lock = NativeClass("Ljava/util/concurrent/locks/ReentrantLock;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/concurrent/locks/Lock;"])
-        lock.method("<init>", "()V") { _, _, _ in .zero }
-        lock.method("<init>", "(Z)V") { _, _, _ in .zero }
-        lock.method("lock", "()V") { _, _, _ in .zero }
-        lock.method("unlock", "()V") { _, _, _ in .zero }
-        lock.method("tryLock", "()Z") { _, _, _ in .boolean(true) }
+        lock.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMLockPayload())
+            return .zero
+        }
+        lock.method("<init>", "(Z)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMLockPayload())
+            return .zero
+        }
+        lock.method("lock", "()V") { runtime, args, _ in
+            runtime.mutableLock(args[0]).locked = true
+            return .zero
+        }
+        lock.method("unlock", "()V") { runtime, args, _ in
+            runtime.mutableLock(args[0]).locked = false
+            return .zero
+        }
+        lock.method("tryLock", "()Z") { runtime, args, _ in
+            let payload = runtime.mutableLock(args[0])
+            if payload.locked { return .boolean(false) }
+            payload.locked = true
+            return .boolean(true)
+        }
+        lock.method("isLocked", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMLockPayload.self)?.locked ?? false)
+        }
+        lock.method("isHeldByCurrentThread", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMLockPayload.self)?.locked ?? false)
+        }
+        lock.method("getHoldCount", "()I") { runtime, args, _ in
+            .int32((runtime.payload(args[0], as: VMLockPayload.self)?.locked ?? false) ? 1 : 0)
+        }
+        lock.method("hasQueuedThreads", "()Z") { _, _, _ in .boolean(false) }
         lock.method("newCondition", "()Ljava/util/concurrent/locks/Condition;") { runtime, _, _ in
             runtime.makeNative("Ljava/util/concurrent/locks/Condition;", payload: NSNull())
         }
@@ -149,6 +239,13 @@ enum ConcurrencyRuntime {
 }
 
 extension VMRuntime {
+    func mutableLock(_ value: VMValue) -> VMLockPayload {
+        if let existing: VMLockPayload = payload(value, as: VMLockPayload.self) { return existing }
+        let created = VMLockPayload()
+        setPayload(value, created)
+        return created
+    }
+
     func mutableAtomic(_ value: VMValue) -> VMAtomicPayload {
         if let existing: VMAtomicPayload = payload(value, as: VMAtomicPayload.self) { return existing }
         let created = VMAtomicPayload()

@@ -157,8 +157,8 @@ struct MihonBinaryXML {
         let stylesStart = Int(u32(bytes, start + 24))
         let utf8 = flags & 0x100 != 0
 
-        guard count >= 0, count <= (size - headerSize) / 4,
-              styleCount >= 0, styleCount <= (size - headerSize) / 4,
+        guard count >= 0, count <= min((size - headerSize) / 4, 100_000),
+              styleCount >= 0, styleCount <= min((size - headerSize) / 4, 100_000),
               stringsStart >= 0, stringsStart <= size,
               stylesStart == 0 || (stylesStart >= 0 && stylesStart <= size) else {
             throw MihonBinaryXMLError.invalidStringPool
@@ -197,7 +197,7 @@ struct MihonBinaryXML {
         headerSize: Int,
         size: Int
     ) -> [UInt32] {
-        let count = (size - headerSize) / 4
+        let count = min(max(0, (size - headerSize) / 4), 100_000)
         guard count > 0 else { return [] }
         return (0..<count).map { u32(bytes, start + headerSize + $0 * 4) }
     }

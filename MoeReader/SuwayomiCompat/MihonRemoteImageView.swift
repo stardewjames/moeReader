@@ -30,7 +30,7 @@ actor MihonRemoteImageLoader {
 
         let task = Task<DecodedImage, Error> {
             let response = try await http.fetch(
-                MihonHTTPRequest(url: url, headers: headers)
+                MihonHTTPRequest(url: url, headers: headers, maxBytes: 32 * 1024 * 1024)
             )
             guard response.isSuccess else {
                 throw MihonError.httpStatus(response.statusCode)

@@ -56,6 +56,7 @@ final class MihonAPIContractTests: XCTestCase {
         let runtime = VMRuntime(host: host)
         installSource(runtime, descriptor: "Ltest/Legacy;", base: "Leu/kanade/tachiyomi/source/online/HttpSource;")
         installParsedSource(runtime)
+        installParsedSource(runtime, descriptor: "Ltest/ParsedSimple;", includeImageParser: false)
         return (runtime, host)
     }
 
@@ -166,8 +167,11 @@ final class MihonAPIContractTests: XCTestCase {
         runtime.nativeClasses[descriptor] = cls
     }
 
-    private func installParsedSource(_ runtime: VMRuntime) {
-        let descriptor = "Ltest/Parsed;"
+    private func installParsedSource(
+        _ runtime: VMRuntime,
+        descriptor: String = "Ltest/Parsed;",
+        includeImageParser: Bool = true
+    ) {
         let cls = NativeClass(descriptor, superclass: "Leu/kanade/tachiyomi/source/online/ParsedHttpSource;")
         cls.method("getBaseUrl", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("https://example.test") }
         cls.method("getName", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("Parsed") }
@@ -207,8 +211,10 @@ final class MihonAPIContractTests: XCTestCase {
         cls.method("pageListParse", "(Lorg/jsoup/nodes/Document;)Ljava/util/List;") { runtime, _, _ in
             runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload([]))
         }
-        cls.method("imageUrlParse", "(Lorg/jsoup/nodes/Document;)Ljava/lang/String;") { runtime, _, _ in
-            runtime.newString("https://example.test/i.jpg")
+        if includeImageParser {
+            cls.method("imageUrlParse", "(Lorg/jsoup/nodes/Document;)Ljava/lang/String;") { runtime, _, _ in
+                runtime.newString("https://example.test/i.jpg")
+            }
         }
         runtime.nativeClasses[descriptor] = cls
     }
@@ -281,6 +287,87 @@ final class MihonAPIContractTests: XCTestCase {
         XCTAssertEqual(runtime.listItems(pages)?.count, 3)
     }
 
+    func testHttpSourceKtUrlHelperAndConstants() throws {
+        let runtime = VMRuntime()
+        let helper = try runtime.linkClass("Leu/kanade/tachiyomi/source/online/HttpSourceKt;")
+        let manga = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
+        let chapter = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSChapter;", payload: VMChapterPayload())
+        let setManga = try XCTUnwrap(
+            helper.lookupStatic(
+                "setUrlWithoutDomain",
+                "(Leu/kanade/tachiyomi/source/model/SManga;Ljava/lang/String;)V"
+            )
+        )
+        let setChapter = try XCTUnwrap(
+            helper.lookupStatic(
+                "setUrlWithoutDomain",
+                "(Leu/kanade/tachiyomi/source/model/SChapter;Ljava/lang/String;)V"
+            )
+        )
+        _ = try runtime.invoke(setManga, [manga, runtime.newString("https://example.test/m/1?q=2")])
+        _ = try runtime.invoke(setChapter, [chapter, runtime.newString("https://example.test/c/3#x")])
+        XCTAssertEqual(runtime.stringValue(runtime.manga(manga).url), "/m/1?q=2")
+        XCTAssertEqual(runtime.stringValue(runtime.chapter(chapter).url), "/c/3#x")
+
+        let sourceClass = try runtime.linkClass("Leu/kanade/tachiyomi/source/online/HttpSource;")
+        try runtime.ensureInitialized(sourceClass)
+        let initial = try XCTUnwrap(sourceClass.staticField(named: "INIT_USER_AGENT"))
+        let current = try XCTUnwrap(sourceClass.staticField(named: "DEFAULT_USER_AGENT"))
+        XCTAssertFalse((runtime.stringValue(sourceClass.staticValue(initial)) ?? "").isEmpty)
+        XCTAssertEqual(
+            runtime.stringValue(sourceClass.staticValue(initial)),
+            runtime.stringValue(sourceClass.staticValue(current))
+        )
+
+        let appInfo = try runtime.linkClass("Leu/kanade/tachiyomi/AppInfo;")
+        try runtime.ensureInitialized(appInfo)
+        let version = try XCTUnwrap(appInfo.staticField(named: "VERSION_NAME"))
+        XCTAssertEqual(runtime.stringValue(appInfo.staticValue(version)), "0.1.0-mihoncompat")
+    }
+
+    func testMangaCopyHelpersAndSelectDisplayValues() throws {
+        let runtime = VMRuntime()
+        let target = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
+        let source = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
+        let sourcePayload = runtime.manga(source)
+        sourcePayload.author = runtime.newString("Author")
+        sourcePayload.artist = runtime.newString("Artist")
+        sourcePayload.status = 2
+        sourcePayload.description = runtime.newString("Description")
+        sourcePayload.thumbnail = runtime.newString("https://example.test/c.jpg")
+        sourcePayload.initialized = true
+        let targetClass = try runtime.linkClass("Leu/kanade/tachiyomi/source/model/MihonSManga;")
+        let copy = try XCTUnwrap(
+            targetClass.lookupVirtual(key: "copyFrom(Leu/kanade/tachiyomi/source/model/SManga;)V")
+        )
+        _ = try runtime.invoke(copy, [target, source])
+        let copied = runtime.manga(target)
+        XCTAssertEqual(runtime.stringValue(copied.author), "Author")
+        XCTAssertEqual(runtime.stringValue(copied.artist), "Artist")
+        XCTAssertEqual(copied.status, 2)
+        XCTAssertTrue(copied.initialized)
+
+        let values = runtime.newArray(component: "Ljava/lang/Object;", count: 2)
+        runtime.setArrayElement(values, index: 0, value: runtime.newString("A"))
+        runtime.setArrayElement(values, index: 1, value: runtime.newString("B"))
+        let selectClass = try runtime.linkClass("Leu/kanade/tachiyomi/source/model/Filter$Select;")
+        let select = VMValue.reference(runtime.allocateObject(selectClass))
+        let constructor = try XCTUnwrap(
+            selectClass.lookupVirtual(key: "<init>(Ljava/lang/String;[Ljava/lang/Object;I)V")
+        )
+        _ = try runtime.invoke(constructor, [select, runtime.newString("Order"), values, .int32(0)])
+        let display = try runtime.invoke(
+            try XCTUnwrap(selectClass.lookupVirtual(key: "getDisplayValues()Ljava/util/List;")),
+            [select]
+        )
+        XCTAssertEqual(runtime.listItems(display)?.compactMap { runtime.stringValue($0) }, ["A", "B"])
+
+        let host = MihonEngineHost(prefix: "scheme-test", log: { _ in })
+        XCTAssertThrowsError(
+            try host.performRequest(VMHTTPRequest(url: "file:///etc/passwd"))
+        )
+    }
+
     func testLegacyImageUrlFallsBackThroughImageUrlParse() throws {
         let (runtime, host) = makeRuntime()
         let source = try instance(runtime, "Ltest/Legacy;")
@@ -295,6 +382,24 @@ final class MihonAPIContractTests: XCTestCase {
         )
         XCTAssertEqual(runtime.stringValue(resolved), "https://example.test/resolved.jpg")
         XCTAssertTrue(host.requests.contains { $0.contains("/image-page") })
+    }
+
+    func testParsedSourceWithoutImageParserFallsBackToPageURL() throws {
+        let (runtime, host) = makeRuntime()
+        let source = try instance(runtime, "Ltest/ParsedSimple;")
+        let page = runtime.makeNative("Leu/kanade/tachiyomi/source/model/Page;", payload: VMPagePayload())
+        let payload: VMPagePayload? = runtime.payload(page, as: VMPagePayload.self)
+        payload?.url = runtime.newString("https://example.test/direct.jpg")
+        payload?.imageUrl = runtime.newString("")
+        let continuation = runtime.makeNative("Lmihoncompat/Continuation;", payload: NSNull())
+        let before = host.requests.count
+        let resolved = try invoke(
+            runtime, source,
+            "getImageUrl(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+            [page, continuation]
+        )
+        XCTAssertEqual(runtime.stringValue(resolved), "https://example.test/direct.jpg")
+        XCTAssertEqual(host.requests.count, before)
     }
 
     func testParsedHttpSourceSelectorsProducePagesChaptersAndImages() throws {

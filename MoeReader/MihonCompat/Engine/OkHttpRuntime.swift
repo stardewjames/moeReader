@@ -759,7 +759,9 @@ enum OkHttpRuntime {
         call.method("request", "()Lokhttp3/Request;") { runtime, args, _ in
             runtime.payload(args[0], as: VMCallPayload.self)?.request ?? .null
         }
-        call.method("timeout", "()Lokhttp3/Timeout;") { _, _, _ in .null }
+        call.method("timeout", "()Lokhttp3/Timeout;") { runtime, _, _ in
+            runtime.makeNative("Lokhttp3/Timeout;", payload: NSNull())
+        }
         call.method("clone", "()Lokhttp3/Call;") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMCallPayload.self) else { return .null }
             return runtime.makeNative("Lokhttp3/Call;", payload: VMCallPayload(request: payload.request, client: payload.client))
@@ -973,29 +975,62 @@ enum OkHttpRuntime {
 
         let requestBody = NativeClass("Lokhttp3/RequestBody;", superclass: "Ljava/lang/Object;")
         requestBody.staticField("Companion", "Lokhttp3/RequestBody$Companion;")
-        requestBody.method("contentType", "()Lokhttp3/MediaType;") { _, _, _ in .null }
-        requestBody.method("contentLength", "()J") { _, _, _ in .int64(0) }
+        requestBody.method("contentType", "()Lokhttp3/MediaType;") { runtime, args, _ in
+            guard let contentType = runtime.payload(args[0], as: VMFormBodyPayload.self)?.contentType else { return .null }
+            return runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: contentType))
+        }
+        requestBody.method("contentLength", "()J") { runtime, args, _ in
+            .int64(Int64(runtime.payload(args[0], as: VMFormBodyPayload.self)?.data.count ?? 0))
+        }
         requestBody.staticMethod("create", "(Lokhttp3/MediaType;Ljava/lang/String;)Lokhttp3/RequestBody;") { runtime, args, _ in
-            runtime.makeNative("Lokhttp3/FormBody;", payload: VMFormBodyPayload(pairs: [], data: Data((runtime.stringValue(args[1]) ?? "").utf8)))
+            runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(
+                    pairs: [],
+                    data: Data((runtime.stringValue(args[1]) ?? "").utf8),
+                    contentType: runtime.payload(args[0], as: VMMediaTypePayload.self)?.text
+                )
+            )
         }
         requestBody.staticMethod("create", "(Lokhttp3/MediaType;[B)Lokhttp3/RequestBody;") { runtime, args, _ in
             var data = Data()
             for index in 0..<runtime.arrayLength(args[1]) {
                 data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
             }
-            return runtime.makeNative("Lokhttp3/FormBody;", payload: VMFormBodyPayload(pairs: [], data: data))
+            return runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(
+                    pairs: [],
+                    data: data,
+                    contentType: runtime.payload(args[0], as: VMMediaTypePayload.self)?.text
+                )
+            )
         }
 
         let requestBodyCompanion = NativeClass("Lokhttp3/RequestBody$Companion;", superclass: "Ljava/lang/Object;")
         requestBodyCompanion.method("create", "(Lokhttp3/MediaType;Ljava/lang/String;)Lokhttp3/RequestBody;") { runtime, args, _ in
-            runtime.makeNative("Lokhttp3/FormBody;", payload: VMFormBodyPayload(pairs: [], data: Data((runtime.stringValue(args[2]) ?? "").utf8)))
+            runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(
+                    pairs: [],
+                    data: Data((runtime.stringValue(args[2]) ?? "").utf8),
+                    contentType: runtime.payload(args[1], as: VMMediaTypePayload.self)?.text
+                )
+            )
         }
         requestBodyCompanion.method("create", "(Lokhttp3/MediaType;[B)Lokhttp3/RequestBody;") { runtime, args, _ in
             var data = Data()
             for index in 0..<runtime.arrayLength(args[2]) {
                 data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[2], index).asInt32))
             }
-            return runtime.makeNative("Lokhttp3/FormBody;", payload: VMFormBodyPayload(pairs: [], data: data))
+            return runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(
+                    pairs: [],
+                    data: data,
+                    contentType: runtime.payload(args[1], as: VMMediaTypePayload.self)?.text
+                )
+            )
         }
         requestBody.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lokhttp3/RequestBody$Companion;", payload: NSNull())
@@ -1010,7 +1045,10 @@ enum OkHttpRuntime {
                     runtime.stringValue(runtime.arrayElement(args[2], index)) ?? ""
                 ))
             }
-            runtime.setPayload(args[0], VMFormBodyPayload(pairs: pairs, data: Data()))
+            runtime.setPayload(
+                args[0],
+                VMFormBodyPayload(pairs: pairs, data: Data(), contentType: "application/x-www-form-urlencoded")
+            )
             return .zero
         }
         formBody.method("size", "()I") { runtime, args, _ in
@@ -1031,7 +1069,10 @@ enum OkHttpRuntime {
 
         let formBuilder = NativeClass("Lokhttp3/FormBody$Builder;", superclass: "Ljava/lang/Object;")
         formBuilder.method("<init>", "()V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMFormBodyPayload(pairs: [], data: Data()))
+            runtime.setPayload(
+                args[0],
+                VMFormBodyPayload(pairs: [], data: Data(), contentType: "application/x-www-form-urlencoded")
+            )
             return .zero
         }
         formBuilder.method("add", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;") { runtime, args, _ in
@@ -1046,7 +1087,14 @@ enum OkHttpRuntime {
         }
         formBuilder.method("build", "()Lokhttp3/FormBody;") { runtime, args, _ in
             let payload: VMFormBodyPayload? = runtime.payload(args[0], as: VMFormBodyPayload.self)
-            return runtime.makeNative("Lokhttp3/FormBody;", payload: payload ?? VMFormBodyPayload(pairs: [], data: Data()))
+            return runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: payload ?? VMFormBodyPayload(
+                    pairs: [],
+                    data: Data(),
+                    contentType: "application/x-www-form-urlencoded"
+                )
+            )
         }
         return [body, bodyCompanion, bufferedSource, requestBody, requestBodyCompanion, formBody, formBuilder]
     }
@@ -1100,9 +1148,11 @@ enum OkHttpRuntime {
 final class VMFormBodyPayload {
     var pairs: [(String, String)]
     var data: Data
-    init(pairs: [(String, String)], data: Data) {
+    var contentType: String?
+    init(pairs: [(String, String)], data: Data, contentType: String? = nil) {
         self.pairs = pairs
         self.data = data
+        self.contentType = contentType
     }
 }
 
@@ -1148,12 +1198,17 @@ extension VMRuntime {
             throw VMJavaException("Ljava/io/IOException;", "no network host")
         }
         var body: Data?
+        var headers = payload.headers.entries
         if payload.body.bits != 0 {
             if let form: VMFormBodyPayload = self.payload(payload.body, as: VMFormBodyPayload.self) {
                 if !form.pairs.isEmpty {
                     body = Data(form.pairs.map { "\(formWire($0.0))=\(formWire($0.1))" }.joined(separator: "&").utf8)
                 } else {
                     body = form.data
+                }
+                if let contentType = form.contentType,
+                   !headers.contains(where: { $0.0.caseInsensitiveCompare("Content-Type") == .orderedSame }) {
+                    headers.append(("Content-Type", contentType))
                 }
             } else {
                 body = Data()
@@ -1162,7 +1217,7 @@ extension VMRuntime {
         let vmRequest = VMHTTPRequest(
             url: payload.url,
             method: payload.method,
-            headers: payload.headers.entries,
+            headers: headers,
             body: body
         )
         var response: VMHTTPResponse

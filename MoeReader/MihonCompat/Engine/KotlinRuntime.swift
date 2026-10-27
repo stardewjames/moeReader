@@ -59,7 +59,42 @@ final class VMRegexPayload {
 
 final class VMMatchResultPayload {
     let groups: [VMValue]
-    init(groups: [VMValue]) { self.groups = groups }
+    let ranges: [NSRange?]
+    let nextSearchStart: Int?
+    let text: String?
+    let expression: NSRegularExpression?
+
+    init(
+        groups: [VMValue],
+        ranges: [NSRange?] = [],
+        nextSearchStart: Int? = nil,
+        text: String? = nil,
+        expression: NSRegularExpression? = nil
+    ) {
+        self.groups = groups
+        self.ranges = ranges
+        self.nextSearchStart = nextSearchStart
+        self.text = text
+        self.expression = expression
+    }
+}
+
+final class VMMatchGroupPayload {
+    let value: VMValue
+    let range: NSRange?
+    init(value: VMValue, range: NSRange?) {
+        self.value = value
+        self.range = range
+    }
+}
+
+final class VMIntRangePayload {
+    let first: Int
+    let last: Int
+    init(first: Int, last: Int) {
+        self.first = first
+        self.last = last
+    }
 }
 
 final class VMSequencePayload {
@@ -158,12 +193,25 @@ enum KotlinRuntime {
         resultClass.staticMethod("isSuccess-impl", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             .boolean(runtime.classOf(args[0])?.descriptor != "Lkotlin/Result$Failure;")
         }
+        resultClass.staticMethod("getOrNull-impl", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            runtime.classOf(args[0])?.descriptor == "Lkotlin/Result$Failure;" ? .null : args[0]
+        }
+        resultClass.staticMethod("getOrThrow-impl", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            if runtime.classOf(args[0])?.descriptor == "Lkotlin/Result$Failure;" {
+                let value = runtime.payload(args[0], as: VMResultPayload.self)?.value ?? .null
+                let cls = runtime.classOf(value)?.descriptor ?? "Ljava/lang/RuntimeException;"
+                var exception = VMJavaException(cls, nil)
+                exception.object = value
+                throw exception
+            }
+            return args[0]
+        }
         resultClass.staticMethod("exceptionOrNull-impl", "(Ljava/lang/Object;)Ljava/lang/Throwable;") { runtime, args, _ in
             guard runtime.classOf(args[0])?.descriptor == "Lkotlin/Result$Failure;" else { return .null }
             return runtime.payload(args[0], as: VMResultPayload.self)?.value ?? .null
         }
         resultClass.staticMethod("box-impl", "(Ljava/lang/Object;)Lkotlin/Result;") { _, args, _ in args[0] }
-        resultClass.staticMethod("unbox-impl", "()Ljava/lang/Object;") { _, _, _ in .null }
+        resultClass.method("unbox-impl", "()Ljava/lang/Object;") { _, args, _ in args[0] }
         resultClass.staticMethod("toString-impl", "(Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             if runtime.classOf(args[0])?.descriptor == "Lkotlin/Result$Failure;" {
                 let failure = runtime.payload(args[0], as: VMResultPayload.self)?.value ?? .null
@@ -1423,14 +1471,7 @@ enum KotlinRuntime {
             let index = text.utf16.index(text.utf16.startIndex, offsetBy: start)
             let range = NSRange(index..<text.endIndex, in: text)
             guard let match = expression.firstMatch(in: text, range: range) else { return .null }
-            var groups: [VMValue] = []
-            for groupIndex in 0..<match.numberOfRanges {
-                let groupRange = match.range(at: groupIndex)
-                if groupRange.location == NSNotFound { groups.append(.null) }
-                else if let swiftRange = Range(groupRange, in: text) { groups.append(runtime.newString(String(text[swiftRange]))) }
-                else { groups.append(.null) }
-            }
-            return runtime.makeNative("Lkotlin/text/MatchResult;", payload: VMMatchResultPayload(groups: groups))
+            return makeMatchResultValue(runtime, match: match, text: text, expression: expression)
         }
         regex.method("findAll", "(Ljava/lang/CharSequence;I)Lkotlin/sequences/Sequence;") { runtime, args, _ in
             let payload: VMRegexPayload? = runtime.payload(args[0], as: VMRegexPayload.self)
@@ -1439,13 +1480,7 @@ enum KotlinRuntime {
             if let payload, let expression = payload.expression {
                 let matches = expression.matches(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text))
                 for match in matches {
-                    var groups: [VMValue] = []
-                    for groupIndex in 0..<match.numberOfRanges {
-                        let groupRange = match.range(at: groupIndex)
-                        if let swiftRange = Range(groupRange, in: text) { groups.append(runtime.newString(String(text[swiftRange]))) }
-                        else { groups.append(.null) }
-                    }
-                    values.append(runtime.makeNative("Lkotlin/text/MatchResult;", payload: VMMatchResultPayload(groups: groups)))
+                    values.append(makeMatchResultValue(runtime, match: match, text: text, expression: expression))
                 }
             }
             return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(values))
@@ -1456,13 +1491,7 @@ enum KotlinRuntime {
             guard let payload, let expression = payload.expression else { return .null }
             let range = NSRange(text.startIndex..<text.endIndex, in: text)
             guard let match = expression.firstMatch(in: text, range: range), match.range == range else { return .null }
-            var groups: [VMValue] = []
-            for groupIndex in 0..<match.numberOfRanges {
-                let groupRange = match.range(at: groupIndex)
-                if let swiftRange = Range(groupRange, in: text) { groups.append(runtime.newString(String(text[swiftRange]))) }
-                else { groups.append(.null) }
-            }
-            return runtime.makeNative("Lkotlin/text/MatchResult;", payload: VMMatchResultPayload(groups: groups))
+            return makeMatchResultValue(runtime, match: match, text: text, expression: expression)
         }
         regex.method("getPattern", "()Ljava/lang/String;") { runtime, args, _ in
             let payload: VMRegexPayload? = runtime.payload(args[0], as: VMRegexPayload.self)
@@ -1476,13 +1505,7 @@ enum KotlinRuntime {
             let index = text.utf16.index(text.utf16.startIndex, offsetBy: start)
             let range = NSRange(index..<text.endIndex, in: text)
             guard let match = expression.firstMatch(in: text, range: range) else { return .null }
-            var groups: [VMValue] = []
-            for groupIndex in 0..<match.numberOfRanges {
-                let groupRange = match.range(at: groupIndex)
-                if let swiftRange = Range(groupRange, in: text) { groups.append(runtime.newString(String(text[swiftRange]))) }
-                else { groups.append(.null) }
-            }
-            return runtime.makeNative("Lkotlin/text/MatchResult;", payload: VMMatchResultPayload(groups: groups))
+            return makeMatchResultValue(runtime, match: match, text: text, expression: expression)
         }
         regex.method("replaceFirst", "(Ljava/lang/CharSequence;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             let payload: VMRegexPayload? = runtime.payload(args[0], as: VMRegexPayload.self)
@@ -1515,13 +1538,7 @@ enum KotlinRuntime {
             for match in matches {
                 guard let fullRange = Range(match.range, in: text) else { continue }
                 output += String(text[cursor..<fullRange.lowerBound])
-                var groups: [VMValue] = []
-                for groupIndex in 0..<match.numberOfRanges {
-                    let groupRange = match.range(at: groupIndex)
-                    if let swiftRange = Range(groupRange, in: text) { groups.append(runtime.newString(String(text[swiftRange]))) }
-                    else { groups.append(.null) }
-                }
-                let matchResult = runtime.makeNative("Lkotlin/text/MatchResult;", payload: VMMatchResultPayload(groups: groups))
+                let matchResult = makeMatchResultValue(runtime, match: match, text: text, expression: expression)
                 let replacement = try runtime.callFunction(args[2], [matchResult])
                 output += runtime.stringValue(replacement) ?? ""
                 cursor = fullRange.upperBound
@@ -1545,11 +1562,26 @@ enum KotlinRuntime {
             let payload: VMMatchResultPayload? = runtime.payload(args[0], as: VMMatchResultPayload.self)
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(payload?.groups ?? [], immutable: true))
         }
-        matchResult.method("getGroups", "()Lkotlin/text/MatchGroupCollection;") { runtime, args, _ in
+        matchResult.method("getRange", "()Lkotlin/ranges/IntRange;") { runtime, args, _ in
             let payload: VMMatchResultPayload? = runtime.payload(args[0], as: VMMatchResultPayload.self)
-            return runtime.makeNative("Lkotlin/text/MatchGroupCollection;", payload: VMListPayload(payload?.groups ?? []))
+            return matchRangeValue(runtime, range: payload?.ranges.first ?? nil)
         }
-        matchResult.method("next", "()Lkotlin/text/MatchResult;") { _, _, _ in .null }
+        matchResult.method("getGroups", "()Lkotlin/text/MatchGroupCollection;") { runtime, args, _ in
+            guard let payload: VMMatchResultPayload = runtime.payload(args[0], as: VMMatchResultPayload.self) else { return .null }
+            let groups = payload.groups.enumerated().map { index, value in
+                runtime.makeNative(
+                    "Lkotlin/text/MatchGroup;",
+                    payload: VMMatchGroupPayload(
+                        value: value,
+                        range: index < payload.ranges.count ? payload.ranges[index] : nil
+                    )
+                )
+            }
+            return runtime.makeNative("Lkotlin/text/MatchGroupCollection;", payload: VMListPayload(groups))
+        }
+        matchResult.method("next", "()Lkotlin/text/MatchResult;") { runtime, args, _ in
+            nextMatchResultValue(runtime, value: args[0])
+        }
         result.append(matchResult)
 
         let groupCollection = NativeClass("Lkotlin/text/MatchGroupCollection;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/Collection;"])
@@ -1557,17 +1589,60 @@ enum KotlinRuntime {
             let items = runtime.listPayload(args[0])?.items ?? []
             let index = Int(args[1].asInt32)
             guard index >= 0, index < items.count else { return .null }
-            return runtime.makeNative("Lkotlin/text/MatchGroup;", payload: items[index])
+            return items[index]
         }
         groupCollection.method("size", "()I") { runtime, args, _ in .int32(Int32(runtime.listPayload(args[0])?.items.count ?? 0)) }
         result.append(groupCollection)
 
         let group = NativeClass("Lkotlin/text/MatchGroup;", superclass: "Ljava/lang/Object;")
-        group.method("getValue", "()Ljava/lang/String;") { runtime, args, _ in
-            runtime.payload(args[0], as: VMValue.self) ?? .null
+        group.method("<init>", "(Ljava/lang/String;Lkotlin/ranges/IntRange;)V") { runtime, args, _ in
+            let range: VMIntRangePayload? = runtime.payload(args[2], as: VMIntRangePayload.self)
+            let nsRange = range.map { NSRange(location: $0.first, length: max(0, $0.last - $0.first + 1)) }
+            runtime.setPayload(args[0], VMMatchGroupPayload(value: args[1], range: nsRange))
+            return .zero
         }
-        group.method("getRange", "()Lkotlin/ranges/IntRange;") { runtime, args, _ in .null }
+        group.method("getValue", "()Ljava/lang/String;") { runtime, args, _ in
+            if let payload: VMMatchGroupPayload = runtime.payload(args[0], as: VMMatchGroupPayload.self) {
+                return payload.value
+            }
+            return runtime.payload(args[0], as: VMValue.self) ?? .null
+        }
+        group.method("getRange", "()Lkotlin/ranges/IntRange;") { runtime, args, _ in
+            let payload: VMMatchGroupPayload? = runtime.payload(args[0], as: VMMatchGroupPayload.self)
+            return matchRangeValue(runtime, range: payload?.range)
+        }
         result.append(group)
+
+        let intRange = NativeClass("Lkotlin/ranges/IntRange;", superclass: "Ljava/lang/Object;")
+        intRange.method("<init>", "(II)V") { runtime, args, _ in
+            runtime.setPayload(
+                args[0],
+                VMIntRangePayload(first: Int(args[1].asInt32), last: Int(args[2].asInt32))
+            )
+            return .zero
+        }
+        for name in ["getFirst", "getStart"] {
+            intRange.method(name, "()I") { runtime, args, _ in
+                .int32(Int32(runtime.payload(args[0], as: VMIntRangePayload.self)?.first ?? 0))
+            }
+        }
+        for name in ["getLast", "getEndInclusive"] {
+            intRange.method(name, "()I") { runtime, args, _ in
+                .int32(Int32(runtime.payload(args[0], as: VMIntRangePayload.self)?.last ?? 0))
+            }
+        }
+        intRange.method("getEnd", "()I") { runtime, args, _ in
+            .int32(Int32((runtime.payload(args[0], as: VMIntRangePayload.self)?.last ?? 0) + 1))
+        }
+        intRange.method("isEmpty", "()Z") { runtime, args, _ in
+            let payload: VMIntRangePayload? = runtime.payload(args[0], as: VMIntRangePayload.self)
+            return .boolean((payload?.first ?? 0) > (payload?.last ?? -1))
+        }
+        intRange.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let payload: VMIntRangePayload? = runtime.payload(args[0], as: VMIntRangePayload.self)
+            return runtime.newString("\(payload?.first ?? 0)..\(payload?.last ?? 0)")
+        }
+        result.append(intRange)
 
         let charKt = NativeClass("Lkotlin/text/StringsKt__StringsKt;")
         charKt.staticMethod("isBlank", "(Ljava/lang/CharSequence;)Z") { runtime, args, _ in
@@ -2059,4 +2134,61 @@ private func parseInstantMillis(_ text: String) -> Int64? {
         return Int64((date.timeIntervalSince1970 * 1000).rounded())
     }
     return nil
+}
+
+private func makeMatchResultValue(
+    _ runtime: VMRuntime,
+    match: NSTextCheckingResult,
+    text: String,
+    expression: NSRegularExpression?
+) -> VMValue {
+    var groups: [VMValue] = []
+    var ranges: [NSRange?] = []
+    for index in 0..<match.numberOfRanges {
+        let range = match.range(at: index)
+        if range.location == NSNotFound {
+            groups.append(.null)
+            ranges.append(nil)
+        } else if let swiftRange = Range(range, in: text) {
+            groups.append(runtime.newString(String(text[swiftRange])))
+            ranges.append(range)
+        } else {
+            groups.append(.null)
+            ranges.append(nil)
+        }
+    }
+    let nextStart = match.range.length == 0
+        ? match.range.upperBound + 1
+        : match.range.upperBound
+    let payload = VMMatchResultPayload(
+        groups: groups,
+        ranges: ranges,
+        nextSearchStart: nextStart,
+        text: text,
+        expression: expression
+    )
+    return runtime.makeNative("Lkotlin/text/MatchResult;", payload: payload)
+}
+
+private func nextMatchResultValue(_ runtime: VMRuntime, value: VMValue) -> VMValue {
+    guard let payload: VMMatchResultPayload = runtime.payload(value, as: VMMatchResultPayload.self),
+          let text = payload.text,
+          let expression = payload.expression,
+          let start = payload.nextSearchStart,
+          start >= 0, start <= text.utf16.count else {
+        return .null
+    }
+    let index = text.utf16.index(text.utf16.startIndex, offsetBy: start)
+    let range = NSRange(index..<text.endIndex, in: text)
+    guard let match = expression.firstMatch(in: text, range: range) else { return .null }
+    return makeMatchResultValue(runtime, match: match, text: text, expression: expression)
+}
+
+private func matchRangeValue(_ runtime: VMRuntime, range: NSRange?) -> VMValue {
+    guard let range, range.location != NSNotFound else { return .null }
+    let last = range.length == 0 ? range.location - 1 : range.location + range.length - 1
+    return runtime.makeNative(
+        "Lkotlin/ranges/IntRange;",
+        payload: VMIntRangePayload(first: range.location, last: last)
+    )
 }

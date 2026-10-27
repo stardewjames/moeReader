@@ -44,14 +44,17 @@ final class MihonEngineHost: VMHost {
     func extensionFileRoot() -> String { fileRoot }
 
     func performRequest(_ request: VMHTTPRequest) throws -> VMHTTPResponse {
-        guard let url = URL(string: request.url) else {
-            throw VMJavaException("Ljava/io/IOException;", "invalid URL: \(request.url)")
+        guard let url = URL(string: request.url),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else {
+            throw VMJavaException("Ljava/io/IOException;", "unsupported URL: \(request.url)")
         }
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = request.method
         urlRequest.httpBody = request.body
         for (name, value) in request.headers where !name.isEmpty {
-            urlRequest.setValue(value, forHTTPHeaderField: name)
+            urlRequest.addValue(value, forHTTPHeaderField: name)
         }
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -139,17 +142,33 @@ final class MihonEnginePool: @unchecked Sendable {
     private var order: [String] = []
     private let limit = 2
 
+    private func key(packageName: String, apkURL: URL) -> String {
+        // Installed packages are content-addressed (sha256.apk). Including the
+        // file name makes an updated extension create a fresh engine instead of
+        // reusing the runtime for the removed APK.
+        "\(packageName)#\(apkURL.lastPathComponent)"
+    }
+
     func runtime(packageName: String, apkURL: URL) -> MihonEngineRuntime {
         lock.lock()
         defer { lock.unlock() }
-        if let existing = runtimes[packageName] {
-            order.removeAll { $0 == packageName }
-            order.append(packageName)
+        let identifier = key(packageName: packageName, apkURL: apkURL)
+        if let existing = runtimes[identifier] {
+            order.removeAll { $0 == identifier }
+            order.append(identifier)
             return existing
         }
+        // Drop any engine for an older APK of the same package before adding
+        // the replacement.
+        for staleKey in Array(runtimes.keys) where staleKey.hasPrefix("\(packageName)#") {
+            if let stale = runtimes.removeValue(forKey: staleKey) {
+                stale.unload()
+            }
+            order.removeAll { $0 == staleKey }
+        }
         let runtime = MihonEngineRuntime(packageName: packageName, apkURL: apkURL)
-        runtimes[packageName] = runtime
-        order.append(packageName)
+        runtimes[identifier] = runtime
+        order.append(identifier)
         while order.count > limit, let oldest = order.first {
             order.removeFirst()
             if let evicted = runtimes.removeValue(forKey: oldest) {
@@ -157,6 +176,17 @@ final class MihonEnginePool: @unchecked Sendable {
             }
         }
         return runtime
+    }
+
+    func evict(packageName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        for key in Array(runtimes.keys) where key.hasPrefix("\(packageName)#") {
+            if let runtime = runtimes.removeValue(forKey: key) {
+                runtime.unload()
+            }
+            order.removeAll { $0 == key }
+        }
     }
 }
 
@@ -345,6 +375,7 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
     }
 
     func solve(url: URL) -> Bool {
+        guard !Thread.isMainThread else { return false }
         var cleared = false
         DispatchQueue.main.sync {
             let configuration = WKWebViewConfiguration()
@@ -386,7 +417,9 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
         DispatchQueue.main.async {
             guard let webView = self.webView else { semaphore.signal(); return }
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-                for cookie in cookies { HTTPCookieStorage.shared.setCookie(cookie) }
+                for cookie in cookies where cookie.name == "cf_clearance" {
+                    HTTPCookieStorage.shared.setCookie(cookie)
+                }
                 semaphore.signal()
             }
         }

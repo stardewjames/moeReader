@@ -906,7 +906,24 @@ struct SerializationRuntime {
                     return .zero
                 }
                 cls.method("<init>", "(Ljava/lang/String;Z)V") { runtime, args, _ in
-                    runtime.setPayload(args[0], VMJsonTree(.bool((runtime.stringValue(args[1]) ?? "").lowercased() == "true")))
+                    let text = runtime.stringValue(args[1]) ?? ""
+                    let kind: VMJsonTree.Kind
+                    if args[2].asBoolean {
+                        kind = .string(text)
+                    } else if text == "true" {
+                        kind = .bool(true)
+                    } else if text == "false" {
+                        kind = .bool(false)
+                    } else if text == "null" {
+                        kind = .null
+                    } else if let number = Double(text), text.rangeOfCharacter(from: CharacterSet(charactersIn: ".eE")) != nil {
+                        kind = .number(text)
+                    } else if Int64(text) != nil {
+                        kind = .number(text)
+                    } else {
+                        kind = .string(text)
+                    }
+                    runtime.setPayload(args[0], VMJsonTree(kind))
                     return .zero
                 }
                 cls.method("getContent", "()Ljava/lang/String;") { runtime, args, _ in
@@ -950,8 +967,9 @@ struct SerializationRuntime {
             return runtime.makeNative("Lkotlinx/serialization/json/JsonArray;", payload: tree)
         }
         jsonElementKt.staticMethod("getContentOrNull", "(Lkotlinx/serialization/json/JsonPrimitive;)Ljava/lang/String;") { runtime, args, _ in
-            guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self) else { return .null }
-            return runtime.newString(tree.stringValue ?? "")
+            guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                  let text = tree.stringValue else { return .null }
+            return runtime.newString(text)
         }
         for (name, conversion) in [
             ("getInt", "int"), ("getLong", "long"), ("getBoolean", "bool"), ("getDouble", "double"), ("getFloat", "float"),

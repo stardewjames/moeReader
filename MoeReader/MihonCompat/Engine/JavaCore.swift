@@ -209,7 +209,14 @@ enum JavaCore {
             guard let units = runtime.stringUnits(args[0]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
             let index = Int(args[1].asInt32)
             guard index >= 0, index < units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
-            return .int32(Int32(units[index]))
+            let first = UInt32(units[index])
+            if first >= 0xD800, first <= 0xDBFF, index + 1 < units.count {
+                let second = UInt32(units[index + 1])
+                if second >= 0xDC00, second <= 0xDFFF {
+                    return .int32(Int32(0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)))
+                }
+            }
+            return .int32(Int32(first))
         }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             .boolean(runtime.stringsEqual(args[0], args[1]))
@@ -228,9 +235,12 @@ enum JavaCore {
             return .int32(Int32(left.count - right.count))
         }
         cls.method("compareTo", "(Ljava/lang/Object;)I") { runtime, args, _ in
-            guard let left = runtime.stringValue(args[0]), let right = runtime.stringValue(args[1]) else { return .int32(0) }
-            if left == right { return .int32(0) }
-            return .int32(left < right ? -1 : 1)
+            guard let left = runtime.stringUnits(args[0]), let right = runtime.stringUnits(args[1]) else { return .int32(0) }
+            let count = min(left.count, right.count)
+            for index in 0..<count where left[index] != right[index] {
+                return .int32(Int32(left[index]) - Int32(right[index]))
+            }
+            return .int32(Int32(left.count - right.count))
         }
         cls.method("compareToIgnoreCase", "(Ljava/lang/String;)I") { runtime, args, _ in
             guard let left = runtime.stringValue(args[0]), let right = runtime.stringValue(args[1]) else { return .int32(0) }
@@ -239,12 +249,14 @@ enum JavaCore {
             return .int32(l < r ? -1 : 1)
         }
         cls.method("contains", "(Ljava/lang/CharSequence;)Z") { runtime, args, _ in
-            guard let haystack = runtime.stringValue(args[0]), let needle = runtime.stringValue(args[1]) else {
-                return .boolean(false)
-            }
-            return .boolean(haystack.contains(needle))
+            .boolean(runtime.indexOf(args[0], needle: args[1], from: 0, last: false) >= 0)
         }
-        cls.method("startsWith", "(Ljava/lang/String;)Z") { runtime, args, _ in .boolean(runtime.stringValue(args[0])?.hasPrefix(runtime.stringValue(args[1]) ?? "") ?? false) }
+        cls.method("startsWith", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            guard let text = runtime.stringUnits(args[0]), let prefix = runtime.stringUnits(args[1]),
+                  prefix.count <= text.count else { return .boolean(false) }
+            for index in 0..<prefix.count where text[index] != prefix[index] { return .boolean(false) }
+            return .boolean(true)
+        }
         cls.method("startsWith", "(Ljava/lang/String;I)Z") { runtime, args, _ in
             guard let text = runtime.stringUnits(args[0]), let prefix = runtime.stringUnits(args[1]) else { return .boolean(false) }
             let offset = Int(args[2].asInt32)
@@ -253,7 +265,13 @@ enum JavaCore {
             for index in 0..<prefix.count where text[offset + index] != prefix[index] { return .boolean(false) }
             return .boolean(true)
         }
-        cls.method("endsWith", "(Ljava/lang/String;)Z") { runtime, args, _ in .boolean(runtime.stringValue(args[0])?.hasSuffix(runtime.stringValue(args[1]) ?? "") ?? false) }
+        cls.method("endsWith", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            guard let text = runtime.stringUnits(args[0]), let suffix = runtime.stringUnits(args[1]),
+                  suffix.count <= text.count else { return .boolean(false) }
+            let offset = text.count - suffix.count
+            for index in 0..<suffix.count where text[offset + index] != suffix[index] { return .boolean(false) }
+            return .boolean(true)
+        }
         cls.method("indexOf", "(I)I") { runtime, args, _ in
             guard let units = runtime.stringUnits(args[0]) else { return .int32(-1) }
             let target = UInt16(truncatingIfNeeded: args[1].asInt32)
@@ -290,10 +308,11 @@ enum JavaCore {
             return runtime.newString(left + right)
         }
         cls.method("replace", "(CC)Ljava/lang/String;") { runtime, args, _ in
-            guard let text = runtime.stringValue(args[0]) else { return .null }
-            let from = Character(UnicodeScalar(UInt32(truncatingIfNeeded: args[1].asInt32)) ?? " ")
-            let to = Character(UnicodeScalar(UInt32(truncatingIfNeeded: args[2].asInt32)) ?? " ")
-            return runtime.newString(text.replacingOccurrences(of: String(from), with: String(to)))
+            guard var units = runtime.stringUnits(args[0]) else { return .null }
+            let from = UInt16(truncatingIfNeeded: args[1].asInt32)
+            let to = UInt16(truncatingIfNeeded: args[2].asInt32)
+            for index in units.indices where units[index] == from { units[index] = to }
+            return runtime.newString(units: units)
         }
         cls.method("replace", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;") { runtime, args, _ in
             guard let text = runtime.stringValue(args[0]) else { return .null }
@@ -394,7 +413,7 @@ enum JavaCore {
         cls.staticMethod("valueOf", "(D)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asDouble)) }
         cls.staticMethod("valueOf", "(Z)Ljava/lang/String;") { runtime, args, _ in runtime.newString(args[0].asBoolean ? "true" : "false") }
         cls.staticMethod("valueOf", "(C)Ljava/lang/String;") { runtime, args, _ in
-            runtime.newString(String(UnicodeScalar(UInt32(truncatingIfNeeded: args[0].asInt32)) ?? " "))
+            runtime.newString(units: [UInt16(truncatingIfNeeded: args[0].asInt32)])
         }
         cls.staticMethod("valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             args[1].bits == 0 ? runtime.newString("null") : runtime.javaToString(args[1])
@@ -636,9 +655,7 @@ enum JavaCore {
         }
         cls.staticMethod("valueOf", "(Z)Ljava/lang/Boolean;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Boolean;") else { return .null }
-            let pointer = runtime.allocateObject(cls)
-            VMObjectLayout.setAux(pointer, args[0].asBoolean ? 1 : 0)
-            return .reference(pointer)
+            return cls.staticValues[args[0].asBoolean ? 0 : 1]
         }
         cls.staticMethod("parseBoolean", "(Ljava/lang/String;)Z") { runtime, args, _ in
             .boolean((runtime.stringValue(args[0]) ?? "").lowercased() == "true")
@@ -649,8 +666,11 @@ enum JavaCore {
             return .int32(Int32(left - right))
         }
         cls.method("hashCode", "()I") { _, args, _ in .int32(args[0].asBoolean2() ? 1231 : 1237) }
-        cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in
-            .boolean(args[1].bits != 0 && args[0].asBoolean2() == args[1].asBoolean2())
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Boolean;" else {
+                return .boolean(false)
+            }
+            return .boolean(args[0].asBoolean2() == args[1].asBoolean2())
         }
         return [cls]
     }
@@ -735,14 +755,17 @@ enum JavaCore {
         }
         cls.staticMethod("valueOf", "(Ljava/lang/String;)\(descriptor)") { runtime, args, _ in
             guard let cls = runtime.findClass(descriptor) else { return .null }
-            let text = runtime.stringValue(args[0]) ?? "0"
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Int64(text) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
             let pointer = runtime.allocateObject(cls)
-            VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(text.trimmingCharacters(in: .whitespaces)) ?? 0)
+            VMObjectLayout.slot(pointer, 0).pointee = .int64(value)
             return .reference(pointer)
         }
         cls.staticMethod("parseInt", "(Ljava/lang/String;)I") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
-            guard let value = Int32(text.trimmingCharacters(in: .whitespaces)) else {
+            guard let value = Int32(text) else {
                 throw VMJavaException("Ljava/lang/NumberFormatException;", text)
             }
             return .int32(value)
@@ -757,7 +780,7 @@ enum JavaCore {
         }
         cls.staticMethod("parseLong", "(Ljava/lang/String;)J") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
-            guard let value = Int64(text.trimmingCharacters(in: .whitespaces)) else {
+            guard let value = Int64(text) else {
                 throw VMJavaException("Ljava/lang/NumberFormatException;", text)
             }
             return .int64(value)
@@ -770,10 +793,18 @@ enum JavaCore {
             return .int64(value)
         }
         cls.staticMethod("parseDouble", "(Ljava/lang/String;)D") { runtime, args, _ in
-            .double(Double((runtime.stringValue(args[0]) ?? "").trimmingCharacters(in: .whitespaces)) ?? 0)
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Double(text.trimmingCharacters(in: .whitespaces)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .double(value)
         }
         cls.staticMethod("parseFloat", "(Ljava/lang/String;)F") { runtime, args, _ in
-            .float(Float((runtime.stringValue(args[0]) ?? "").trimmingCharacters(in: .whitespaces)) ?? 0)
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Float(text.trimmingCharacters(in: .whitespaces)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .float(value)
         }
         cls.staticMethod("toString", "(\(letter))Ljava/lang/String;") { runtime, args, _ in
             if letter == "J" { return runtime.newString(String(args[0].asInt64)) }
@@ -810,6 +841,19 @@ enum JavaCore {
             return .zero
         }
         cls.method("charValue", "()C") { _, args, _ in .int32(Int32(truncatingIfNeeded: args[0].asChar())) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Character;" else {
+                return .boolean(false)
+            }
+            return .boolean(args[0].asChar() == args[1].asChar())
+        }
+        cls.method("hashCode", "()I") { _, args, _ in .int32(Int32(args[0].asChar())) }
+        cls.method("compareTo", "(Ljava/lang/Character;)I") { _, args, _ in
+            .int32(Int32(args[0].asChar()) - Int32(args[1].asChar()))
+        }
+        cls.staticMethod("compare", "(CC)I") { _, args, _ in
+            .int32(Int32(args[0].asChar()) - Int32(args[1].asChar()))
+        }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(String(UnicodeScalar(UInt32(args[0].asChar())) ?? " "))
         }
@@ -866,6 +910,35 @@ enum JavaCore {
             cls.staticValues[1] = .float(.leastNonzeroMagnitude)
         }
         cls.method("floatValue", "()F") { _, args, _ in .float(args[0].asFloatBox()) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Float;" else {
+                return .boolean(false)
+            }
+            let left = args[0].asFloatBox(), right = args[1].asFloatBox()
+            if left.isNaN && right.isNaN { return .boolean(true) }
+            return .boolean(left.bitPattern == right.bitPattern)
+        }
+        cls.method("hashCode", "()I") { _, args, _ in
+            let value = args[0].asFloatBox()
+            return .int32(Int32(bitPattern: value.isNaN ? 0x7FC0_0000 : value.bitPattern))
+        }
+        cls.staticMethod("compare", "(FF)I") { _, args, _ in
+            let left = args[0].asFloat, right = args[1].asFloat
+            if left < right { return .int32(-1) }
+            if left > right { return .int32(1) }
+            let leftBits = left.isNaN ? 0x7FC0_0000 : left.bitPattern
+            let rightBits = right.isNaN ? 0x7FC0_0000 : right.bitPattern
+            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+        }
+        cls.method("compareTo", "(Ljava/lang/Float;)I") { _, args, _ in
+            let left = args[0].asFloatBox(), right = args[1].asFloatBox()
+            if left < right { return .int32(-1) }
+            if left > right { return .int32(1) }
+            let leftBits = left.isNaN ? 0x7FC0_0000 : left.bitPattern
+            let rightBits = right.isNaN ? 0x7FC0_0000 : right.bitPattern
+            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+        }
+        cls.staticMethod("isNaN", "(F)Z") { _, args, _ in .boolean(args[0].asFloat.isNaN) }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asFloatBox())) }
         cls.staticMethod("valueOf", "(F)Ljava/lang/Float;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Float;") else { return .null }
@@ -874,7 +947,11 @@ enum JavaCore {
             return .reference(pointer)
         }
         cls.staticMethod("parseFloat", "(Ljava/lang/String;)F") { runtime, args, _ in
-            .float(Float(runtime.stringValue(args[0]) ?? "0") ?? 0)
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Float(text.trimmingCharacters(in: .whitespaces)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .float(value)
         }
         return [cls]
     }
@@ -888,6 +965,36 @@ enum JavaCore {
             cls.staticValues[1] = .double(.leastNonzeroMagnitude)
         }
         cls.method("doubleValue", "()D") { _, args, _ in .double(args[0].asDoubleBox()) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Double;" else {
+                return .boolean(false)
+            }
+            let left = args[0].asDoubleBox(), right = args[1].asDoubleBox()
+            if left.isNaN && right.isNaN { return .boolean(true) }
+            return .boolean(left.bitPattern == right.bitPattern)
+        }
+        cls.method("hashCode", "()I") { _, args, _ in
+            let value = args[0].asDoubleBox()
+            let bits = value.isNaN ? UInt64(0x7FF8_0000_0000_0000) : value.bitPattern
+            return .int32(Int32(truncatingIfNeeded: bits ^ (bits >> 32)))
+        }
+        cls.staticMethod("compare", "(DD)I") { _, args, _ in
+            let left = args[0].asDouble, right = args[1].asDouble
+            if left < right { return .int32(-1) }
+            if left > right { return .int32(1) }
+            let leftBits = left.isNaN ? 0x7FF8_0000_0000_0000 : left.bitPattern
+            let rightBits = right.isNaN ? 0x7FF8_0000_0000_0000 : right.bitPattern
+            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+        }
+        cls.method("compareTo", "(Ljava/lang/Double;)I") { _, args, _ in
+            let left = args[0].asDoubleBox(), right = args[1].asDoubleBox()
+            if left < right { return .int32(-1) }
+            if left > right { return .int32(1) }
+            let leftBits = left.isNaN ? UInt64(0x7FF8_0000_0000_0000) : left.bitPattern
+            let rightBits = right.isNaN ? UInt64(0x7FF8_0000_0000_0000) : right.bitPattern
+            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+        }
+        cls.staticMethod("isNaN", "(D)Z") { _, args, _ in .boolean(args[0].asDouble.isNaN) }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asDoubleBox())) }
         cls.staticMethod("valueOf", "(D)Ljava/lang/Double;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Double;") else { return .null }
@@ -896,7 +1003,11 @@ enum JavaCore {
             return .reference(pointer)
         }
         cls.staticMethod("parseDouble", "(Ljava/lang/String;)D") { runtime, args, _ in
-            .double(Double(runtime.stringValue(args[0]) ?? "0") ?? 0)
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Double(text.trimmingCharacters(in: .whitespaces)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .double(value)
         }
         return [cls]
     }
@@ -917,8 +1028,18 @@ enum JavaCore {
         cls.staticMethod("abs", "(J)J") { _, args, _ in .int64(args[0].asInt64.magnitude == 0x8000_0000_0000_0000 ? args[0].asInt64 : Swift.abs(args[0].asInt64)) }
         cls.staticMethod("abs", "(F)F") { _, args, _ in .float(Swift.abs(args[0].asFloat)) }
         cls.staticMethod("abs", "(D)D") { _, args, _ in .double(Swift.abs(args[0].asDouble)) }
-        cls.staticMethod("round", "(F)I") { _, args, _ in .int32(Int32((args[0].asFloat).rounded())) }
-        cls.staticMethod("round", "(D)J") { _, args, _ in .int64(Int64((args[0].asDouble).rounded())) }
+        cls.staticMethod("round", "(F)I") { _, args, _ in
+            let value = args[0].asFloat
+            if value.isNaN { return .int32(0) }
+            let rounded = (Double(value) + 0.5).rounded(.down)
+            return .int32(Int32(min(max(rounded, Double(Int32.min)), Double(Int32.max))))
+        }
+        cls.staticMethod("round", "(D)J") { _, args, _ in
+            let value = args[0].asDouble
+            if value.isNaN { return .int64(0) }
+            let rounded = (value + 0.5).rounded(.down)
+            return .int64(Int64(min(max(rounded, Double(Int64.min)), Double(Int64.max))))
+        }
         cls.staticMethod("floor", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.down)) }
         cls.staticMethod("ceil", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.up)) }
         cls.staticMethod("pow", "(DD)D") { _, args, _ in .double(pow(args[0].asDouble, args[1].asDouble)) }

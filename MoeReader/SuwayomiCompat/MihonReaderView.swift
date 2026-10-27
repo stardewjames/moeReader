@@ -12,6 +12,7 @@ struct MihonReaderView: View {
     @State private var pageIndex = 0
     @State private var isLoading = true
     @State private var errorMessage: String?
+    @State private var didLoad = false
 
     private var progressKey: String {
         "MihonCompat.Progress.\(packageName).\(source.identity).\(chapter.id)"
@@ -100,6 +101,8 @@ struct MihonReaderView: View {
         }
         .statusBarHidden()
         .task {
+            guard !didLoad else { return }
+            didLoad = true
             await load()
         }
         .onChange(of: pageIndex) {
@@ -110,6 +113,7 @@ struct MihonReaderView: View {
 
     private func load() async {
         isLoading = true
+        defer { isLoading = false }
         errorMessage = nil
         do {
             pages = try await runtime.pages(chapter: chapter, manga: manga, source: source)
@@ -118,13 +122,11 @@ struct MihonReaderView: View {
             }
             let saved = UserDefaults.standard.integer(forKey: progressKey)
             pageIndex = min(max(saved, 0), pages.count - 1)
-            isLoading = false
             prefetchAroundCurrentPage()
         } catch is CancellationError {
             return
         } catch {
             errorMessage = error.localizedDescription
-            isLoading = false
         }
     }
 

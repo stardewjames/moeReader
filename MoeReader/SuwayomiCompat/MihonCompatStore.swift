@@ -50,14 +50,24 @@ actor MihonCompatStore {
         let repository = try await service.makeRepository(indexURL: indexURL)
         repositories.append(repository)
         repositories.sort { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
-        try persistRepositories()
+        do {
+            try persistRepositories()
+        } catch {
+            repositories.removeAll { $0.id == repository.id }
+            throw error
+        }
         return repository.id
     }
 
     func removeRepository(id: UUID) throws {
-        guard repositories.contains(where: { $0.id == id }) else { return }
-        repositories.removeAll { $0.id == id }
-        try persistRepositories()
+        guard let index = repositories.firstIndex(where: { $0.id == id }) else { return }
+        let removed = repositories.remove(at: index)
+        do {
+            try persistRepositories()
+        } catch {
+            repositories.insert(removed, at: min(index, repositories.count))
+            throw error
+        }
     }
 
     func refreshRepository(id: UUID) async throws {
@@ -193,8 +203,14 @@ actor MihonCompatStore {
             return
         }
         guard installed[index].isEnabled != isEnabled else { return }
+        let previous = installed[index].isEnabled
         installed[index].isEnabled = isEnabled
-        try persistInstalled()
+        do {
+            try persistInstalled()
+        } catch {
+            installed[index].isEnabled = previous
+            throw error
+        }
     }
 
     nonisolated func apkURL(for installedExtension: MihonInstalledExtension) -> URL {

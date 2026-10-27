@@ -7,6 +7,7 @@ enum MihonError: Error, LocalizedError, Equatable, Sendable {
     case invalidIndex(String)
     case unsupportedIndex(String)
     case indexTooLarge(Int)
+    case responseTooLarge(Int)
     case untrustedRepository
     case signingKeyChanged(String)
     case extensionNotInRepository(String)
@@ -39,6 +40,8 @@ enum MihonError: Error, LocalizedError, Equatable, Sendable {
             "This extension index isn’t supported: \(detail)"
         case .indexTooLarge(let bytes):
             "The extension index is too large (\(bytes) bytes)."
+        case .responseTooLarge(let bytes):
+            "The server response is too large (\(bytes) bytes)."
         case .untrustedRepository:
             "The repository doesn’t publish a signing key, so its extensions can’t be verified."
         case .signingKeyChanged(let expected):

@@ -40,6 +40,7 @@ extension VMRuntime {
         let callerClass = try linkClass(callerOwner)
         let previousFrame = currentFrame
         currentFrame = "\(callerOwner).\(method.key)"
+        defer { currentFrame = previousFrame }
         let insnUnits = code.insnUnits
         var pc = 0
         var result: VMValue = .zero
@@ -201,7 +202,7 @@ extension VMRuntime {
                 case 0x19: // const-wide/high16
                     let a = Int(unit >> 8)
                     guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
-                    registers[a] = .int64(Int64(bitPattern: UInt64(u1) << 48))
+                    registers[a] = .int64(Int64(Int16(bitPattern: u1)) << 48)
                     pc += 2
                 case 0x1a: // const-string
                     let a = Int(unit >> 8)
@@ -275,6 +276,9 @@ extension VMRuntime {
                     let c = Int((u2) & 0xF), d = Int((u2 >> 4) & 0xF)
                     let e = Int((u2 >> 8) & 0xF), f = Int((u2 >> 12) & 0xF)
                     let registerList = [c, d, e, f, g]
+                    guard count <= registerList.count else {
+                        throw failure("Ljava/lang/VerifyError;", "filled-new-array register count")
+                    }
                     guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
                     let descriptor = dex.type(at: Int(u1))
                     guard descriptor.first == "[" else { throw failure("Ljava/lang/VerifyError;", "filled-new-array of non-array type") }
@@ -458,7 +462,19 @@ extension VMRuntime {
                     let index = Int(registers[c].asInt32)
                     let count = Int(VMObjectLayout.aux(pointer))
                     guard index >= 0, index < count else { throw failure("Ljava/lang/ArrayIndexOutOfBoundsException;") }
-                    registers[a] = VMObjectLayout.slot(pointer, index).pointee
+                    let raw = VMObjectLayout.slot(pointer, index).pointee
+                    switch opcode {
+                    case 0x47: // aget-boolean
+                        registers[a] = .int32((raw.asInt32 == 0 ? 0 : 1))
+                    case 0x48: // aget-byte
+                        registers[a] = .int32(Int32(Int8(truncatingIfNeeded: raw.asInt32)))
+                    case 0x49: // aget-char
+                        registers[a] = .int32(Int32(UInt16(truncatingIfNeeded: raw.asInt32)))
+                    case 0x4a: // aget-short
+                        registers[a] = .int32(Int32(Int16(truncatingIfNeeded: raw.asInt32)))
+                    default:
+                        registers[a] = raw
+                    }
                     pc += 2
                 case 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51:
                     let a = Int(unit >> 8), b = Int(u1 & 0xFF), c = Int(u1 >> 8)
@@ -470,15 +486,27 @@ extension VMRuntime {
                     let count = Int(VMObjectLayout.aux(pointer))
                     guard index >= 0, index < count else { throw failure("Ljava/lang/ArrayIndexOutOfBoundsException;") }
                     var value = registers[a]
-                    if opcode == 0x4d { // aput-object: verify reference type
+                    switch opcode {
+                    case 0x4d: // aput-object: verify reference type
                         let arrayClass = VMObjectLayout.cls(pointer)
                         if value.bits != 0, let component = componentClass(of: arrayClass) {
                             guard isInstance(value, of: component) else {
                                 throw failure("Ljava/lang/ArrayStoreException;")
                             }
                         }
+                    case 0x4e: // aput-boolean
+                        value = .int32(value.asInt32 == 0 ? 0 : 1)
+                    case 0x4f: // aput-byte
+                        value = .int32(Int32(Int8(truncatingIfNeeded: value.asInt32)))
+                    case 0x50: // aput-char
+                        value = .int32(Int32(UInt16(truncatingIfNeeded: value.asInt32)))
+                    case 0x51: // aput-short
+                        value = .int32(Int32(Int16(truncatingIfNeeded: value.asInt32)))
+                    case 0x4b: // aput-int
+                        value = .int32(value.asInt32)
+                    default:
+                        break
                     }
-                    if opcode == 0x4b { value = .int32(value.asInt32) }
                     VMObjectLayout.slot(pointer, index).pointee = value
                     pc += 2
 

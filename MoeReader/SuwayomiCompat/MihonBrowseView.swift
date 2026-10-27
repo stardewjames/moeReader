@@ -261,7 +261,6 @@ struct MihonBrowseView: View {
             return
         } catch {
             errorMessage = error.localizedDescription
-            hasMore = false
         }
     }
 }

@@ -32,7 +32,40 @@ final class VMOkioBufferedSinkPayload {
 
 final class VMOkioBufferPayload {
     var data = Data()
-    init(data: Data = Data()) { self.data = data }
+    /// When this Buffer came from `BufferedSink.buffer()`, writes belong to the
+    /// sink rather than a detached snapshot.
+    var backingSink: VMOkioSinkPayload?
+
+    init(data: Data = Data(), backingSink: VMOkioSinkPayload? = nil) {
+        self.data = data
+        self.backingSink = backingSink
+    }
+
+    var count: Int { backingSink?.data.count ?? data.count }
+
+    func append(_ bytes: Data) {
+        if let backingSink {
+            backingSink.data.append(bytes)
+        } else {
+            data.append(bytes)
+        }
+    }
+
+    func takeAll() -> Data {
+        if let backingSink {
+            let bytes = backingSink.data
+            backingSink.data.removeAll()
+            return bytes
+        }
+        let bytes = data
+        data.removeAll()
+        return bytes
+    }
+
+    func clearAll() {
+        data.removeAll()
+        backingSink?.data.removeAll()
+    }
 }
 
 enum FileRuntime {
@@ -212,7 +245,7 @@ enum FileRuntime {
             let count = max(0, Int(args[2].asInt64))
             let chunk = payload.consume(count)
             if chunk.isEmpty && payload.offset >= payload.data.count { return .int64(-1) }
-            buffer.data.append(chunk)
+            buffer.append(chunk)
             return .int64(Int64(chunk.count))
         }
         source.method("close", "()V") { _, _, _ in .zero }
@@ -224,7 +257,10 @@ enum FileRuntime {
             guard let buffered: VMOkioSinkPayload = runtime.payload(args[0], as: VMOkioSinkPayload.self) else { return .zero }
             let buffer: VMOkioBufferPayload? = runtime.payload(args[1], as: VMOkioBufferPayload.self)
             let count = max(0, Int(args[2].asInt64))
-            if let buffer { buffered.data.append(buffer.data.prefix(count)) }
+            if let buffer {
+                buffered.data.append(buffer.data.prefix(count))
+                buffer.data.removeFirst(min(count, buffer.data.count))
+            }
             return .zero
         }
         sink.method("flush", "()V") { runtime, args, _ in
@@ -244,28 +280,26 @@ enum FileRuntime {
             return .zero
         }
         buffer.method("size", "()J") { runtime, args, _ in
-            .int64(Int64(runtime.payload(args[0], as: VMOkioBufferPayload.self)?.data.count ?? 0))
+            .int64(Int64(runtime.payload(args[0], as: VMOkioBufferPayload.self)?.count ?? 0))
         }
         buffer.method("writeUtf8", "(Ljava/lang/String;)Lokio/Buffer;") { runtime, args, _ in
             let payload = try runtime.payloadBox(args[0], as: VMOkioBufferPayload.self)
-            payload.data.append(Data((runtime.stringValue(args[1]) ?? "").utf8))
+            payload.append(Data((runtime.stringValue(args[1]) ?? "").utf8))
             return args[0]
         }
         buffer.method("readUtf8", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMOkioBufferPayload.self) else { return .null }
-            let text = String(decoding: payload.data, as: UTF8.self)
-            payload.data.removeAll()
-            return runtime.newString(text)
+            return runtime.newString(String(decoding: payload.takeAll(), as: UTF8.self))
         }
         buffer.method("readByteArray", "()[B") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMOkioBufferPayload.self) else { return .null }
-            let array = runtime.newArray(component: "B", count: payload.data.count)
-            for (index, byte) in payload.data.enumerated() { runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: byte)))) }
-            payload.data.removeAll()
+            let data = payload.takeAll()
+            let array = runtime.newArray(component: "B", count: data.count)
+            for (index, byte) in data.enumerated() { runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: byte)))) }
             return array
         }
         buffer.method("clear", "()Lokio/Buffer;") { runtime, args, _ in
-            (runtime.payload(args[0], as: VMOkioBufferPayload.self))?.data.removeAll()
+            (runtime.payload(args[0], as: VMOkioBufferPayload.self))?.clearAll()
             return args[0]
         }
         buffer.method("close", "()V") { _, _, _ in .zero }
@@ -337,7 +371,9 @@ enum FileRuntime {
         }
         bufferedSink.method("writeByteArray", "([BII)Lokio/BufferedSink;") { runtime, args, _ in
             guard let payload: VMOkioBufferedSinkPayload = runtime.payload(args[0], as: VMOkioBufferedSinkPayload.self) else { return args[0] }
-            payload.sink.data.append(bytes(runtime, args[1], from: Int(args[2].asInt32), to: Int(args[3].asInt32)))
+            let offset = Int(args[2].asInt32)
+            let count = Int(args[3].asInt32)
+            payload.sink.data.append(bytes(runtime, args[1], from: offset, to: offset + count))
             return args[0]
         }
         bufferedSink.method("write", "([B)Lokio/BufferedSink;") { runtime, args, _ in
@@ -347,7 +383,9 @@ enum FileRuntime {
         }
         bufferedSink.method("write", "([BII)Lokio/BufferedSink;") { runtime, args, _ in
             guard let payload: VMOkioBufferedSinkPayload = runtime.payload(args[0], as: VMOkioBufferedSinkPayload.self) else { return args[0] }
-            payload.sink.data.append(bytes(runtime, args[1], from: Int(args[2].asInt32), to: Int(args[3].asInt32)))
+            let offset = Int(args[2].asInt32)
+            let count = Int(args[3].asInt32)
+            payload.sink.data.append(bytes(runtime, args[1], from: offset, to: offset + count))
             return args[0]
         }
         for (name, signature, value) in [
@@ -381,7 +419,7 @@ enum FileRuntime {
         }
         bufferedSink.method("buffer", "()Lokio/Buffer;") { runtime, args, _ in
             guard let payload: VMOkioBufferedSinkPayload = runtime.payload(args[0], as: VMOkioBufferedSinkPayload.self) else { return .null }
-            return runtime.makeNative("Lokio/Buffer;", payload: VMOkioBufferPayload(data: payload.sink.data))
+            return runtime.makeNative("Lokio/Buffer;", payload: VMOkioBufferPayload(backingSink: payload.sink))
         }
         bufferedSink.method("writeAll", "(Lokio/Source;)J") { runtime, args, _ in
             guard let payload: VMOkioBufferedSinkPayload = runtime.payload(args[0], as: VMOkioBufferedSinkPayload.self),
@@ -443,9 +481,10 @@ enum FileRuntime {
     }
 
     static func absolutePath(_ runtime: VMRuntime, _ path: String) -> String {
-        if path.hasPrefix("/") { return path }
         let root = URL(fileURLWithPath: runtime.extensionFileRoot()).standardizedFileURL
-        let candidate = root.appendingPathComponent(path).standardizedFileURL
+        let candidate = path.hasPrefix("/")
+            ? URL(fileURLWithPath: path).standardizedFileURL
+            : root.appendingPathComponent(path).standardizedFileURL
         if candidate.path == root.path || candidate.path.hasPrefix(root.path + "/") {
             return candidate.path
         }

@@ -295,10 +295,16 @@ final class VMClass {
     /// do extra work when an extension (or an intermediate host class) overrides
     /// a helper.
     func hasImplementation(key: String, excluding ownerDescriptor: String) -> Bool {
+        hasImplementation(key: key, excluding: [ownerDescriptor])
+    }
+
+    /// Set form: ignores implementations declared by any of the host classes
+    /// that supply bridge defaults.
+    func hasImplementation(key: String, excluding ownerDescriptors: Set<String>) -> Bool {
         var cursor: VMClass? = self
         while let cls = cursor {
             if let method = cls.methods[key], !method.isStatic, !method.isAbstract {
-                return cls.descriptor != ownerDescriptor
+                return !ownerDescriptors.contains(cls.descriptor)
             }
             cursor = cls.superclass
         }
@@ -334,6 +340,16 @@ final class VMClass {
         while let cls = cursor {
             if let method = cls.methods[key], method.isStatic { return method }
             cursor = cls.superclass
+        }
+        var visited: Set<ObjectIdentifier> = []
+        return findInterfaceStatic(key, visited: &visited)
+    }
+
+    private func findInterfaceStatic(_ key: String, visited: inout Set<ObjectIdentifier>) -> VMMethod? {
+        guard visited.insert(ObjectIdentifier(self)).inserted else { return nil }
+        for proto in interfaces {
+            if let method = proto.methods[key], method.isStatic { return method }
+            if let found = proto.findInterfaceStatic(key, visited: &visited) { return found }
         }
         return nil
     }

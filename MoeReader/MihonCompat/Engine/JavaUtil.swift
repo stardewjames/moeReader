@@ -64,13 +64,23 @@ final class VMMapPayload {
 final class VMListIteratorPayload {
     let snapshot: [VMValue]
     var index = 0
-    init(_ snapshot: [VMValue]) { self.snapshot = snapshot }
+    var owner: VMListPayload?
+    var lastIndex: Int?
+    init(_ snapshot: [VMValue], owner: VMListPayload? = nil) {
+        self.snapshot = snapshot
+        self.owner = owner
+    }
 }
 
 final class VMEntryPayload {
     let key: VMValue
-    let value: VMValue
-    init(key: VMValue, value: VMValue) { self.key = key; self.value = value }
+    var value: VMValue
+    var owner: VMMapPayload?
+    init(key: VMValue, value: VMValue, owner: VMMapPayload? = nil) {
+        self.key = key
+        self.value = value
+        self.owner = owner
+    }
 }
 
 enum JavaUtil {
@@ -299,7 +309,10 @@ enum JavaUtil {
         }
         cls.method("add", "(ILjava/lang/Object;)V") { runtime, args, _ in
             let list = try runtime.mutableList(args[0])
-            let index = max(0, min(Int(args[1].asInt32), list.items.count))
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index <= list.items.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(list.items.count)")
+            }
             list.items.insert(args[2], at: index)
             return .zero
         }
@@ -340,12 +353,12 @@ enum JavaUtil {
             return .zero
         }
         cls.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
-            let items = runtime.listPayload(args[0])?.items ?? []
-            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(items))
+            let payload = runtime.listPayload(args[0])
+            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(payload?.items ?? [], owner: payload))
         }
         cls.method("listIterator", "()Ljava/util/ListIterator;") { runtime, args, _ in
-            let items = runtime.listPayload(args[0])?.items ?? []
-            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(items))
+            let payload = runtime.listPayload(args[0])
+            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(payload?.items ?? [], owner: payload))
         }
         cls.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
             let items = runtime.listItems(args[0]) ?? []
@@ -355,16 +368,25 @@ enum JavaUtil {
         }
         cls.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
             let items = runtime.listPayload(args[0])?.items ?? []
-            let array = runtime.newArray(component: "Ljava/lang/Object;", count: max(items.count, runtime.arrayLength(args[1])))
+            let suppliedCount = runtime.arrayLength(args[1])
+            if suppliedCount >= items.count {
+                for (index, item) in items.enumerated() { runtime.setArrayElement(args[1], index: index, value: item) }
+                if suppliedCount > items.count { runtime.setArrayElement(args[1], index: items.count, value: .null) }
+                return args[1]
+            }
+            let component = runtime.classOf(args[1])?.arrayComponent ?? "Ljava/lang/Object;"
+            let array = runtime.newArray(component: component, count: items.count)
             for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
             return array
         }
         cls.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
             let items = runtime.listPayload(args[0])?.items ?? []
-            let start = max(0, Int(args[1].asInt32))
-            let end = min(items.count, Int(args[2].asInt32))
-            let slice = start < end ? Array(items[start..<end]) : []
-            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(slice))
+            let start = Int(args[1].asInt32)
+            let end = Int(args[2].asInt32)
+            guard start >= 0, end <= items.count, start <= end else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(start)..<\(end), size \(items.count)")
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(Array(items[start..<end])))
         }
         cls.method("sort", "(Ljava/util/Comparator;)V") { runtime, args, _ in
             try runtime.sortList(args[0], comparator: args[1])
@@ -596,8 +618,11 @@ enum JavaUtil {
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
         }
         cls.method("entrySet", "()Ljava/util/Set;") { runtime, args, _ in
-            let entries = runtime.mapPayload(args[0])?.entries ?? []
-            return runtime.makeNative("Ljava/util/EntrySet;", payload: VMEntrySetPayload(entries: entries))
+            let map = runtime.mapPayload(args[0])
+            return runtime.makeNative(
+                "Ljava/util/EntrySet;",
+                payload: VMEntrySetPayload(entries: map?.entries ?? [], owner: map)
+            )
         }
         cls.method("forEach", "(Ljava/util/function/BiConsumer;)V") { runtime, args, _ in
             let entries = runtime.mapPayload(args[0])?.entries ?? []
@@ -638,6 +663,7 @@ enum JavaUtil {
             guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .null }
             guard iterator.index < iterator.snapshot.count else { throw VMJavaException("Ljava/util/NoSuchElementException;") }
             let value = iterator.snapshot[iterator.index]
+            iterator.lastIndex = iterator.index
             iterator.index += 1
             return value
         }
@@ -651,7 +677,17 @@ enum JavaUtil {
             iterator.index -= 1
             return iterator.snapshot[iterator.index]
         }
-        cls.method("remove", "()V") { _, _, _ in .zero }
+        cls.method("remove", "()V") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self),
+                  let last = iterator.lastIndex,
+                  let owner = iterator.owner else { return .zero }
+            if last >= 0, last < owner.items.count {
+                owner.items.remove(at: last)
+                iterator.index = max(0, iterator.index - 1)
+            }
+            iterator.lastIndex = nil
+            return .zero
+        }
         cls.method("forEachRemaining", "(Ljava/util/function/Consumer;)V") { runtime, args, _ in
             guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self),
                   let method = runtime.classOf(args[1])?.lookupVirtual(key: "accept(Ljava/lang/Object;)V") else { return .zero }
@@ -666,7 +702,12 @@ enum JavaUtil {
             guard let set = runtime.payload(args[0], as: VMEntrySetPayload.self) else {
                 return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload([]))
             }
-            let entries = set.entries.map { runtime.makeNative("Ljava/util/MapEntry;", payload: VMEntryPayload(key: $0.key, value: $0.value)) }
+            let entries = set.entries.map { entry in
+                runtime.makeNative(
+                    "Ljava/util/MapEntry;",
+                    payload: VMEntryPayload(key: entry.key, value: entry.value, owner: set.owner)
+                )
+            }
             return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(entries))
         }
         entrySet.method("size", "()I") { runtime, args, _ in
@@ -699,7 +740,14 @@ enum JavaUtil {
             (runtime.payload(args[0], as: VMEntryPayload.self)?.value) ?? .null
         }
         cls.method("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
-            (runtime.payload(args[0], as: VMEntryPayload.self)?.value) ?? .null
+            guard let entry: VMEntryPayload = runtime.payload(args[0], as: VMEntryPayload.self) else { return .null }
+            let previous = entry.value
+            entry.value = args[1]
+            if let owner = entry.owner,
+               let index = owner.entries.firstIndex(where: { runtime.javaEquals($0.key, entry.key) }) {
+                owner.entries[index].value = args[1]
+            }
+            return previous
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             guard let entry: VMEntryPayload = runtime.payload(args[0], as: VMEntryPayload.self) else { return .null }
@@ -1090,5 +1138,9 @@ final class VMStringJoinerPayload {
 
 final class VMEntrySetPayload {
     let entries: [(key: VMValue, value: VMValue)]
-    init(entries: [(key: VMValue, value: VMValue)]) { self.entries = entries }
+    var owner: VMMapPayload?
+    init(entries: [(key: VMValue, value: VMValue)], owner: VMMapPayload? = nil) {
+        self.entries = entries
+        self.owner = owner
+    }
 }

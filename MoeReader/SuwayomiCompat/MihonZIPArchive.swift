@@ -54,12 +54,14 @@ struct MihonZIPArchive: Sendable {
 
         guard entryCount >= 0, directoryOffset >= 0, directorySize >= 0,
               directoryOffset <= bytes.count,
-              directorySize <= bytes.count - directoryOffset else {
+              directorySize <= bytes.count - directoryOffset,
+              entryCount <= 100_000,
+              entryCount == 0 || entryCount <= directorySize / 46 else {
             throw MihonZIPError.truncated
         }
 
         var entries: [MihonZIPEntry] = []
-        entries.reserveCapacity(entryCount)
+        entries.reserveCapacity(min(entryCount, 1_024))
         var index = directoryOffset
         for _ in 0..<entryCount {
             guard index + 46 <= bytes.count, Self.u32(bytes, index) == 0x0201_4b50 else {
@@ -96,7 +98,8 @@ struct MihonZIPArchive: Sendable {
                 localOffset = values.localOffset
             }
 
-            guard nameLength > 0, localOffset <= bytes.count else {
+            guard nameLength > 0, localOffset >= 0, localOffset <= bytes.count,
+                  compressed >= 0, uncompressed >= 0 else {
                 throw MihonZIPError.invalidEntry
             }
             guard let name = String(
@@ -151,7 +154,8 @@ struct MihonZIPArchive: Sendable {
         let nameLength = Int(Self.u16(bytes, offset + 26))
         let extraLength = Int(Self.u16(bytes, offset + 28))
         let dataStart = offset + 30 + nameLength + extraLength
-        guard dataStart <= bytes.count,
+        guard dataStart >= 0, dataStart <= bytes.count,
+              entry.compressedSize >= 0,
               entry.compressedSize <= bytes.count - dataStart else {
             throw MihonZIPError.truncated
         }

@@ -369,7 +369,9 @@ extension VMRuntime {
     func decode(bytes: [UInt8], charset: String) -> String {
         switch charset.uppercased() {
         case "UTF-8", "UTF8": return String(decoding: bytes, as: UTF8.self)
-        case "US-ASCII", "ASCII", "ISO-8859-1", "ISO8859-1", "LATIN1":
+        case "US-ASCII", "ASCII":
+            return String(decoding: bytes.map { UInt16($0 < 0x80 ? UInt16($0) : 0xFFFD) }, as: UTF16.self)
+        case "ISO-8859-1", "ISO8859-1", "LATIN1":
             return String(decoding: bytes.map { UInt16($0) }, as: UTF16.self)
         default: return String(decoding: bytes, as: UTF8.self)
         }

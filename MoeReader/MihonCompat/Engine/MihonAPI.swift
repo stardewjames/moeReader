@@ -162,12 +162,67 @@ enum MihonAPI {
         result.append(configurable)
 
         result.append(httpSourceClass())
+        result.append(httpSourceCompanionClass())
+        result.append(httpSourceKtClass())
         result.append(parsedHttpSourceClass())
         return result
     }
 
+    private static func httpSourceCompanionClass() -> NativeClass {
+        let cls = NativeClass("Leu/kanade/tachiyomi/source/online/HttpSource$Companion;", superclass: "Ljava/lang/Object;")
+        cls.method("getINIT_USER_AGENT", "()Ljava/lang/String;") { runtime, _, _ in
+            guard let owner = runtime.findClass("Leu/kanade/tachiyomi/source/online/HttpSource;"),
+                  let field = owner.staticField(named: "INIT_USER_AGENT") else { return .null }
+            return owner.staticValue(field)
+        }
+        cls.method("getDEFAULT_USER_AGENT", "()Ljava/lang/String;") { runtime, _, _ in
+            guard let owner = runtime.findClass("Leu/kanade/tachiyomi/source/online/HttpSource;"),
+                  let field = owner.staticField(named: "DEFAULT_USER_AGENT") else { return .null }
+            return owner.staticValue(field)
+        }
+        cls.method("setDEFAULT_USER_AGENT", "(Ljava/lang/String;)V") { runtime, args, _ in
+            guard let owner = runtime.findClass("Leu/kanade/tachiyomi/source/online/HttpSource;"),
+                  let field = owner.staticField(named: "DEFAULT_USER_AGENT") else { return .zero }
+            owner.setStaticValue(field, args[1])
+            return .zero
+        }
+        return cls
+    }
+
+    private static func httpSourceKtClass() -> NativeClass {
+        let cls = NativeClass("Leu/kanade/tachiyomi/source/online/HttpSourceKt;")
+        for (descriptor, accessor) in [
+            ("Leu/kanade/tachiyomi/source/model/SChapter;", "chapter"),
+            ("Leu/kanade/tachiyomi/source/model/SManga;", "manga"),
+        ] {
+            cls.staticMethod("setUrlWithoutDomain", "(\(descriptor)Ljava/lang/String;)V") { runtime, args, _ in
+                let url = runtime.stringValue(args[1]) ?? ""
+                let path = runtime.withoutDomain(url)
+                if accessor == "chapter" {
+                    runtime.chapter(args[0]).url = runtime.newString(path)
+                } else {
+                    runtime.manga(args[0]).url = runtime.newString(path)
+                }
+                return .zero
+            }
+        }
+        return cls
+    }
+
     private static func httpSourceClass() -> NativeClass {
         let cls = NativeClass("Leu/kanade/tachiyomi/source/online/HttpSource;", superclass: "Ljava/lang/Object;", interfaces: ["Leu/kanade/tachiyomi/source/CatalogueSource;"])
+        cls.staticField("Companion", "Leu/kanade/tachiyomi/source/online/HttpSource$Companion;")
+        cls.staticField("INIT_USER_AGENT", "Ljava/lang/String;")
+        cls.staticField("DEFAULT_USER_AGENT", "Ljava/lang/String;")
+        let defaultUserAgent = userAgent(sourceName: "")
+        cls.prepare = { runtime, clazz in
+            clazz.staticValues[0] = runtime.makeNative(
+                "Leu/kanade/tachiyomi/source/online/HttpSource$Companion;",
+                payload: NSNull()
+            )
+            clazz.staticValues[1] = runtime.newString(defaultUserAgent)
+            clazz.staticValues[2] = runtime.newString(defaultUserAgent)
+        }
         // Mihon's HttpSource declares `val headers by lazy`; extensions replace
         // this delegate through reflection to install their own headers.
         cls.field("headers$delegate", "Lkotlin/Lazy;")
@@ -323,11 +378,17 @@ enum MihonAPI {
         cls.method("headersBuilder", "()Lokhttp3/Headers$Builder;") { runtime, args, _ in
             let builder = runtime.makeNative("Lokhttp3/Headers$Builder;", payload: VMHeadersPayload())
             let name = runtime.stringValue(runtime.callVirtual(args[0], "getName()Ljava/lang/String;", []) ?? .null) ?? ""
+            var agent = MihonAPI.userAgent(sourceName: name)
+            if let sourceClass = runtime.findClass("Leu/kanade/tachiyomi/source/online/HttpSource;"),
+               let field = sourceClass.staticField(named: "DEFAULT_USER_AGENT"),
+               let configured = runtime.stringValue(sourceClass.staticValue(field)), !configured.isEmpty {
+                agent = configured
+            }
             if let method = runtime.classOf(builder)?.lookupVirtual(key: "add(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Headers$Builder;") {
                 _ = try runtime.invoke(method, [
                     builder,
                     runtime.newString("User-Agent"),
-                    runtime.newString(MihonAPI.userAgent(sourceName: name)),
+                    runtime.newString(agent),
                 ])
             }
             return builder
@@ -344,10 +405,19 @@ enum MihonAPI {
         }
         cls.method("getImageUrl", "(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             let page: VMPagePayload? = runtime.payload(args[1], as: VMPagePayload.self)
-            if let imageUrl = page?.imageUrl, imageUrl.bits != 0 { return imageUrl }
+            if let imageUrl = page?.imageUrl, imageUrl.bits != 0,
+               let text = runtime.stringValue(imageUrl), !text.isEmpty {
+                return imageUrl
+            }
             let parseKey = "imageUrlParse(Lokhttp3/Response;)Ljava/lang/String;"
+            let documentKey = "imageUrlParse(Lorg/jsoup/nodes/Document;)Ljava/lang/String;"
+            let hostBridges: Set<String> = [
+                "Leu/kanade/tachiyomi/source/online/HttpSource;",
+                "Leu/kanade/tachiyomi/source/online/ParsedHttpSource;",
+            ]
             if let cls = runtime.classOf(args[0]),
-               cls.hasImplementation(key: parseKey, excluding: "Leu/kanade/tachiyomi/source/online/HttpSource;") {
+               cls.hasImplementation(key: parseKey, excluding: hostBridges)
+                || cls.hasImplementation(key: documentKey, excluding: hostBridges) {
                 let request = try invoke(
                     runtime, receiver: args[0],
                     key: "imageUrlRequest(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;",
@@ -400,6 +470,9 @@ enum MihonAPI {
         }
         cls.method("getFilterList", "()Leu/kanade/tachiyomi/source/model/FilterList;") { runtime, args, _ in
             runtime.makeFilterList([])
+        }
+        cls.method("prepareNewChapter", "(Leu/kanade/tachiyomi/source/model/SChapter;Leu/kanade/tachiyomi/source/model/SManga;)V") { _, _, _ in
+            .zero
         }
         return cls
     }
@@ -597,7 +670,9 @@ enum MihonAPI {
         let response = try runtime.executeOkHttp(request: request, client: client)
         if let payload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self),
            !(200..<300).contains(payload.code) {
-            throw VMJavaException("Leu/kanade/tachiyomi/network/HttpException;", "HTTP error \(payload.code)")
+            var exception = VMJavaException("Leu/kanade/tachiyomi/network/HttpException;", "HTTP error \(payload.code)")
+            exception.object = runtime.makeHttpException(payload.code)
+            throw exception
         }
         return response
     }
@@ -1071,6 +1146,14 @@ enum MihonAPI {
         select.method("getValues", "()[Ljava/lang/Object;") { runtime, args, _ in
             runtime.payload(args[0], as: VMFilterPayload.self)?.values ?? .null
         }
+        select.method("getDisplayValues", "()Ljava/util/List;") { runtime, args, _ in
+            guard let values = runtime.payload(args[0], as: VMFilterPayload.self)?.values else { return .null }
+            var display: [VMValue] = []
+            for index in 0..<runtime.arrayLength(values) {
+                display.append(runtime.newString(runtime.stringValue(runtime.javaToString(runtime.arrayElement(values, index))) ?? ""))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(display))
+        }
         result.append(select)
 
         let group = filtered("Leu/kanade/tachiyomi/source/model/Filter$Group;", kind: .group)
@@ -1301,7 +1384,9 @@ enum MihonAPI {
             let response = try runtime.invoke(method, [args[0]])
             guard let payload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self) else { return .null }
             guard (200..<300).contains(payload.code) else {
-                throw VMJavaException("Leu/kanade/tachiyomi/network/HttpException;", "HTTP error \(payload.code)")
+                var exception = VMJavaException("Leu/kanade/tachiyomi/network/HttpException;", "HTTP error \(payload.code)")
+                exception.object = runtime.makeHttpException(payload.code)
+                throw exception
             }
             return response
         }
@@ -1392,8 +1477,10 @@ enum MihonAPI {
 
         let appInfo = NativeClass("Leu/kanade/tachiyomi/AppInfo;", superclass: "Ljava/lang/Object;")
         appInfo.staticField("INSTANCE", "Leu/kanade/tachiyomi/AppInfo;")
+        appInfo.staticField("VERSION_NAME", "Ljava/lang/String;")
         appInfo.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Leu/kanade/tachiyomi/AppInfo;", payload: NSNull())
+            cls.staticValues[1] = runtime.newString("0.1.0-mihoncompat")
         }
         appInfo.method("getVersionCode", "()I") { _, _, _ in .int32(1) }
         appInfo.method("getVersionName", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("0.1.0-mihoncompat") }
@@ -1409,6 +1496,9 @@ enum MihonAPI {
         let networkHelperClass = result.first { $0.descriptor == "Leu/kanade/tachiyomi/network/NetworkHelper;" }
         _ = networkHelperClass?.method("defaultUserAgentProvider", "()Ljava/lang/String;") { runtime, _, _ in
             runtime.newString(MihonAPI.userAgent(sourceName: ""))
+        }
+        _ = networkHelperClass?.method("getCloudflareClient", "()Lokhttp3/OkHttpClient;") { runtime, args, _ in
+            runtime.callVirtual(args[0], "getClient()Lokhttp3/OkHttpClient;", []) ?? .null
         }
         return result
     }
@@ -1517,6 +1607,15 @@ extension VMRuntime {
 
     func makeFilterList(_ filters: [VMValue]) -> VMValue {
         makeNative("Leu/kanade/tachiyomi/source/model/FilterList;", payload: VMListPayload(filters, immutable: true))
+    }
+
+    func makeHttpException(_ code: Int) -> VMValue {
+        guard let cls = findClass("Leu/kanade/tachiyomi/network/HttpException;") else { return .null }
+        let value = VMValue.reference(allocateObject(cls))
+        if let constructor = cls.lookupVirtual(key: "<init>(I)V") {
+            _ = try? invoke(constructor, [value, .int32(Int32(code))])
+        }
+        return value
     }
 
     func absoluteUrl(_ relative: VMValue, source: VMValue) -> VMValue {
@@ -1659,6 +1758,35 @@ extension MihonAPI {
         cls.method("setMemo", "(Lkotlinx/serialization/json/JsonObject;)V") { r, a, _ in r.manga(a[0]).memo = a[1]; return .zero }
         cls.method("getInitialized", "()Z") { r, a, _ in .boolean(r.manga(a[0]).initialized) }
         cls.method("setInitialized", "(Z)V") { r, a, _ in r.manga(a[0]).initialized = a[1].asBoolean; return .zero }
+        for name in ["copyFrom", "cloneFrom"] {
+            cls.method(name, "(Leu/kanade/tachiyomi/source/model/SManga;)V") { runtime, args, _ in
+                let target = runtime.manga(args[0])
+                let other = runtime.manga(args[1])
+                if name == "cloneFrom" {
+                    target.url = other.url
+                    target.title = other.title
+                    target.artist = other.artist
+                    target.author = other.author
+                    target.description = other.description
+                    target.genre = other.genre
+                    target.status = other.status
+                    target.thumbnail = other.thumbnail
+                    target.updateStrategy = other.updateStrategy
+                    target.initialized = other.initialized
+                    target.memo = other.memo
+                    return .zero
+                }
+                if other.author.bits != 0 { target.author = other.author }
+                if other.artist.bits != 0 { target.artist = other.artist }
+                if other.description.bits != 0 { target.description = other.description }
+                if other.genre.bits != 0 { target.genre = other.genre }
+                if other.thumbnail.bits != 0 { target.thumbnail = other.thumbnail }
+                target.status = other.status
+                if !target.initialized { target.initialized = other.initialized }
+                target.memo = other.memo
+                return .zero
+            }
+        }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.stringValue(runtime.manga(args[0]).title) ?? "")
         }
@@ -1695,6 +1823,17 @@ extension MihonAPI {
         cls.method("setNote", "(Ljava/lang/String;)V") { r, a, _ in try r.chapter(a[0]).note = a[1]; return .zero }
         cls.method("getMemo", "()Lkotlinx/serialization/json/JsonObject;") { r, a, _ in r.chapter(a[0]).memo }
         cls.method("setMemo", "(Lkotlinx/serialization/json/JsonObject;)V") { r, a, _ in try r.chapter(a[0]).memo = a[1]; return .zero }
+        cls.method("copyFrom", "(Leu/kanade/tachiyomi/source/model/SChapter;)V") { runtime, args, _ in
+            let target = runtime.chapter(args[0])
+            let other = runtime.chapter(args[1])
+            target.name = other.name
+            target.url = other.url
+            target.dateUpload = other.dateUpload
+            target.chapterNumber = other.chapterNumber
+            target.scanlator = other.scanlator
+            target.memo = other.memo
+            return .zero
+        }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             let chapter = runtime.chapter(args[0])
             return runtime.newString(runtime.stringValue(chapter.name) ?? "")

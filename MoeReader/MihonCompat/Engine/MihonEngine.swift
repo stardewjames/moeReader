@@ -15,9 +15,10 @@ struct MihonEngineSourceInfo: Sendable, Hashable {
     var id: Int64
 }
 
-struct MihonEngineError: Error, CustomStringConvertible {
+struct MihonEngineError: Error, CustomStringConvertible, LocalizedError {
     var description: String
     init(_ message: String) { description = message }
+    var errorDescription: String? { description }
 }
 
 final class MihonEngine: @unchecked Sendable {
@@ -131,8 +132,9 @@ final class MihonEngine: @unchecked Sendable {
 
     func sourceInfos() -> [MihonEngineSourceInfo] {
         runtime.resetBudget()
-        return sources.compactMap { source in
-            guard let name = runtime.stringValue(call(source, "getName()Ljava/lang/String;") ?? .null) else { return nil }
+        return sources.enumerated().map { index, source in
+            let name = runtime.stringValue(call(source, "getName()Ljava/lang/String;") ?? .null)
+                ?? "Source \(index + 1)"
             let language = runtime.stringValue(call(source, "getLanguage()Ljava/lang/String;") ?? .null)
                 ?? runtime.stringValue(call(source, "getLang()Ljava/lang/String;") ?? .null)
                 ?? "all"
@@ -253,12 +255,12 @@ final class MihonEngine: @unchecked Sendable {
         for (index, item) in items.enumerated() {
             guard let payload: VMPagePayload = runtime.payload(item, as: VMPagePayload.self) else { continue }
             var resolved = payload.imageUrl
-            if resolved.bits == 0 {
-                resolved = try callSuspend(
+            if resolved.bits == 0 || (runtime.stringValue(resolved)?.isEmpty ?? true) {
+                resolved = (try? callSuspend(
                     source,
                     "getImageUrl(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
                     [item]
-                )
+                )) ?? .null
                 if resolved.bits != 0 { payload.imageUrl = resolved }
             }
             let urlText = runtime.stringValue(resolved.bits != 0 ? resolved : payload.url) ?? ""
@@ -292,13 +294,14 @@ final class MihonEngine: @unchecked Sendable {
         }
         let stored = runtime.host?.preferences()
         var result: [MihonEnginePreference] = []
-        func collect(_ children: [VMValue]) {
+        func collect(_ children: [VMValue], depth: Int = 0) {
+            guard depth < 32 else { return }
             for child in children {
                 guard let pref: VMUiPreferencePayload = runtime.payload(child, as: VMUiPreferencePayload.self) else { continue }
                 if let preference = sourcePreference(pref, stored: stored) {
                     result.append(preference)
                 }
-                collect(pref.children)
+                collect(pref.children, depth: depth + 1)
             }
         }
         collect(payload.children)

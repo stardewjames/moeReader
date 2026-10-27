@@ -82,11 +82,12 @@ and the suspend lib-1.6 API in practice:
   `java.util` collections, `java.io` byte streams and `File` (metadata, mkdir,
   rename, temp files, listing), `java.time` parsing and formatting,
   `java.lang.reflect.Field`, atomics, `ConcurrentHashMap`, `ReentrantLock`.
-- **Kotlin**: `Intrinsics`, `Unit`, `Pair`/`Triple`, `Result`, `Lazy`,
-  collection/text/ranges helpers, sequences, `Regex`, `Duration`, `Instant`
-  (including `parseOrNull`), `kotlin.coroutines` internals, and the
-  `kotlinx.coroutines` builders needed by sources (`coroutineScope`,
-  `async`/`await`, `withContext`, `launch`, `delay`).
+- **Kotlin**: `Intrinsics`, `Unit`, `Pair`/`Triple`, `Result` (including
+  `getOrNull`/`getOrThrow`/unboxing), `Lazy`, collection/text/ranges helpers,
+  `Regex` with iterable `MatchResult` and `IntRange` groups, sequences,
+  `Duration`, `Instant` (including `parseOrNull`), `kotlin.coroutines`
+  internals, and the `kotlinx.coroutines` builders needed by sources
+  (`coroutineScope`, `async`/`await`, `withContext`, `launch`, `delay`).
 - **Android**: `android.net.Uri`, `android.text.Html`, `android.util.Base64`,
   `android.content` shared preferences (including string sets),
   `androidx.preference` controls for source preference screens.
@@ -98,9 +99,11 @@ and the suspend lib-1.6 API in practice:
   attribute access, a CSS selector engine (`>`, `+`, `~`, `:has`,
   `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), and the
   `selectText`/`selectInt`/`attrOrText`/`asJsoup` helpers.
-- **Mihon**: `Source`, `CatalogueSource`, `HttpSource`, `ParsedHttpSource`,
-  `SourceFactory`, `SManga`, `SChapter`, `Page`, `MangasPage`, `SMangaUpdate`,
-  filters and `FilterList`, `NetworkHelper`, `RequestsKt`
+- **Mihon**: `Source`, `CatalogueSource`, `HttpSource` (including its
+  `Companion` user-agent constants), `HttpSourceKt` URL helpers,
+  `ParsedHttpSource`, `SourceFactory`, `SManga`/`SChapter` with copy helpers,
+  `Page`, `MangasPage`, `SMangaUpdate`, filters and `FilterList` (including
+  `displayValues`), `NetworkHelper`, `RequestsKt`
   (`GET`/`POST`/`PUT`/`DELETE`), `OkHttpExtensionsKt`, `JsoupExtensionsKt`,
   `AppInfo`.
 
@@ -119,10 +122,19 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - `MihonEngineEdgeCaseTests` covers literal operand sources, `String` copy
   construction, array covariance, `clone`, unmodifiable collections, Java
   string/regex splitting, and positional/unknown Jsoup selectors.
+- `MihonRuntimeSemanticsTests` covers UTF-16 string operations, numeric
+  parsing failures, boxed boolean identity, list bounds/typed `toArray`,
+  `Map.Entry.setValue`, regex `next`/group ranges, and okio byte-count/buffer
+  semantics.
+- `MihonEngineArrayTests` runs a generated DEX fixture through the interpreter:
+  byte/char/short/boolean array widening and truncation, `filled-new-array`,
+  and sign-extended `const-wide/high16`.
+- `MihonEngineLifecycleTests` verifies that installing a different APK creates
+  a fresh runtime instead of reusing the removed package.
 - `MihonAPIContractTests` covers the deprecated `HttpSource` request/parse
   defaults, `ParsedHttpSource` selector parsers, legacy `imageUrlParse`
   resolution, filter tree rehydration, string-set preferences, `java.io.File`
-  with okio, and JSON element conversion.
+  with okio, JSON element conversion, and the `HttpSourceKt`/companion helpers.
 - `scripts/analyze_compat.py` audits an APK's host API references against the
   engine registry. See "Auditing the native surface" below.
 - An opt-in extension test runs a real lib-1.6 extension through the whole
@@ -169,7 +181,10 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 | Source preference screens | `setupPreferenceScreen` is executed and its controls are rendered by `MihonSourceSettingsView` (headers, toggles, single-choice lists, text, multi-select). Multi-select values persist as string sets in `SharedPreferences`; `setDialogTitle` is used as the text field's placeholder. |
 | Extension lib 1.4/1.5 API | Request/parse-style sources are supported through native `HttpSource` and `ParsedHttpSource` defaults, even when they predate the suspend API. Extensions that override only the RxJava `fetch*` methods still need an Rx host and are not executed. |
 | Zstd response bodies | `com.squareup.zstd.okio` is not linked; servers that require zstd transcoding fail closed with a typed error. |
-| Reflection beyond fields | `getDeclaredField` works; arbitrary method/handle reflection does not. |
+| Duplicate response headers | URLSession merges repeated response headers (notably `Set-Cookie`) into one value before the engine sees them; request headers keep duplicates. |
+| Preference change listeners | `setOnPreferenceChangeListener` callbacks are accepted but not invoked; the extension’s next source call sees the stored value instead. |
+| `NetworkHelper.cookieJar` | The Suwayomi-specific `McCookieJar` type is not exposed; `cloudflareClient` and the shared URLSession cookie jar are available. |
+| Reflection beyond fields | `Field` access works, including inherited fields; arbitrary `Method` invocation and constructor reflection do not. |
 
 Unsupported APIs fail closed with a typed error. The engine never guesses at a
 method's behaviour.
@@ -229,9 +244,12 @@ per source operation.
   instruction budget.
 - There is no JIT, no dynamic code loading and no private API use; the engine is
   plain Swift running in the app's sandbox.
-- Relative extension file paths are rooted at
-  `Caches/MihonCompat/Files/<package>` and cannot escape it; absolute paths
-  remain limited by the iOS sandbox. Caches is excluded from backup.
+- Extension file paths resolve under `Caches/MihonCompat/Files/<package>`;
+  `..` and absolute paths outside that root are clamped to the root. Caches is
+  excluded from backup.
+- Engine requests accept only `http`/`https` URLs; repository, index-list, APK
+  and image downloads are size-capped, and repository indexes must remain HTTPS
+  after redirects.
 - Native methods can throw Java exceptions but cannot escape the engine's
   serial queue.
 

@@ -129,6 +129,15 @@ engine's core tests run against a generated `engine-probe.dex`; the end-to-end
 extension test is skipped unless `MOEREADER_ENGINE_APK` points at a real
 extension APK.
 
+The interpreter array/constant fixture (`engine-arrays.dex`) is compiled from
+[`scripts/engine-fixtures/ArrayProbe.java`](scripts/engine-fixtures/ArrayProbe.java):
+
+```bash
+javac -source 8 -target 8 scripts/engine-fixtures/ArrayProbe.java
+"$ANDROID_HOME"/build-tools/*/d8 --min-api 26 --output /tmp/dex scripts/engine-fixtures/ArrayProbe.class
+cp /tmp/dex/classes.dex MoeReaderTests/Fixtures/engine-arrays.dex
+```
+
 ## Project layout
 
 ```text
