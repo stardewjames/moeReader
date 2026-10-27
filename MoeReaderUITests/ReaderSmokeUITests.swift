@@ -5,6 +5,7 @@ final class ReaderSmokeUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    @MainActor
     func testImportReadTurnPageAndDirection() throws {
         let app = XCUIApplication()
         app.launchArguments += ["-ui-testing"]
@@ -64,6 +65,7 @@ final class ReaderSmokeUITests: XCTestCase {
         XCTAssertTrue(tile.waitForExistence(timeout: 10))
     }
 
+    @MainActor
     private func attachScreenshot(named name: String) {
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name
