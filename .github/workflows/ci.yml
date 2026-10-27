@@ -1,15 +1,24 @@
 name: CI
 on: [push, pull_request]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: brew install xcodegen
       - run: xcodebuild -version
       - run: ./scripts/test.sh
-      - uses: actions/upload-artifact@v4
+      - run: ./scripts/build_ipa.sh
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: TestResults
           path: TestResults.xcresult
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MoeReader-unsigned-ipa
+          path: MoeReader.ipa
+          if-no-files-found: error

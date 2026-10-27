@@ -2,6 +2,8 @@
 /MoeReader.xcodeproj/
 /build/
 /DerivedData/
+/Payload/
+*.ipa
 *.xcresult
 xcuserdata/
 .DS_Store

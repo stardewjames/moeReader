@@ -50,6 +50,25 @@ Run the full unit and UI test suite on a simulator:
 `xcodebuild test`, and writes `TestResults.xcresult`. CI runs the same script on
 `macos-26` and uploads the result bundle.
 
+Build an unsigned device IPA:
+
+```bash
+./scripts/build_ipa.sh
+```
+
+This produces `MoeReader.ipa` in the repository root, built for
+`generic/platform=iOS` without code signing. Successful CI runs upload the same
+file as the `MoeReader-unsigned-ipa` artifact.
+
+### Install with Sideloadly
+
+1. Download `MoeReader.ipa` from the latest green CI run's artifacts.
+2. Connect an iPhone or iPad running iOS 26 or later.
+3. Open Sideloadly, select the IPA, enter your Apple ID, and install.
+
+Sideloadly re-signs the unsigned IPA with your Apple ID. Free Apple developer
+accounts produce a seven-day install.
+
 ## Test fixtures
 
 Fixtures are deterministic and generated with the Python standard library:
