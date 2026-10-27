@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-enum ImportError: Error, LocalizedError, Equatable {
+enum ImportError: Error, LocalizedError, Equatable, Sendable {
     case unsupportedFormat
     case fileNotDownloaded
 

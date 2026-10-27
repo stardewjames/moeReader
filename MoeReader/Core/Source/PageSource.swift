@@ -19,7 +19,7 @@ final class MappedPayload: @unchecked Sendable {
     }
 }
 
-enum SourceError: Error, Equatable, LocalizedError {
+enum SourceError: Error, Equatable, LocalizedError, Sendable {
     case notAnArchive
     case truncated
     case malformed(String)

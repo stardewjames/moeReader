@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
-enum ImageError: Error {
+enum ImageError: Error, Sendable {
     case decodeFailed
 }
 
