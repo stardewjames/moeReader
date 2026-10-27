@@ -63,73 +63,88 @@ struct MihonFilterSheet: View {
         }
     }
 
-    @ViewBuilder
-    private func row(for filter: MihonFilter) -> some View {
+    private func row(for filter: MihonFilter) -> AnyView {
         switch filter.kind {
         case .group:
-            Section {
-                ForEach(filter.children) { child in
-                    row(for: child)
+            return AnyView(
+                Section {
+                    ForEach(filter.children) { child in
+                        row(for: child)
+                    }
+                } header: {
+                    Text(filter.name.isEmpty ? "Filters" : filter.name)
                 }
-            } header: {
-                Text(filter.name.isEmpty ? "Filters" : filter.name)
-            }
+            )
         case .header:
-            Text(filter.name)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-        case .separator:
-            Divider()
-        case .text:
-            HStack {
+            return AnyView(
                 Text(filter.name)
-                Spacer()
-                TextField("", text: Binding(
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            )
+        case .separator:
+            return AnyView(Divider())
+        case .text:
+            return AnyView(
+                HStack {
+                    Text(filter.name)
+                    Spacer()
+                    TextField("", text: Binding(
+                        get: { value(for: filter) },
+                        set: { update(filter, value: $0) }
+                    ))
+                    .multilineTextAlignment(.trailing)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                }
+            )
+        case .checkbox:
+            return AnyView(
+                Toggle(filter.name, isOn: Binding(
+                    get: { value(for: filter) == "true" },
+                    set: { update(filter, value: $0 ? "true" : "false") }
+                ))
+            )
+        case .tristate:
+            return AnyView(
+                Picker(filter.name, selection: Binding(
                     get: { value(for: filter) },
                     set: { update(filter, value: $0) }
-                ))
-                .multilineTextAlignment(.trailing)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            }
-        case .checkbox:
-            Toggle(filter.name, isOn: Binding(
-                get: { value(for: filter) == "true" },
-                set: { update(filter, value: $0 ? "true" : "false") }
-            ))
-        case .tristate:
-            Picker(filter.name, selection: Binding(
-                get: { value(for: filter) },
-                set: { update(filter, value: $0) }
-            )) {
-                Text("Ignore").tag("0")
-                Text("Include").tag("1")
-                Text("Exclude").tag("2")
-            }
+                )) {
+                    Text("Ignore").tag("0")
+                    Text("Include").tag("1")
+                    Text("Exclude").tag("2")
+                }
+            )
         case .select:
-            Picker(filter.name, selection: Binding(
-                get: { value(for: filter) },
-                set: { update(filter, value: $0) }
-            )) {
-                ForEach(Array(filter.entryValues.enumerated()), id: \.offset) { index, entryValue in
-                    Text(filter.entries.indices.contains(index) ? filter.entries[index] : entryValue)
-                        .tag(entryValue)
+            return AnyView(
+                Picker(filter.name, selection: Binding(
+                    get: { value(for: filter) },
+                    set: { update(filter, value: $0) }
+                )) {
+                    ForEach(Array(filter.entryValues.enumerated()), id: \.offset) { index, entryValue in
+                        Text(filter.entries.indices.contains(index) ? filter.entries[index] : entryValue)
+                            .tag(entryValue)
+                    }
                 }
-            }
+            )
         case .sort:
-            Picker(filter.name, selection: Binding(
-                get: { value(for: filter) },
-                set: { update(filter, value: $0) }
-            )) {
-                ForEach(Array(filter.entryValues.enumerated()), id: \.offset) { index, entryValue in
-                    Text(filter.entries.indices.contains(index) ? filter.entries[index] : entryValue)
-                        .tag(entryValue)
+            return AnyView(
+                VStack {
+                    Picker(filter.name, selection: Binding(
+                        get: { value(for: filter) },
+                        set: { update(filter, value: $0) }
+                    )) {
+                        ForEach(Array(filter.entryValues.enumerated()), id: \.offset) { index, entryValue in
+                            Text(filter.entries.indices.contains(index) ? filter.entries[index] : entryValue)
+                                .tag(entryValue)
+                        }
+                    }
+                    Toggle("Ascending", isOn: Binding(
+                        get: { selection(for: filter).ascending },
+                        set: { update(filter, value: value(for: filter), ascending: $0) }
+                    ))
                 }
-            }
-            Toggle("Ascending", isOn: Binding(
-                get: { selection(for: filter).ascending },
-                set: { update(filter, value: value(for: filter), ascending: $0) }
-            ))
+            )
         }
     }
 
