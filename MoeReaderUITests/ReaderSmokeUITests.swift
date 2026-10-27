@@ -45,13 +45,18 @@ final class ReaderSmokeUITests: XCTestCase {
         waitForIndicator("3 / 3", indicator)
         attachScreenshot(named: "04-reader-page-3-ltr")
 
-        selectMode("Paged (vertical)", in: app)
-        XCTAssertEqual(indicator.label, "3 / 3")
-        Thread.sleep(forTimeInterval: 0.3)
-        app.swipeDown()
+        app.buttons["reader.chrome.prev"].tap()
         waitForIndicator("2 / 3", indicator)
+
+        selectMode("Paged (vertical)", in: app)
+        XCTAssertEqual(indicator.label, "2 / 3")
+        Thread.sleep(forTimeInterval: 0.3)
+        app.swipeUp()
+        waitForIndicator("3 / 3", indicator)
         attachScreenshot(named: "05-reader-paged-vertical")
 
+        app.buttons["reader.chrome.prev"].tap()
+        waitForIndicator("2 / 3", indicator)
         app.buttons["reader.chrome.prev"].tap()
         waitForIndicator("1 / 3", indicator)
 
