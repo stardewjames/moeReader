@@ -24,6 +24,7 @@ targets:
           - "Resources"
           - "Resources/**"
           - "Info.plist"
+          - "**/*.md"
       - path: MoeReader/Resources
         buildPhase: resources
     settings:
