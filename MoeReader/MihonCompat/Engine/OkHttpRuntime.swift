@@ -105,6 +105,25 @@ final class VMResponseBodyPayload {
     }
 }
 
+final class VMBufferedSourcePayload {
+    var data: Data
+    var offset: Int = 0
+    init(data: Data) { self.data = data }
+
+    func remaining() -> Data {
+        guard offset < data.count else { return Data() }
+        return data.subdata(in: offset..<data.count)
+    }
+
+    func consume(_ count: Int) -> Data {
+        guard offset < data.count else { return Data() }
+        let end = min(data.count, offset + max(0, count))
+        let slice = data.subdata(in: offset..<end)
+        offset = end
+        return slice
+    }
+}
+
 final class VMClientPayload {
     var interceptors: [VMValue] = []
     var networkInterceptors: [VMValue] = []
@@ -896,6 +915,10 @@ enum OkHttpRuntime {
             guard let text = runtime.payload(args[0], as: VMResponseBodyPayload.self)?.contentType else { return .null }
             return runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: text))
         }
+        body.method("source", "()Lokio/BufferedSource;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMResponseBodyPayload.self)
+            return runtime.makeNative("Lokio/BufferedSource;", payload: VMBufferedSourcePayload(data: payload?.data ?? Data()))
+        }
         body.method("close", "()V") { _, _, _ in .zero }
         body.method("toString", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("ResponseBody") }
 
@@ -923,6 +946,30 @@ enum OkHttpRuntime {
         bodyCompanion.method("create", "(Lokhttp3/MediaType;Ljava/io/File;)Lokhttp3/ResponseBody;") { runtime, args, _ in
             runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: Data(), contentType: runtime.payload(args[1], as: VMMediaTypePayload.self)?.text))
         }
+
+        let bufferedSource = NativeClass("Lokio/BufferedSource;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Closeable;"])
+        bufferedSource.method("readUtf8", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .null }
+            return runtime.newString(String(decoding: source.consume(source.data.count - source.offset), as: UTF8.self))
+        }
+        bufferedSource.method("readUtf8", "(J)Ljava/lang/String;") { runtime, args, _ in
+            guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .null }
+            return runtime.newString(String(decoding: source.consume(Int(args[1].asInt64)), as: UTF8.self))
+        }
+        bufferedSource.method("readByteArray", "()[B") { runtime, args, _ in
+            guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .null }
+            let data = source.consume(source.data.count - source.offset)
+            let array = runtime.newArray(component: "B", count: data.count)
+            for (index, byte) in data.enumerated() {
+                runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: byte))))
+            }
+            return array
+        }
+        bufferedSource.method("exhausted", "()Z") { runtime, args, _ in
+            guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .boolean(true) }
+            return .boolean(source.offset >= source.data.count)
+        }
+        bufferedSource.method("close", "()V") { _, _, _ in .zero }
 
         let requestBody = NativeClass("Lokhttp3/RequestBody;", superclass: "Ljava/lang/Object;")
         requestBody.staticField("Companion", "Lokhttp3/RequestBody$Companion;")
@@ -1001,7 +1048,7 @@ enum OkHttpRuntime {
             let payload: VMFormBodyPayload? = runtime.payload(args[0], as: VMFormBodyPayload.self)
             return runtime.makeNative("Lokhttp3/FormBody;", payload: payload ?? VMFormBodyPayload(pairs: [], data: Data()))
         }
-        return [body, bodyCompanion, requestBody, requestBodyCompanion, formBody, formBuilder]
+        return [body, bodyCompanion, bufferedSource, requestBody, requestBodyCompanion, formBody, formBuilder]
     }
 
     private static func compressionClasses() -> [NativeClass] {

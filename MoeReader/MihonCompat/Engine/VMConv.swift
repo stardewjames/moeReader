@@ -271,24 +271,24 @@ extension VMRuntime {
             case "s", "S":
                 rendered = stringValue(value) ?? stringValue(javaToString(value)) ?? "null"
             case "d":
-                rendered = stringValue(value) ?? String(value.asInt64)
+                rendered = String(formatInteger(value))
                 if let widthValue = Int(width), rendered.count < widthValue {
                     let pad = String(repeating: flags.contains("0") ? "0" : " ", count: widthValue - rendered.count)
                     rendered = flags.contains("-") ? rendered + pad : pad + rendered
                 }
             case "x":
-                rendered = String(UInt64(bitPattern: value.asInt64), radix: 16)
+                rendered = String(UInt64(bitPattern: formatInteger(value)), radix: 16)
             case "X":
-                rendered = String(UInt64(bitPattern: value.asInt64), radix: 16).uppercased()
+                rendered = String(UInt64(bitPattern: formatInteger(value)), radix: 16).uppercased()
             case "f":
                 let digits = Int(precision) ?? 6
-                rendered = String(format: "%.\(digits)f", value.asDouble)
+                rendered = String(format: "%.\(digits)f", formatDouble(value))
             case "e":
-                rendered = String(format: "%.6e", value.asDouble)
+                rendered = String(format: "%.6e", formatDouble(value))
             case "b":
-                rendered = value.asBoolean ? "true" : "false"
+                rendered = formatBoolean(value) ? "true" : "false"
             case "c":
-                rendered = String(UnicodeScalar(UInt32(truncatingIfNeeded: value.asInt32)) ?? " ")
+                rendered = String(UnicodeScalar(UInt32(truncatingIfNeeded: formatInteger(value))) ?? " ")
             case "%":
                 rendered = "%"
             default:
@@ -301,6 +301,36 @@ extension VMRuntime {
             output += rendered
         }
         return newString(output)
+    }
+
+    private func formatInteger(_ value: VMValue) -> Int64 {
+        guard let pointer = value.object, let cls = classOf(value) else { return value.asInt64 }
+        switch cls.descriptor {
+        case "Ljava/lang/Integer;", "Ljava/lang/Short;", "Ljava/lang/Byte;":
+            return Int64(VMObjectLayout.slot(pointer, 0).pointee.asInt32)
+        case "Ljava/lang/Long;":
+            return VMObjectLayout.slot(pointer, 0).pointee.asInt64
+        default:
+            return value.asInt64
+        }
+    }
+
+    private func formatDouble(_ value: VMValue) -> Double {
+        guard let pointer = value.object, let cls = classOf(value) else { return value.asDouble }
+        switch cls.descriptor {
+        case "Ljava/lang/Double;":
+            return Double(bitPattern: VMObjectLayout.aux(pointer))
+        case "Ljava/lang/Float;":
+            return Double(Float(bitPattern: UInt32(truncatingIfNeeded: VMObjectLayout.aux(pointer))))
+        default:
+            return value.asDouble
+        }
+    }
+
+    private func formatBoolean(_ value: VMValue) -> Bool {
+        guard let pointer = value.object, let cls = classOf(value) else { return value.asBoolean }
+        if cls.descriptor == "Ljava/lang/Boolean;" { return VMObjectLayout.aux(pointer) != 0 }
+        return value.asBoolean
     }
 
     func join(separator: VMValue, elements: VMValue) -> VMValue {
@@ -588,6 +618,9 @@ extension VMRuntime {
             return elements.nodes.map { node in
                 makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: elements.document))
             }
+        }
+        if let tree: VMJsonTree = payload(value, as: VMJsonTree.self), case .array(let items) = tree.kind {
+            return items.map { jsonElementValue($0) }
         }
         return nil
     }

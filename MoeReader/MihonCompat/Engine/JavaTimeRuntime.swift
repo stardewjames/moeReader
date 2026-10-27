@@ -315,6 +315,20 @@ enum JavaTimeRuntime {
             guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .null }
             return runtime.makeNative("Ljava/time/ZoneId;", payload: zoned.zone)
         }
+        for (name, get) in [
+            ("getYear", { (l: VMLocalDateTimePayload) in l.year }),
+            ("getMonthValue", { (l: VMLocalDateTimePayload) in l.month }),
+            ("getDayOfMonth", { (l: VMLocalDateTimePayload) in l.day }),
+            ("getHour", { (l: VMLocalDateTimePayload) in l.hour }),
+            ("getMinute", { (l: VMLocalDateTimePayload) in l.minute }),
+            ("getSecond", { (l: VMLocalDateTimePayload) in l.second }),
+            ("getNano", { (l: VMLocalDateTimePayload) in l.nano }),
+        ] {
+            cls.method(name, "()I") { runtime, args, _ in
+                guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .int32(0) }
+                return .int32(Int32(get(zoned.local)))
+            }
+        }
         cls.method("format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;") { runtime, args, _ in
             guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .null }
             let formatter: VMDateTimeFormatterPayload? = runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)
@@ -343,6 +357,12 @@ enum JavaTimeRuntime {
         }
         cls.method("getEpochSecond", "()J") { runtime, args, _ in
             .int64((runtime.payload(args[0], as: VMInstantPayload.self)?.epochMilli ?? 0) / 1000)
+        }
+        cls.method("atZone", "(Ljava/time/ZoneId;)Ljava/time/ZonedDateTime;") { runtime, args, _ in
+            let millis = runtime.payload(args[0], as: VMInstantPayload.self)?.epochMilli ?? 0
+            let zone: VMZonePayload? = runtime.payload(args[1], as: VMZonePayload.self)
+            let local = localFromDate(Date(timeIntervalSince1970: Double(millis) / 1000), zone: zone ?? utc)
+            return runtime.makeNative("Ljava/time/ZonedDateTime;", payload: VMZonedDateTimePayload(local: local, zone: zone ?? utc))
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             let millis = runtime.payload(args[0], as: VMInstantPayload.self)?.epochMilli ?? 0

@@ -71,6 +71,44 @@ final class MihonEngineCoreTests: XCTestCase {
         XCTAssertEqual(JsoupSelector.select(document.root, selector: "div.table-row:nth-child(2) a").count, 2)
     }
 
+    func testVirtualDispatchPrefersClassOverInterfaceDefault() throws {
+        let runtime = VMRuntime()
+        let cls = try runtime.linkClass("Ljava/util/ArrayDeque;")
+        let initMethod = try XCTUnwrap(cls.findMethodByKey("<init>(I)V"))
+        let deque = VMValue.reference(runtime.allocateObject(cls))
+        _ = try runtime.invoke(initMethod, [deque, .int32(2)])
+        let isEmpty = try XCTUnwrap(cls.lookupVirtual(key: "isEmpty()Z"))
+        XCTAssertTrue(try runtime.invoke(isEmpty, [deque]).asBoolean)
+    }
+
+    func testDurationBoxingRoundTrips() throws {
+        let runtime = VMRuntime()
+        let cls = try runtime.linkClass("Lkotlin/time/Duration;")
+        let box = try XCTUnwrap(cls.lookupStatic("box-impl", "(J)Lkotlin/time/Duration;"))
+        let unbox = try XCTUnwrap(cls.lookupVirtual(key: "unbox-impl()J"))
+        let boxed = try runtime.invoke(box, [.int64(123)])
+        XCTAssertEqual(try runtime.invoke(unbox, [boxed]).asInt64, 123)
+    }
+
+    func testRegexReplaceFirstAndStringFormat() throws {
+        let runtime = VMRuntime()
+        let regex = try runtime.linkClass("Lkotlin/text/Regex;")
+        let initMethod = try XCTUnwrap(regex.findMethodByKey("<init>(Ljava/lang/String;)V"))
+        let pattern = VMValue.reference(runtime.allocateObject(regex))
+        _ = try runtime.invoke(initMethod, [pattern, runtime.newString("a+")])
+        let replace = try XCTUnwrap(regex.lookupVirtual(key: "replaceFirst(Ljava/lang/CharSequence;Ljava/lang/String;)Ljava/lang/String;"))
+        let replaced = try runtime.invoke(replace, [pattern, runtime.newString("baaad"), runtime.newString("a")])
+        XCTAssertEqual(runtime.stringValue(replaced), "bad")
+
+        let stringClass = try runtime.linkClass("Ljava/lang/String;")
+        let format = try XCTUnwrap(stringClass.lookupStatic("format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"))
+        let values = runtime.newArray(component: "Ljava/lang/Object;", count: 2)
+        runtime.setArrayElement(values, index: 0, value: runtime.boxInt(7))
+        runtime.setArrayElement(values, index: 1, value: runtime.newString("x"))
+        let formatted = try runtime.invoke(format, [runtime.newString("%d-%s"), values])
+        XCTAssertEqual(runtime.stringValue(formatted), "7-x")
+    }
+
     func testEngineRecyclesItsArena() throws {
         let runtime = VMRuntime(dexFiles: [try probeDex()])
         let cls = try runtime.linkClass("Ltest/Probe;")

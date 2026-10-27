@@ -414,31 +414,38 @@ enum KotlinRuntime {
         let buildScope = NativeClass("Lkotlinx/coroutines/BuildersKt;")
         buildScope.staticMethod("coroutineScope", "(Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
-            return try runtime.callFunction(args[0], [scope, runtime.unitValue])
+            return try runtime.callSuspend(args[0], scope)
         }
         buildScope.staticMethod("async$default", "(Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lkotlinx/coroutines/CoroutineStart;Lkotlin/jvm/functions/Function2;ILjava/lang/Object;)Lkotlinx/coroutines/Deferred;") { runtime, args, _ in
-            let result = try runtime.callFunction(args[3], [args[0], runtime.unitValue])
+            let result = try runtime.callSuspend(args[3], args[0])
             return runtime.makeNative("Lkotlinx/coroutines/DeferredCoroutine;", payload: result)
         }
         buildScope.staticMethod("async", "(Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lkotlinx/coroutines/CoroutineStart;Lkotlin/jvm/functions/Function2;)Lkotlinx/coroutines/Deferred;") { runtime, args, _ in
-            let result = try runtime.callFunction(args[3], [args[0], runtime.unitValue])
+            let result = try runtime.callSuspend(args[3], args[0])
             return runtime.makeNative("Lkotlinx/coroutines/DeferredCoroutine;", payload: result)
         }
         buildScope.staticMethod("withContext", "(Lkotlin/coroutines/CoroutineContext;Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
-            return try runtime.callFunction(args[1], [scope, runtime.unitValue])
+            return try runtime.callSuspend(args[1], scope)
         }
         buildScope.staticMethod("runBlocking", "(Lkotlin/coroutines/CoroutineContext;Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;") { runtime, args, _ in
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
-            return try runtime.callFunction(args[1], [scope, runtime.unitValue])
+            return try runtime.callSuspend(args[1], scope)
         }
         buildScope.staticMethod("delay", "(JLjava/util/concurrent/TimeUnit;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .zero }
         buildScope.staticMethod("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .zero }
         buildScope.staticMethod("launch$default", "(Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lkotlinx/coroutines/CoroutineStart;Lkotlin/jvm/functions/Function2;ILjava/lang/Object;)Lkotlinx/coroutines/Job;") { runtime, args, _ in
-            _ = try runtime.callFunction(args[3], [args[0], runtime.unitValue])
+            _ = try runtime.callSuspend(args[3], args[0])
             return runtime.makeNative("Lkotlinx/coroutines/JobImpl;", payload: NSNull())
         }
         result.append(buildScope)
+
+        let scopeKt = NativeClass("Lkotlinx/coroutines/CoroutineScopeKt;")
+        scopeKt.staticMethod("coroutineScope", "(Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
+            return try runtime.callSuspend(args[0], scope)
+        }
+        result.append(scopeKt)
 
         let deferred = NativeClass("Lkotlinx/coroutines/DeferredCoroutine;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/coroutines/Deferred;"])
         deferred.method("await", "(Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
@@ -489,6 +496,23 @@ enum KotlinRuntime {
             var items: [VMValue] = []
             for index in 0..<count { items.append(runtime.arrayElement(args[0], index)) }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+        }
+        collections.staticMethod("createListBuilder", "()Ljava/util/List;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+        }
+        collections.staticMethod("build", "(Ljava/util/List;)Ljava/util/List;") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items, immutable: true))
+        }
+        collections.staticMethod("addAll", "(Ljava/util/Collection;Ljava/lang/Iterable;)Z") { runtime, args, _ in
+            let incoming = runtime.listItems(args[1]) ?? []
+            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
+            return .boolean(!incoming.isEmpty)
+        }
+        collections.staticMethod("addAll", "(Ljava/util/Collection;Ljava/util/Collection;)Z") { runtime, args, _ in
+            let incoming = runtime.listItems(args[1]) ?? []
+            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
+            return .boolean(!incoming.isEmpty)
         }
         collections.staticMethod("emptyList", "()Ljava/util/List;") { runtime, _, _ in
             runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload([], immutable: true))
@@ -983,8 +1007,28 @@ enum KotlinRuntime {
         result.append(maps)
 
         let comparisons = NativeClass("Lkotlin/comparisons/ComparisonsKt;")
+        let ranges = NativeClass("Lkotlin/ranges/RangesKt;")
+        ranges.staticMethod("coerceAtLeast", "(II)I") { _, args, _ in .int32(max(args[0].asInt32, args[1].asInt32)) }
+        ranges.staticMethod("coerceAtMost", "(II)I") { _, args, _ in .int32(min(args[0].asInt32, args[1].asInt32)) }
+        result.append(ranges)
+
         comparisons.staticMethod("maxOf", "(II)I") { _, args, _ in .int32(max(args[0].asInt32, args[1].asInt32)) }
         comparisons.staticMethod("maxOf", "(JJ)J") { _, args, _ in .int64(max(args[0].asInt64, args[1].asInt64)) }
+        comparisons.staticMethod("maxOf", "(Ljava/lang/Comparable;Ljava/lang/Comparable;)Ljava/lang/Comparable;") { runtime, args, _ in
+            let left = runtime.payload(args[0], as: NSNumber.self)?.int64Value
+            let right = runtime.payload(args[1], as: NSNumber.self)?.int64Value
+            guard let left, let right else { return args[0] }
+            return left >= right ? args[0] : args[1]
+        }
+        comparisons.staticMethod("maxOf", "(Ljava/lang/Comparable;Ljava/lang/Comparable;Ljava/lang/Comparable;)Ljava/lang/Comparable;") { runtime, args, _ in
+            var best = args[0]
+            var bestValue = runtime.payload(best, as: NSNumber.self)?.int64Value ?? .min
+            for index in 1..<3 {
+                let value = runtime.payload(args[index], as: NSNumber.self)?.int64Value ?? .min
+                if value > bestValue { best = args[index]; bestValue = value }
+            }
+            return best
+        }
         comparisons.staticMethod("minOf", "(II)I") { _, args, _ in .int32(min(args[0].asInt32, args[1].asInt32)) }
         comparisons.staticMethod("minOf", "(JJ)J") { _, args, _ in .int64(min(args[0].asInt64, args[1].asInt64)) }
         comparisons.staticMethod("compareValues", "(Ljava/lang/Comparable;Ljava/lang/Comparable;)I") { runtime, args, _ in
@@ -1399,6 +1443,17 @@ enum KotlinRuntime {
             }
             return runtime.makeNative("Lkotlin/text/MatchResult;", payload: VMMatchResultPayload(groups: groups))
         }
+        regex.method("replaceFirst", "(Ljava/lang/CharSequence;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let payload: VMRegexPayload? = runtime.payload(args[0], as: VMRegexPayload.self)
+            let text = runtime.stringValue(args[1]) ?? ""
+            let replacement = runtime.stringValue(args[2]) ?? ""
+            guard let payload, let expression = payload.expression else { return args[1] }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let match = expression.firstMatch(in: text, range: range),
+                  let swiftRange = Range(match.range, in: text) else { return args[1] }
+            let substituted = expression.replacementString(for: match, in: text, offset: 0, template: replacement)
+            return runtime.newString(text.replacingCharacters(in: swiftRange, with: substituted))
+        }
         regex.method("replace", "(Ljava/lang/CharSequence;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             let payload: VMRegexPayload? = runtime.payload(args[0], as: VMRegexPayload.self)
             let text = runtime.stringValue(args[1]) ?? ""
@@ -1669,10 +1724,16 @@ enum KotlinRuntime {
 
     private static func timeClasses() -> [NativeClass] {
         var result: [NativeClass] = []
-        let duration = NativeClass("Lkotlin/time/Duration;")
+        let duration = NativeClass("Lkotlin/time/Duration;", superclass: "Ljava/lang/Object;")
         duration.staticField("Companion", "Lkotlin/time/Duration$Companion;")
         duration.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lkotlin/time/Duration$Companion;", payload: NSNull())
+        }
+        duration.staticMethod("box-impl", "(J)Lkotlin/time/Duration;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/time/Duration;", payload: NSNumber(value: args[0].asInt64))
+        }
+        duration.method("unbox-impl", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? args[0].asInt64)
         }
         duration.staticMethod("getInWholeMilliseconds-impl", "(J)J") { _, args, _ in .int64(args[0].asInt64 / 1_000_000) }
         duration.staticMethod("getInWholeNanoseconds-impl", "(J)J") { _, args, _ in .int64(args[0].asInt64) }
@@ -1735,12 +1796,18 @@ enum KotlinRuntime {
         durationCompanion.method("getINFINITE-UwyO8pc", "()J") { _, _, _ in .int64(Int64.max) }
         result.append(durationCompanion)
 
-        let instant = NativeClass("Lkotlin/time/Instant;")
+        let instant = NativeClass("Lkotlin/time/Instant;", superclass: "Ljava/lang/Object;")
         instant.staticField("Companion", "Lkotlin/time/Instant$Companion;")
         instant.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lkotlin/time/Instant$Companion;", payload: NSNull())
         }
         instant.staticMethod("fromEpochMilliseconds", "(J)J") { _, args, _ in args[0] }
+        instant.staticMethod("box-impl", "(J)Lkotlin/time/Instant;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: args[0].asInt64))
+        }
+        instant.method("unbox-impl", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? args[0].asInt64)
+        }
         instant.staticMethod("toEpochMilliseconds", "(J)J") { _, args, _ in args[0] }
         instant.staticMethod("getEpochMilliseconds-impl", "(J)J") { _, args, _ in args[0] }
         instant.staticMethod("compareTo-impl", "(JJ)I") { _, args, _ in
@@ -1757,8 +1824,27 @@ enum KotlinRuntime {
         result.append(instant)
         let instantCompanion = NativeClass("Lkotlin/time/Instant$Companion;", superclass: "Ljava/lang/Object;")
         instantCompanion.method("fromEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
+        instantCompanion.method("fromEpochMilliseconds", "(J)Lkotlin/time/Instant;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: args[1].asInt64))
+        }
+        instantCompanion.method("now", "()Lkotlin/time/Instant;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: Int64(Date().timeIntervalSince1970 * 1000)))
+        }
         instantCompanion.method("getEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
         result.append(instantCompanion)
+
+        let instantConversions = NativeClass("Lkotlin/time/jdk8/InstantConversionsJDK8Kt;")
+        instantConversions.staticMethod("toJavaInstant", "(J)Ljava/time/Instant;") { runtime, args, _ in
+            runtime.makeNative("Ljava/time/Instant;", payload: VMInstantPayload(epochMilli: args[0].asInt64))
+        }
+        instantConversions.staticMethod("toJavaInstant", "(Lkotlin/time/Instant;)Ljava/time/Instant;") { runtime, args, _ in
+            let millis = runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0
+            return runtime.makeNative("Ljava/time/Instant;", payload: VMInstantPayload(epochMilli: millis))
+        }
+        instantConversions.staticMethod("toKotlinInstant", "(Ljava/time/Instant;)J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMInstantPayload.self)?.epochMilli ?? 0)
+        }
+        result.append(instantConversions)
 
         let unitKt = NativeClass("Lkotlin/time/DurationUnitKt;")
         for (name, unit) in [("nanoseconds", 0), ("microseconds", 1), ("milliseconds", 2), ("seconds", 3), ("minutes", 4), ("hours", 5), ("days", 6)] {
@@ -1835,6 +1921,13 @@ extension VMRuntime {
         return .reference(pointer)
     }
 
+    func boxBoolean(_ value: Bool) -> VMValue {
+        guard let cls = findClass("Ljava/lang/Boolean;") else { return .null }
+        let pointer = allocateObject(cls)
+        VMObjectLayout.setAux(pointer, value ? 1 : 0)
+        return .reference(pointer)
+    }
+
     func boxDouble(_ value: Double) -> VMValue {
         guard let cls = findClass("Ljava/lang/Double;") else { return .null }
         let pointer = allocateObject(cls)
@@ -1866,6 +1959,18 @@ extension VMRuntime {
             values.append(try invoke(next, [iterator]))
         }
         return values
+    }
+
+    func callSuspend(_ function: VMValue, _ argument: VMValue) throws -> VMValue {
+        guard let cls = classOf(function) else { throw VMJavaException("Ljava/lang/NullPointerException;", "null function in \(currentFrame)") }
+        if let method = cls.lookupVirtual(key: "invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;") {
+            let result = try invoke(method, [function, argument])
+            if result.bits == coroutineSuspended.bits {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "coroutine suspension is not supported")
+            }
+            return result
+        }
+        return try callFunction(function, [argument, .null])
     }
 
     func callFunction(_ function: VMValue, _ arguments: [VMValue]) throws -> VMValue {

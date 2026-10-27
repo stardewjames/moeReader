@@ -163,6 +163,7 @@ final class VMJsonParser {
 final class VMSerialDescriptorPayload {
     var serialName: String
     var elements: [(name: String, optional: Bool)] = []
+    var aliases: [Int: [String]] = [:]
     init(serialName: String) { self.serialName = serialName }
 }
 
@@ -392,7 +393,26 @@ struct SerializationRuntime {
             }
             return .zero
         }
-        descriptor.method("pushAnnotation", "(Ljava/lang/Object;)V") { _, _, _ in .zero }
+        descriptor.method("pushAnnotation", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self),
+                  let annotation = runtime.callVirtual(args[1], "names()[Ljava/lang/String;", []) else { return .zero }
+            var names: [String] = []
+            for index in 0..<runtime.arrayLength(annotation) {
+                if let name = runtime.stringValue(runtime.arrayElement(annotation, index)) { names.append(name) }
+            }
+            if !names.isEmpty { payload.aliases[payload.elements.count - 1] = names }
+            return .zero
+        }
+        descriptor.method("pushAnnotation", "(Ljava/lang/annotation/Annotation;)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self),
+                  let annotation = runtime.callVirtual(args[1], "names()[Ljava/lang/String;", []) else { return .zero }
+            var names: [String] = []
+            for index in 0..<runtime.arrayLength(annotation) {
+                if let name = runtime.stringValue(runtime.arrayElement(annotation, index)) { names.append(name) }
+            }
+            if !names.isEmpty { payload.aliases[payload.elements.count - 1] = names }
+            return .zero
+        }
         descriptor.method("getSerialName", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: VMSerialDescriptorPayload.self)?.serialName ?? "")
         }
@@ -566,7 +586,15 @@ struct SerializationRuntime {
                 case .primitive(let name): kind = name.lowercased()
                 default: return .null
                 }
-                return runtime.jsonPrimitiveValue(decoder.tree, kind: kind)
+                let value = runtime.jsonPrimitiveValue(decoder.tree, kind: kind)
+                switch kind {
+                case "int", "short", "byte", "char": return runtime.boxInt(value.asInt32)
+                case "long": return runtime.boxLong(value.asInt64)
+                case "bool": return runtime.boxBoolean(value.asBoolean)
+                case "double": return runtime.boxDouble(value.asDouble)
+                case "float": return runtime.boxFloat(value.asFloat)
+                default: return value
+                }
             }
             result.append(cls)
         }
@@ -763,7 +791,14 @@ struct SerializationRuntime {
             if name == "JsonObject" {
                 cls.method("get", "(Ljava/lang/String;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
                     guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
-                          case .object(let fields) = payload.kind, let value = fields[runtime.stringValue(args[1]) ?? ""] else { return .null }
+                          case .object(let fields) = payload.kind,
+                          let value = fields[runtime.stringValue(args[1]) ?? ""] else { return .null }
+                    return runtime.jsonElementValue(value)
+                }
+                cls.method("get", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+                    let key = runtime.stringValue(args[1]) ?? ""
+                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                          case .object(let fields) = payload.kind, let value = fields[key] else { return .null }
                     return runtime.jsonElementValue(value)
                 }
                 cls.method("entrySet", "()Ljava/util/Set;") { runtime, args, _ in
@@ -905,6 +940,9 @@ struct SerializationRuntime {
         }
         result.append(jsonElementKt)
 
+        let jsonNames = NativeClass("Lkotlinx/serialization/json/JsonNames;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        result.append(jsonNames)
+
         let json = NativeClass("Lkotlinx/serialization/json/Json;", superclass: "Ljava/lang/Object;")
         json.staticField("Default", "Lkotlinx/serialization/json/Json;")
         json.prepare = { runtime, cls in
@@ -957,6 +995,20 @@ struct SerializationRuntime {
             return runtime.makeNative("Lkotlinx/serialization/json/Json;", payload: config)
         }
         result.append(jsonKt)
+
+        let okioStreams = NativeClass("Lkotlinx/serialization/json/okio/OkioStreamsKt;")
+        okioStreams.staticMethod("decodeFromBufferedSource", "(Lkotlinx/serialization/json/Json;Lkotlinx/serialization/DeserializationStrategy;Lokio/BufferedSource;)Ljava/lang/Object;") { runtime, args, _ in
+            guard let source = runtime.payload(args[2], as: VMBufferedSourcePayload.self) else {
+                throw VMJavaException("Ljava/io/IOException;", "missing buffered source")
+            }
+            let text = String(decoding: source.consume(source.data.count - source.offset), as: UTF8.self)
+            guard let jsonClass = runtime.classOf(args[0]),
+                  let decode = jsonClass.lookupVirtual(key: "decodeFromString(Lkotlinx/serialization/DeserializationStrategy;Ljava/lang/String;)Ljava/lang/Object;") else {
+                throw VMJavaException("Lkotlinx/serialization/SerializationException;", "Json decoder unavailable")
+            }
+            return try runtime.invoke(decode, [args[0], args[1], runtime.newString(text)])
+        }
+        result.append(okioStreams)
 
         let builder = NativeClass("Lkotlinx/serialization/json/JsonBuilder;", superclass: "Ljava/lang/Object;")
         builder.method("<init>", "()V") { runtime, args, _ in
@@ -1263,12 +1315,12 @@ struct SerializationRuntime {
             while payload.cursor < descriptor.elements.count {
                 let index = payload.cursor
                 payload.cursor += 1
-                if fields[descriptor.elements[index].name] != nil {
-                    if runtime.traceEnabled {
-                        FileHandle.standardError.write("DEC index \(descriptor.serialName)[\(index)=\(descriptor.elements[index].name)]\n".data(using: .utf8)!)
-                    }
-                    return .int32(Int32(index))
+                if runtime.traceEnabled {
+                    let present = fields[descriptor.elements[index].name] != nil
+                        || (descriptor.aliases[index] ?? []).contains(where: { fields[$0] != nil })
+                    FileHandle.standardError.write("DEC index \(descriptor.serialName)[\(index)=\(descriptor.elements[index].name)] present=\(present)\n".data(using: .utf8)!)
                 }
+                return .int32(Int32(index))
             }
             if runtime.traceEnabled {
                 FileHandle.standardError.write("DEC end \(descriptor.serialName) elements=\(descriptor.elements.count)\n".data(using: .utf8)!)
@@ -1404,11 +1456,12 @@ extension VMRuntime {
             throw VMJavaException("Lkotlinx/serialization/SerializationException;", "not an object")
         }
         let elementIndex = Int(index)
-        guard elementIndex >= 0, elementIndex < descriptorPayload.elements.count,
-              let tree = fields[descriptorPayload.elements[elementIndex].name] else {
-            throw VMJavaException("Lkotlinx/serialization/SerializationException;", "missing field")
+        guard elementIndex >= 0, elementIndex < descriptorPayload.elements.count else {
+            throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid field index")
         }
-        return tree
+        return fields[descriptorPayload.elements[elementIndex].name]
+            ?? (descriptorPayload.aliases[elementIndex] ?? []).lazy.compactMap({ fields[$0] }).first
+            ?? VMJsonTree(.null)
     }
 
     func jsonElementValue(_ tree: VMJsonTree) -> VMValue {

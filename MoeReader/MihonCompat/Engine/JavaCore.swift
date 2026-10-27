@@ -193,6 +193,9 @@ enum JavaCore {
             guard let units = runtime.stringUnits(args[0]) else { return .boolean(true) }
             return .boolean(!units.contains { !CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar($0) ?? " ") })
         }
+        cls.staticMethod("format", "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.format(template: args[1], arguments: args[2])
+        }
         cls.method("toString", "()Ljava/lang/String;") { _, args, _ in args[0] }
         cls.method("charAt", "(I)C") { runtime, args, _ in
             guard let units = runtime.stringUnits(args[0]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }

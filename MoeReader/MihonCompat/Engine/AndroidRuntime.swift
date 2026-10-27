@@ -169,7 +169,7 @@ enum AndroidRuntime {
         }
         result.append(context)
 
-        let application = NativeClass("Landroid/app/Application;", superclass: "Landroid/content/Context;", interfaces: ["Landroid/content/SharedPreferences;"])
+        let application = NativeClass("Landroid/app/Application;", superclass: "Landroid/content/Context;", interfaces: ["Landroid/content/SharedPreferences;", "Lkotlinx/serialization/json/Json;"])
         application.method("<init>", "()V") { _, _, _ in .zero }
         application.method("onCreate", "()V") { _, _, _ in .zero }
         application.method("getApplicationContext", "()Landroid/content/Context;") { _, args, _ in args[0] }
@@ -271,13 +271,14 @@ enum AndroidRuntime {
         }
         factory.method("getInstance", "(Ljava/lang/reflect/Type;)Ljava/lang/Object;") { runtime, args, _ in
             let name = runtime.payload(args[1], as: VMTypePayload.self)?.name ?? ""
-            if !name.contains("NetworkHelper") {
-                return runtime.makeNative("Landroid/app/Application;", payload: NSNull())
+            if name.contains("kotlinx.serialization.json.Json") {
+                let cls = try runtime.linkClass("Lkotlinx/serialization/json/Json;")
+                return cls.staticValues[0]
             }
             if name.contains("NetworkHelper") {
                 return runtime.makeNative("Leu/kanade/tachiyomi/network/NetworkHelper;", payload: VMSourcePayload())
             }
-            return .null
+            return runtime.makeNative("Landroid/app/Application;", payload: NSNull())
         }
         result.append(factory)
 
@@ -289,6 +290,10 @@ enum AndroidRuntime {
         let scope = NativeClass("Luy/kohesive/injekt/api/InjektScope;", superclass: "Ljava/lang/Object;")
         scope.method("getInstance", "(Ljava/lang/reflect/Type;)Ljava/lang/Object;") { runtime, args, _ in
             let name = runtime.payload(args[1], as: VMTypePayload.self)?.name ?? ""
+            if name.contains("kotlinx.serialization.json.Json") {
+                let cls = try runtime.linkClass("Lkotlinx/serialization/json/Json;")
+                return cls.staticValues[0]
+            }
             if name.contains("NetworkHelper") {
                 return runtime.makeNative("Leu/kanade/tachiyomi/network/NetworkHelper;", payload: VMSourcePayload())
             }

@@ -119,10 +119,11 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   and complete a `getPopularManga` call against a generic fixture. Each gap found
   by that run (static `$default` thunks, `ResponseBody.Companion`, Kotlin
   `startsWith`/`Regex.find$default`) is now part of the native surface.
-- A JSON-API extension (kotlinx.serialization, Injekt, preferences, i18n) loads
-  its sources and extracts preferences. Its API response path is exercised by
-  the serialization driver; one site's custom rate limiter still aborts on an
-  empty deque (see the gap table).
+- A JSON-API extension (kotlinx.serialization, Injekt, preferences, i18n) was
+  exercised end-to-end against a live site: sources, popular, details, 953
+  chapters, and chapter pages. This covers `JsonNames`, nullable-field
+  tolerance, okio `BufferedSource`, `String.format`, Kotlin `Duration`/`Instant`
+  boxing, and coroutine `async`/`await`.
 - The DEX reader handles catch-all-only try handlers (`size == 0`) as well as
   typed and mixed handlers; this previously let exceptions escape methods that
   relied on `catch (Throwable)`.
@@ -134,7 +135,11 @@ that is explicitly covered: destination/source separation for literal
 operations, array covariance and store checks, `clone`, immutable collections,
 rounded `Int`/`Long`/`Char` conversion, preference defaults and removal,
 interceptor list views, `TimeUnit` conversions, JSON encode/decode, and JSON
-element map/array access. Known gaps:
+element map/array access. The runtime also resolves class methods before
+interface defaults, boxes Kotlin `Duration`/`Instant`, reads response bodies
+through okio, handles `JsonNames` aliases, treats missing fields as null for
+tolerant API decoding, formats through `String.format`, and drives suspend
+lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 
 | Gap | Effect |
 |---|---|
@@ -144,7 +149,6 @@ element map/array access. Known gaps:
 | Source preference screens | `setupPreferenceScreen` is executed and its controls are rendered by `MihonSourceSettingsView` (headers, toggles, single-choice lists, text). Multi-select entries are shown as text until a dedicated control lands. Edits persist through `SharedPreferences`, which the extension reads on its next call. |
 | Extension lib 1.4 API | Not targeted. The loader reads lib 1.6 metadata; older request/parse-style extensions are not executed. |
 | Reflection beyond fields | `getDeclaredField` works; arbitrary method/handle reflection does not. |
-| Extension rate limiters | A site interceptor that calls `ArrayDeque.first()` on an empty history still aborts that request. Catch-all decoding is fixed; the remaining cause is site-specific queue logic, not a VM linkage failure. |
 
 Unsupported APIs fail closed with a typed error. The engine never guesses at a
 method's behaviour.

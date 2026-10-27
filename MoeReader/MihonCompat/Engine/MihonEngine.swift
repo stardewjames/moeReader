@@ -407,10 +407,17 @@ final class MihonEngine: @unchecked Sendable {
     private func convertChapter(_ value: VMValue) -> MihonChapter {
         let payload = runtime.chapter(value)
         let date = payload.dateUpload > 0 ? Date(timeIntervalSince1970: Double(payload.dateUpload) / 1000) : nil
+        let numericNumber: String? = {
+            guard payload.chapterNumber >= 0 else { return nil }
+            if payload.chapterNumber == payload.chapterNumber.rounded() {
+                return String(Int(payload.chapterNumber))
+            }
+            return String(payload.chapterNumber)
+        }()
         return MihonChapter(
             id: runtime.stringValue(payload.url) ?? "",
             title: runtime.stringValue(payload.name) ?? "",
-            number: runtime.stringValue(payload.number),
+            number: runtime.stringValue(payload.number) ?? numericNumber,
             volume: runtime.stringValue(payload.volume),
             group: runtime.stringValue(payload.scanlator),
             publishedAt: date,

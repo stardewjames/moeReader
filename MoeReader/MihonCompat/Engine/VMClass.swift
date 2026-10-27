@@ -269,12 +269,17 @@ final class VMClass {
         if let cached = virtualCache[key] { return cached }
         if virtualMisses.contains(key) { return nil }
 
+        // JVM resolution: concrete class hierarchy first, interface defaults only on a miss.
         var cursor: VMClass? = self
         while let cls = cursor {
             if let method = cls.methods[key], !method.isStatic, !method.isAbstract {
                 virtualCache[key] = method
                 return method
             }
+            cursor = cls.superclass
+        }
+        cursor = self
+        while let cls = cursor {
             if let found = cls.findInterfaceDefault(key) {
                 virtualCache[key] = found
                 return found
