@@ -337,6 +337,10 @@ enum MihonAPI {
         cls.method("chapterListParse", "(Lokhttp3/Response;)Ljava/util/List;") { _, _, _ in
             throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "chapterListParse")
         }
+        // Suwayomi's reference `HttpSource` declares `chapterPageParse(Response): SChapter`,
+        // but it is absent from the compiled extension stub surface, so no extension
+        // bytecode can dispatch to it. It is intentionally not registered instead of
+        // advertising an implementation extensions cannot reach.
         cls.method("pageListRequest", "(Leu/kanade/tachiyomi/source/model/SChapter;)Lokhttp3/Request;") { runtime, args, _ in
             let chapter: VMChapterPayload? = runtime.payload(args[1], as: VMChapterPayload.self)
             return MihonAPI.getRequest(runtime, source: args[0], url: runtime.absoluteUrl(chapter?.url ?? .null, source: args[0]))
@@ -763,6 +767,18 @@ enum MihonAPI {
         for (name, signature) in mangaAccessors() {
             iface.method(name, signature) { _, _, _ in .null }
         }
+        // Kotlin interface defaults; dispatch resolves these only when the receiver's
+        // concrete class does not override them.
+        for name in ["copyFrom", "cloneFrom"] {
+            iface.method(name, "(Leu/kanade/tachiyomi/source/model/SManga;)V") { runtime, args, _ in
+                MihonAPI.copyManga(
+                    runtime.manga(args[0]),
+                    from: runtime.manga(args[1]),
+                    clone: name == "cloneFrom"
+                )
+                return .zero
+            }
+        }
         iface.method("create", "()Leu/kanade/tachiyomi/source/model/SManga;") { runtime, _, _ in
             runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
         }
@@ -816,6 +832,10 @@ enum MihonAPI {
             ("getMemo", "()Lkotlinx/serialization/json/JsonObject;"), ("setMemo", "(Lkotlinx/serialization/json/JsonObject;)V"),
         ] {
             iface.method(name, signature) { _, _, _ in .null }
+        }
+        iface.method("copyFrom", "(Leu/kanade/tachiyomi/source/model/SChapter;)V") { runtime, args, _ in
+            MihonAPI.copyChapter(runtime.chapter(args[0]), from: runtime.chapter(args[1]))
+            return .zero
         }
         return iface
     }
@@ -1262,7 +1282,23 @@ enum MihonAPI {
             return items[index]
         }
         filterList.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
-            runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(runtime.listPayload(args[0])?.items ?? []))
+            let payload = runtime.listPayload(args[0])
+            let iterator = VMListIteratorPayload(payload?.items ?? [], owner: payload)
+            iterator.immutable = true
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
+        filterList.method("listIterator", "()Ljava/util/ListIterator;") { runtime, args, _ in
+            let payload = runtime.listPayload(args[0])
+            let iterator = VMListIteratorPayload(payload?.items ?? [], owner: payload)
+            iterator.immutable = true
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
+        filterList.method("listIterator", "(I)Ljava/util/ListIterator;") { runtime, args, _ in
+            let payload = runtime.listPayload(args[0])
+            let iterator = VMListIteratorPayload(payload?.items ?? [], owner: payload)
+            iterator.immutable = true
+            iterator.index = Int(args[1].asInt32)
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
         }
         filterList.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.collectionToString(args[0]) }
         filterList.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
@@ -1286,9 +1322,11 @@ enum MihonAPI {
         }
         filterList.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
             let items = runtime.listPayload(args[0])?.items ?? []
-            let from = max(0, Int(args[1].asInt32))
-            let to = min(items.count, Int(args[2].asInt32))
-            guard from <= to else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            let from = Int(args[1].asInt32)
+            let to = Int(args[2].asInt32)
+            guard from >= 0, to <= items.count, from <= to else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(from)..<\(to), size \(items.count)")
+            }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(Array(items[from..<to]), immutable: true))
         }
         filterList.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
@@ -1296,6 +1334,40 @@ enum MihonAPI {
             let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
             for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
             return array
+        }
+        filterList.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            let suppliedCount = runtime.arrayLength(args[1])
+            if suppliedCount >= items.count {
+                for (index, item) in items.enumerated() { runtime.setArrayElement(args[1], index: index, value: item) }
+                if suppliedCount > items.count { runtime.setArrayElement(args[1], index: items.count, value: .null) }
+                return args[1]
+            }
+            let component = runtime.classOf(args[1])?.arrayComponent ?? "Ljava/lang/Object;"
+            let array = runtime.newArray(component: component, count: items.count)
+            for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+            return array
+        }
+        // `FilterList` delegates to its immutable backing list. All `java.util.List`
+        // mutators must fail exactly like Kotlin's `List` delegation, not fall back
+        // to the silent no-op defaults registered on the interface.
+        for (name, signature) in [
+            ("add", "(Ljava/lang/Object;)Z"),
+            ("add", "(ILjava/lang/Object;)V"),
+            ("addAll", "(Ljava/util/Collection;)Z"),
+            ("addAll", "(ILjava/util/Collection;)Z"),
+            ("remove", "(Ljava/lang/Object;)Z"),
+            ("remove", "(I)Ljava/lang/Object;"),
+            ("removeAll", "(Ljava/util/Collection;)Z"),
+            ("retainAll", "(Ljava/util/Collection;)Z"),
+            ("set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+            ("replaceAll", "(Ljava/util/function/UnaryOperator;)V"),
+            ("sort", "(Ljava/util/Comparator;)V"),
+            ("clear", "()V"),
+        ] {
+            filterList.method(name, signature) { _, _, _ in
+                throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "FilterList.\(name)")
+            }
         }
         result.append(filterList)
         return result
@@ -1316,6 +1388,12 @@ enum MihonAPI {
             result.append(cls)
         }
 
+        // The compiled host surface (and the oneechan runtime overlay) exposes only
+        // `client`, `cloudflareClient` and `defaultUserAgentProvider()`. The reference
+        // implementations also have a `cookieJar`, but its concrete type differs per
+        // host (`McCookieJar`/`AndroidCookieJar`/`PersistentCookieJar`) and no such
+        // native class or real cookie store exists here, so `getCookieJar` is
+        // deliberately absent rather than returning a fake no-op jar.
         let helper = NativeClass("Leu/kanade/tachiyomi/network/NetworkHelper;", superclass: "Ljava/lang/Object;")
         helper.method("<init>", "(Landroid/content/Context;)V") { runtime, args, _ in
             let payload = VMSourcePayload()
@@ -1708,6 +1786,43 @@ extension MihonAPI {
         return cls
     }
 
+    /// Shared `SManga.copyFrom`/`cloneFrom` semantics used by both the interface
+    /// defaults and `MihonSManga`, so extensions see one implementation regardless
+    /// of the receiver's declared type.
+    private static func copyManga(_ target: VMMangaPayload, from other: VMMangaPayload, clone: Bool) {
+        if clone {
+            target.url = other.url
+            target.title = other.title
+            target.artist = other.artist
+            target.author = other.author
+            target.description = other.description
+            target.genre = other.genre
+            target.status = other.status
+            target.thumbnail = other.thumbnail
+            target.updateStrategy = other.updateStrategy
+            target.initialized = other.initialized
+            target.memo = other.memo
+            return
+        }
+        if other.author.bits != 0 { target.author = other.author }
+        if other.artist.bits != 0 { target.artist = other.artist }
+        if other.description.bits != 0 { target.description = other.description }
+        if other.genre.bits != 0 { target.genre = other.genre }
+        if other.thumbnail.bits != 0 { target.thumbnail = other.thumbnail }
+        target.status = other.status
+        if !target.initialized { target.initialized = other.initialized }
+        target.memo = other.memo
+    }
+
+    private static func copyChapter(_ target: VMChapterPayload, from other: VMChapterPayload) {
+        target.name = other.name
+        target.url = other.url
+        target.dateUpload = other.dateUpload
+        target.chapterNumber = other.chapterNumber
+        target.scanlator = other.scanlator
+        target.memo = other.memo
+    }
+
     private static func concreteManga() -> NativeClass {
         let cls = NativeClass("Leu/kanade/tachiyomi/source/model/MihonSManga;", superclass: "Ljava/lang/Object;", interfaces: ["Leu/kanade/tachiyomi/source/model/SManga;"])
         cls.method("<init>", "()V") { runtime, args, _ in
@@ -1760,30 +1875,11 @@ extension MihonAPI {
         cls.method("setInitialized", "(Z)V") { r, a, _ in r.manga(a[0]).initialized = a[1].asBoolean; return .zero }
         for name in ["copyFrom", "cloneFrom"] {
             cls.method(name, "(Leu/kanade/tachiyomi/source/model/SManga;)V") { runtime, args, _ in
-                let target = runtime.manga(args[0])
-                let other = runtime.manga(args[1])
-                if name == "cloneFrom" {
-                    target.url = other.url
-                    target.title = other.title
-                    target.artist = other.artist
-                    target.author = other.author
-                    target.description = other.description
-                    target.genre = other.genre
-                    target.status = other.status
-                    target.thumbnail = other.thumbnail
-                    target.updateStrategy = other.updateStrategy
-                    target.initialized = other.initialized
-                    target.memo = other.memo
-                    return .zero
-                }
-                if other.author.bits != 0 { target.author = other.author }
-                if other.artist.bits != 0 { target.artist = other.artist }
-                if other.description.bits != 0 { target.description = other.description }
-                if other.genre.bits != 0 { target.genre = other.genre }
-                if other.thumbnail.bits != 0 { target.thumbnail = other.thumbnail }
-                target.status = other.status
-                if !target.initialized { target.initialized = other.initialized }
-                target.memo = other.memo
+                MihonAPI.copyManga(
+                    runtime.manga(args[0]),
+                    from: runtime.manga(args[1]),
+                    clone: name == "cloneFrom"
+                )
                 return .zero
             }
         }
@@ -1824,14 +1920,7 @@ extension MihonAPI {
         cls.method("getMemo", "()Lkotlinx/serialization/json/JsonObject;") { r, a, _ in r.chapter(a[0]).memo }
         cls.method("setMemo", "(Lkotlinx/serialization/json/JsonObject;)V") { r, a, _ in try r.chapter(a[0]).memo = a[1]; return .zero }
         cls.method("copyFrom", "(Leu/kanade/tachiyomi/source/model/SChapter;)V") { runtime, args, _ in
-            let target = runtime.chapter(args[0])
-            let other = runtime.chapter(args[1])
-            target.name = other.name
-            target.url = other.url
-            target.dateUpload = other.dateUpload
-            target.chapterNumber = other.chapterNumber
-            target.scanlator = other.scanlator
-            target.memo = other.memo
+            MihonAPI.copyChapter(runtime.chapter(args[0]), from: runtime.chapter(args[1]))
             return .zero
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in

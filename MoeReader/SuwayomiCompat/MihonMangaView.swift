@@ -109,7 +109,12 @@ struct MihonMangaView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 14) {
-                MihonRemoteImageView(url: manga.coverURL, maxPixelSize: 360, contentMode: .fill)
+                MihonRemoteImageView(
+                    url: manga.coverURL,
+                    headers: manga.coverHeaders,
+                    maxPixelSize: 360,
+                    contentMode: .fill
+                )
                     .frame(width: 116, height: 172)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 VStack(alignment: .leading, spacing: 5) {

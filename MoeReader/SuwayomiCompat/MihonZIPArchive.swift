@@ -194,6 +194,12 @@ struct MihonZIPArchive: Sendable {
 
     // MARK: - ZIP64
 
+    /// Converts a ZIP64 field to `Int`, rejecting values that cannot be
+    /// represented. A raw `Int(u64(...))` traps on values above `Int.max`.
+    private static func intValue(_ raw: UInt64) -> Int? {
+        raw <= UInt64(Int.max) ? Int(raw) : nil
+    }
+
     private static func zip64EntryValues(
         _ bytes: [UInt8],
         start: Int,
@@ -212,18 +218,21 @@ struct MihonZIPArchive: Sendable {
                 var cursor = valueStart
                 var result = (uncompressed, compressed, localOffset)
                 if result.0 == 0xffff_ffff {
-                    guard cursor + 8 <= valueStart + size else { return nil }
-                    result.0 = Int(u64(bytes, cursor))
+                    guard cursor + 8 <= valueStart + size,
+                          let value = intValue(u64(bytes, cursor)) else { return nil }
+                    result.0 = value
                     cursor += 8
                 }
                 if result.1 == 0xffff_ffff {
-                    guard cursor + 8 <= valueStart + size else { return nil }
-                    result.1 = Int(u64(bytes, cursor))
+                    guard cursor + 8 <= valueStart + size,
+                          let value = intValue(u64(bytes, cursor)) else { return nil }
+                    result.1 = value
                     cursor += 8
                 }
                 if result.2 == 0xffff_ffff {
-                    guard cursor + 8 <= valueStart + size else { return nil }
-                    result.2 = Int(u64(bytes, cursor))
+                    guard cursor + 8 <= valueStart + size,
+                          let value = intValue(u64(bytes, cursor)) else { return nil }
+                    result.2 = value
                 }
                 return result
             }
@@ -237,17 +246,17 @@ struct MihonZIPArchive: Sendable {
         eocd: Int
     ) -> (entryCount: Int, directorySize: Int, directoryOffset: Int)? {
         let locator = eocd - 20
-        guard locator >= 0, u32(bytes, locator) == 0x0706_4b50 else { return nil }
-        let recordOffset = Int(u64(bytes, locator + 8))
-        guard recordOffset >= 0, recordOffset + 56 <= bytes.count,
-              u32(bytes, recordOffset) == 0x0606_4b50 else {
+        guard locator >= 0, u32(bytes, locator) == 0x0706_4b50,
+              let recordOffset = intValue(u64(bytes, locator + 8)),
+              recordOffset >= 0, recordOffset <= bytes.count,
+              bytes.count - recordOffset >= 56,
+              u32(bytes, recordOffset) == 0x0606_4b50,
+              let entryCount = intValue(u64(bytes, recordOffset + 32)),
+              let directorySize = intValue(u64(bytes, recordOffset + 40)),
+              let directoryOffset = intValue(u64(bytes, recordOffset + 48)) else {
             return nil
         }
-        return (
-            Int(u64(bytes, recordOffset + 32)),
-            Int(u64(bytes, recordOffset + 40)),
-            Int(u64(bytes, recordOffset + 48))
-        )
+        return (entryCount, directorySize, directoryOffset)
     }
 
     // MARK: - Little-endian

@@ -6,18 +6,25 @@ actor MihonCompatStore {
         var installed: [MihonInstalledExtension]
     }
 
+    /// Observes every state write before the bytes hit disk. Production leaves
+    /// this nil; tests inject a throwing hook to exercise rollback paths.
+    typealias PersistHook = @Sendable (String) throws -> Void
+
     nonisolated let baseDirectory: URL
     private let service: MihonRepositoryService
+    private let persistHook: PersistHook?
     private var repositories: [MihonRepository]
     private var installed: [MihonInstalledExtension]
     private var installing: Set<String> = []
 
     init(
         baseDirectory: URL = MihonCompatStore.defaultBaseDirectory,
-        http: any MihonHTTPFetching = MihonHTTPClient()
+        http: any MihonHTTPFetching = MihonHTTPClient(),
+        persistHook: PersistHook? = nil
     ) {
         self.baseDirectory = baseDirectory
         self.service = MihonRepositoryService(http: http)
+        self.persistHook = persistHook
         self.repositories = Self.load([MihonRepository].self, from: baseDirectory.appendingPathComponent("repositories.json")) ?? []
         self.installed = Self.load([MihonInstalledExtension].self, from: baseDirectory.appendingPathComponent("installed.json")) ?? []
     }
@@ -72,29 +79,37 @@ actor MihonCompatStore {
 
     func refreshRepository(id: UUID) async throws {
         guard let index = repositories.firstIndex(where: { $0.id == id }) else { return }
-        let refreshed = try await service.refresh(repositories[index])
-        if let current = repositories.firstIndex(where: { $0.id == id }) {
-            repositories[current] = refreshed
-        }
-        var installedChanged = false
-        for index in installed.indices where installed[index].repositoryID == id {
-            guard let entry = refreshed.extensionEntry(packageName: installed[index].packageName) else {
-                continue
+        let repositorySnapshot = repositories
+        let installedSnapshot = installed
+        do {
+            let refreshed = try await service.refresh(repositories[index])
+            if let current = repositories.firstIndex(where: { $0.id == id }) {
+                repositories[current] = refreshed
             }
-            if installed[index].sources != entry.sources
-                || installed[index].contentWarning != entry.contentWarning
-                || installed[index].name != entry.name {
-                installed[index].sources = entry.sources
-                installed[index].contentWarning = entry.contentWarning
-                installed[index].name = entry.name
-                installedChanged = true
+            var installedChanged = false
+            for index in installed.indices where installed[index].repositoryID == id {
+                guard let entry = refreshed.extensionEntry(packageName: installed[index].packageName) else {
+                    continue
+                }
+                if installed[index].sources != entry.sources
+                    || installed[index].contentWarning != entry.contentWarning
+                    || installed[index].name != entry.name {
+                    installed[index].sources = entry.sources
+                    installed[index].contentWarning = entry.contentWarning
+                    installed[index].name = entry.name
+                    installedChanged = true
+                }
             }
+            if installedChanged {
+                installed.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                try persistInstalled()
+            }
+            try persistRepositories()
+        } catch {
+            repositories = repositorySnapshot
+            installed = installedSnapshot
+            throw error
         }
-        if installedChanged {
-            installed.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            try persistInstalled()
-        }
-        try persistRepositories()
     }
 
     func install(packageName: String, repositoryID: UUID) async throws {
@@ -176,7 +191,7 @@ actor MihonCompatStore {
             } else {
                 installed.removeAll { $0.packageName == packageName }
             }
-            try? FileManager.default.removeItem(at: destination)
+            removeAPKIfUnreferenced(named: fileName)
             throw error
         }
         if let previous, previous.apkFileName != record.apkFileName {
@@ -230,8 +245,20 @@ actor MihonCompatStore {
     }
 
     private func removeAPK(for installedExtension: MihonInstalledExtension) {
-        let url = apkURL(for: installedExtension)
-        try? FileManager.default.removeItem(at: url)
+        removeAPKIfUnreferenced(named: installedExtension.apkFileName)
+    }
+
+    /// Removes an APK only when no installed record still points at it. Two
+    /// packages built from the same source can share one content-addressed
+    /// file, so deleting unconditionally would strand the surviving record.
+    private func removeAPKIfUnreferenced(named fileName: String) {
+        guard !fileName.isEmpty,
+              !installed.contains(where: { $0.apkFileName == fileName }) else {
+            return
+        }
+        try? FileManager.default.removeItem(
+            at: extensionsDirectory.appendingPathComponent(fileName)
+        )
     }
 
     private func persistRepositories() throws {
@@ -243,6 +270,7 @@ actor MihonCompatStore {
     }
 
     private func persist<T: Encodable>(_ value: T, to url: URL) throws {
+        try persistHook?(url.lastPathComponent)
         try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

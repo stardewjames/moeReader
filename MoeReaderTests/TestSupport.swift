@@ -8,6 +8,12 @@ enum TestFixtures {
         file: StaticString = #filePath,
         line: UInt = #line
     ) -> URL {
+        #if SWIFT_PACKAGE
+        if let url = Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures")
+            ?? Bundle.module.url(forResource: name, withExtension: ext) {
+            return url
+        }
+        #endif
         let bundle = Bundle(for: BundleToken.self)
         if let url = bundle.url(forResource: name, withExtension: ext) {
             return url

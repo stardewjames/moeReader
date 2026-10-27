@@ -150,7 +150,7 @@ final class MihonCompatModel {
         for repository in repositories {
             for extensionValue in repository.extensions {
                 guard !seen.contains(extensionValue.packageName) else { continue }
-                if !showNSFW, extensionValue.contentWarning.isNSFW { continue }
+                if !passesContentWarning(extensionValue.contentWarning) { continue }
                 if !matchesLanguage(extensionValue) { continue }
                 if !searchText.isEmpty,
                    !extensionValue.name.localizedCaseInsensitiveContains(searchText),
@@ -169,6 +169,7 @@ final class MihonCompatModel {
     var availableSources: [MihonAvailableSource] {
         var values: [MihonAvailableSource] = []
         for installedExtension in installed where installedExtension.isEnabled {
+            guard passesContentWarning(installedExtension.contentWarning) else { continue }
             guard let runtime = runtime(for: installedExtension) else { continue }
             for source in installedExtension.sources {
                 if !showAllLanguages, languageFilter != "all", source.language != languageFilter {
@@ -205,6 +206,10 @@ final class MihonCompatModel {
     func languageName(_ code: String) -> String {
         if code == "all" { return "All languages" }
         return Locale.current.localizedString(forLanguageCode: code)?.capitalized ?? code
+    }
+
+    private func passesContentWarning(_ contentWarning: MihonContentWarning) -> Bool {
+        showNSFW || !contentWarning.isNSFW
     }
 
     private func matchesLanguage(_ extensionValue: MihonExtension) -> Bool {

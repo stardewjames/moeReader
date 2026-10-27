@@ -4,6 +4,7 @@ struct MihonBrowseView: View {
     let source: MihonSource
     let packageName: String
     private let runtime: (any MihonSourceRuntime)?
+    private let filterStore: MihonFilterSelectionStore
 
     @State private var mode: FeedMode = .popular
     @State private var query = ""
@@ -19,9 +20,14 @@ struct MihonBrowseView: View {
     @State private var filterSelections: [String: MihonFilterSelection] = [:]
 
     init(source: MihonSource, packageName: String, runtime: (any MihonSourceRuntime)? = nil) {
+        let store = MihonFilterSelectionStore()
+        let savedSelections = store.selections(forSourceIdentity: source.identity)
         self.source = source
         self.packageName = packageName
         self.runtime = runtime ?? MihonRuntimeRegistry.shared.runtime(forPackage: packageName)
+        self.filterStore = store
+        _filterSelections = State(initialValue: savedSelections)
+        _mode = State(initialValue: savedSelections.isEmpty ? .popular : .search)
     }
 
     var body: some View {
@@ -76,7 +82,11 @@ struct MihonBrowseView: View {
                 selections: filterSelections
             ) { selections in
                 filterSelections = selections
-                if !selections.isEmpty { mode = .search }
+                filterStore.save(selections, forSourceIdentity: source.identity)
+                // Always re-run the search feed so applying an empty set
+                // replaces any stale popular/latest results.
+                mode = .search
+                searchGeneration += 1
             }
         }
     }
@@ -286,7 +296,12 @@ private struct MihonMangaCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            MihonRemoteImageView(url: manga.coverURL, maxPixelSize: 480, contentMode: .fill)
+            MihonRemoteImageView(
+                url: manga.coverURL,
+                headers: manga.coverHeaders,
+                maxPixelSize: 480,
+                contentMode: .fill
+            )
                 .frame(height: 168)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             Text(manga.title)

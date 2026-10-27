@@ -34,11 +34,54 @@ final class VMResultPayload {
     init(value: VMValue, failure: Bool) { self.value = value; self.failure = failure }
 }
 
+/// `LazyThreadSafetyMode` ordinals as declared by the Kotlin standard library.
+enum VMLazyMode: Int {
+    case synchronized = 0
+    case publication = 1
+    case none = 2
+}
+
+/// State for `kotlin.Lazy`: the initializer runs at most once and the result is
+/// published under a lock so every reader sees the same value. SYNCHRONIZED
+/// evaluates while holding the lock (recursively, matching the re-entrant JVM
+/// monitor); PUBLICATION/NONE evaluate outside the lock and the first published
+/// value wins.
 final class VMLazyPayload {
     let initializer: VMValue
-    var computed: VMValue = .null
-    var ready = false
-    init(initializer: VMValue) { self.initializer = initializer }
+    let mode: VMLazyMode
+    private let lock = NSRecursiveLock()
+    private var stored: VMValue = .null
+    private var initialized = false
+
+    init(initializer: VMValue, mode: VMLazyMode = .synchronized) {
+        self.initializer = initializer
+        self.mode = mode
+    }
+
+    var isInitialized: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return initialized
+    }
+
+    var current: VMValue? {
+        lock.lock(); defer { lock.unlock() }
+        return initialized ? stored : nil
+    }
+
+    @discardableResult
+    func publish(_ value: VMValue) -> VMValue {
+        lock.lock(); defer { lock.unlock() }
+        if !initialized {
+            stored = value
+            initialized = true
+        }
+        return stored
+    }
+
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock(); defer { lock.unlock() }
+        return try body()
+    }
 }
 
 final class VMRegexPayload {
@@ -1119,7 +1162,21 @@ enum KotlinRuntime {
         arrays.staticMethod("contentToString", "([I)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
         arrays.staticMethod("isNotEmpty", "([Ljava/lang/Object;)Z") { runtime, args, _ in .boolean(runtime.arrayLength(args[0]) > 0) }
         arrays.staticMethod("isEmpty", "([Ljava/lang/Object;)Z") { runtime, args, _ in .boolean(runtime.arrayLength(args[0]) == 0) }
-        arrays.staticMethod("getOrNull", "([Ljava/lang/Object;I)Ljava/lang/Object;") { runtime, args, _ in runtime.arrayElement(args[0], Int(args[1].asInt32)) }
+        arrays.staticMethod("getOrNull", "([Ljava/lang/Object;I)Ljava/lang/Object;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < runtime.arrayLength(args[0]) else { return .null }
+            return runtime.arrayElement(args[0], index)
+        }
+        arrays.staticMethod("getOrNull", "([II)Ljava/lang/Integer;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < runtime.arrayLength(args[0]) else { return .null }
+            return runtime.boxInt(runtime.arrayElement(args[0], index).asInt32)
+        }
+        arrays.staticMethod("getOrElse", "([Ljava/lang/Object;ILkotlin/jvm/functions/Function1;)Ljava/lang/Object;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            if index >= 0, index < runtime.arrayLength(args[0]) { return runtime.arrayElement(args[0], index) }
+            return try runtime.callFunction(args[2], [.int32(Int32(index))])
+        }
         arrays.staticMethod("zip", "([Ljava/lang/Object;[Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
             let count = min(runtime.arrayLength(args[0]), runtime.arrayLength(args[1]))
             var pairs: [VMValue] = []
@@ -1728,14 +1785,17 @@ enum KotlinRuntime {
         }
         impl.method("getValue", "()Ljava/lang/Object;") { runtime, args, _ in
             let payload: VMLazyPayload = try runtime.payloadBox(args[0])
-            if payload.ready { return payload.computed }
-            let value = try runtime.callFunction(payload.initializer, [])
-            payload.computed = value
-            payload.ready = true
-            return value
+            if let value = payload.current { return value }
+            if payload.mode == .synchronized {
+                return try payload.withLock { () throws -> VMValue in
+                    if let value = payload.current { return value }
+                    return payload.publish(try runtime.callFunction(payload.initializer, []))
+                }
+            }
+            return payload.publish(try runtime.callFunction(payload.initializer, []))
         }
         impl.method("isInitialized", "()Z") { runtime, args, _ in
-            .boolean(runtime.payload(args[0], as: VMLazyPayload.self)?.ready ?? false)
+            .boolean(runtime.payload(args[0], as: VMLazyPayload.self)?.isInitialized ?? false)
         }
         impl.method("toString", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("Lazy value not initialized yet.") }
         result.append(impl)
@@ -1745,7 +1805,10 @@ enum KotlinRuntime {
             runtime.makeNative("Lkotlin/UnsafeLazyImpl;", payload: VMLazyPayload(initializer: args[0]))
         }
         lazyKt.staticMethod("lazy", "(Lkotlin/LazyThreadSafetyMode;Lkotlin/jvm/functions/Function0;)Lkotlin/Lazy;") { runtime, args, _ in
-            runtime.makeNative("Lkotlin/UnsafeLazyImpl;", payload: VMLazyPayload(initializer: args[1]))
+            runtime.makeNative(
+                "Lkotlin/UnsafeLazyImpl;",
+                payload: VMLazyPayload(initializer: args[1], mode: KotlinRuntime.lazyMode(runtime, args[0]))
+            )
         }
         lazyKt.staticMethod("lazy$default", "(Lkotlin/jvm/functions/Function0;ILjava/lang/Object;)Lkotlin/Lazy;") { runtime, args, _ in
             runtime.makeNative("Lkotlin/UnsafeLazyImpl;", payload: VMLazyPayload(initializer: args[0]))
@@ -1753,29 +1816,54 @@ enum KotlinRuntime {
         result.append(lazyKt)
 
         let mode = NativeClass("Lkotlin/LazyThreadSafetyMode;", superclass: "Ljava/lang/Enum;")
-        for (index, name) in ["SYNCHRONIZED", "PUBLICATION", "NONE"].enumerated() {
+        let modeNames = ["SYNCHRONIZED", "PUBLICATION", "NONE"]
+        for name in modeNames {
             mode.staticField(name, "Lkotlin/LazyThreadSafetyMode;")
-            _ = index
         }
         mode.prepare = { runtime, cls in
-            for index in 0..<3 {
-                cls.staticValues[index] = runtime.makeNative("Lkotlin/LazyThreadSafetyMode;", payload: NSNull())
+            for (index, name) in modeNames.enumerated() {
+                let value = runtime.makeNative("Lkotlin/LazyThreadSafetyMode;", payload: NSNull())
+                if let pointer = value.object {
+                    VMObjectLayout.slot(pointer, 0).pointee = runtime.newString(name)
+                    VMObjectLayout.slot(pointer, 1).pointee = .int32(Int32(index))
+                }
+                cls.staticValues[index] = value
             }
         }
         result.append(mode)
 
         let lazyKt2 = NativeClass("Lkotlin/LazyKt__LazyJVMKt;")
         lazyKt2.staticMethod("lazy", "(Lkotlin/LazyThreadSafetyMode;Lkotlin/jvm/functions/Function0;)Lkotlin/Lazy;") { runtime, args, _ in
-            runtime.makeNative("Lkotlin/UnsafeLazyImpl;", payload: VMLazyPayload(initializer: args[1]))
+            runtime.makeNative(
+                "Lkotlin/UnsafeLazyImpl;",
+                payload: VMLazyPayload(initializer: args[1], mode: KotlinRuntime.lazyMode(runtime, args[0]))
+            )
         }
         lazyKt2.staticMethod("lazy", "(Lkotlin/jvm/functions/Function0;Lkotlin/LazyThreadSafetyMode;)Lkotlin/Lazy;") { runtime, args, _ in
-            runtime.makeNative("Lkotlin/UnsafeLazyImpl;", payload: VMLazyPayload(initializer: args[0]))
+            runtime.makeNative(
+                "Lkotlin/UnsafeLazyImpl;",
+                payload: VMLazyPayload(initializer: args[0], mode: KotlinRuntime.lazyMode(runtime, args[1]))
+            )
         }
         lazyKt2.staticMethod("lazy", "(Lkotlin/jvm/functions/Function0;)Lkotlin/Lazy;") { runtime, args, _ in
             runtime.makeNative("Lkotlin/UnsafeLazyImpl;", payload: VMLazyPayload(initializer: args[0]))
         }
         result.append(lazyKt2)
         return result
+    }
+
+    /// Maps a `LazyThreadSafetyMode` instance to its mode; the mode enum is a
+    /// singleton per constant, so identity against the prepared statics is
+    /// enough. Unknown/null values fall back to SYNCHRONIZED (the Kotlin default).
+    private static func lazyMode(_ runtime: VMRuntime, _ value: VMValue) -> VMLazyMode {
+        guard value.bits != 0, let cls = runtime.findClass("Lkotlin/LazyThreadSafetyMode;") else {
+            return .synchronized
+        }
+        try? runtime.ensureInitialized(cls)
+        for (index, entry) in cls.staticValues.enumerated() where entry.bits == value.bits {
+            return VMLazyMode(rawValue: index) ?? .synchronized
+        }
+        return .synchronized
     }
 
     private static func sequenceClasses() -> [NativeClass] {

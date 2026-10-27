@@ -3,8 +3,9 @@
 //  MihonCompat
 //
 //  The slice of java.time extensions use for chapter dates. Parsing follows the
-//  pattern the extension supplies; zones are fixed offsets (the device zone for
-//  systemDefault) so no tz database is required.
+//  pattern the extension supplies. Zones are modelled as zone ids plus an
+//  offset; region ids resolve through the platform time zone when available and
+//  systemDefault always reflects `TimeZone.current`.
 //
 
 import Foundation
@@ -44,6 +45,24 @@ final class VMLocalDateTimePayload {
         self.second = second
         self.nano = nano
     }
+
+    /// java.time values are immutable, so derived values never share storage.
+    func copy() -> VMLocalDateTimePayload {
+        VMLocalDateTimePayload(year: year, month: month, day: day, hour: hour, minute: minute, second: second, nano: nano)
+    }
+}
+
+final class VMLocalTimePayload {
+    var hour: Int
+    var minute: Int
+    var second: Int
+    var nano: Int
+    init(hour: Int = 0, minute: Int = 0, second: Int = 0, nano: Int = 0) {
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.nano = nano
+    }
 }
 
 final class VMLocalDatePayload {
@@ -66,6 +85,15 @@ final class VMZonedDateTimePayload {
     }
 }
 
+final class VMOffsetDateTimePayload {
+    let local: VMLocalDateTimePayload
+    let offset: VMZonePayload
+    init(local: VMLocalDateTimePayload, offset: VMZonePayload) {
+        self.local = local
+        self.offset = offset
+    }
+}
+
 final class VMInstantPayload {
     let epochMilli: Int64
     init(epochMilli: Int64) { self.epochMilli = epochMilli }
@@ -75,6 +103,8 @@ enum JavaTimeRuntime {
     static let utc = VMZonePayload(id: "UTC", secondsFromGMT: 0)
     static let monthNames = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
     static let monthShort = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    static let weekdayNames = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    static let weekdayShort = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     static func classes() -> [NativeClass] {
         var result: [NativeClass] = []
@@ -83,7 +113,9 @@ enum JavaTimeRuntime {
         result.append(formatterClass())
         result.append(localDateTimeClass())
         result.append(localDateClass())
+        result.append(localTimeClass())
         result.append(zonedDateTimeClass())
+        result.append(offsetDateTimeClass())
         result.append(instantClass())
         result.append(marker("Ljava/time/temporal/TemporalAccessor;"))
         result.append(marker("Ljava/time/temporal/Temporal;"))
@@ -91,6 +123,7 @@ enum JavaTimeRuntime {
         result.append(marker("Ljava/time/chrono/ChronoLocalDateTime;"))
         result.append(marker("Ljava/time/format/DateFormat;"))
         result.append(parseException())
+        result.append(unsupportedTemporalTypeException())
         return result
     }
 
@@ -107,8 +140,7 @@ enum JavaTimeRuntime {
             runtime.newString((runtime.payload(args[0], as: VMZonePayload.self) ?? utc).id)
         }
         cls.staticMethod("systemDefault", "()Ljava/time/ZoneId;") { runtime, _, _ in
-            let seconds = TimeZone.current.secondsFromGMT()
-            return runtime.makeNative("Ljava/time/ZoneId;", payload: VMZonePayload(id: TimeZone.current.identifier, secondsFromGMT: seconds))
+            runtime.makeNative("Ljava/time/ZoneId;", payload: systemDefaultZone())
         }
         cls.staticMethod("of", "(Ljava/lang/String;)Ljava/time/ZoneId;") { runtime, args, _ in
             let id = runtime.stringValue(args[0]) ?? "UTC"
@@ -161,13 +193,38 @@ enum JavaTimeRuntime {
         cls.method("format", "(Ljava/time/temporal/TemporalAccessor;)Ljava/lang/String;") { runtime, args, _ in
             let source: VMDateTimeFormatterPayload? = runtime.payload(args[0], as: VMDateTimeFormatterPayload.self)
             let pattern = source?.pattern ?? "yyyy-MM-dd"
-            if let local: VMLocalDateTimePayload = runtime.payload(args[1], as: VMLocalDateTimePayload.self) {
-                return runtime.newString(formatLocal(local, pattern: pattern))
+            let formatterZone = source.flatMap { $0.zone }
+            let temporal = args[1]
+            if let local: VMLocalDateTimePayload = runtime.payload(temporal, as: VMLocalDateTimePayload.self) {
+                return runtime.newString(try formatLocal(local, pattern: pattern, zone: formatterZone.map { resolvedZone(local, zone: $0) }))
             }
-            if let date: VMLocalDatePayload = runtime.payload(args[1], as: VMLocalDatePayload.self) {
-                return runtime.newString(formatLocal(VMLocalDateTimePayload(year: date.year, month: date.month, day: date.day), pattern: pattern))
+            if let date: VMLocalDatePayload = runtime.payload(temporal, as: VMLocalDatePayload.self) {
+                let local = VMLocalDateTimePayload(year: date.year, month: date.month, day: date.day)
+                return runtime.newString(try formatLocal(local, pattern: pattern, zone: formatterZone.map { resolvedZone(local, zone: $0) }, hasTime: false))
             }
-            return runtime.newString("")
+            if let zoned: VMZonedDateTimePayload = runtime.payload(temporal, as: VMZonedDateTimePayload.self) {
+                let local = zoned.local
+                let zone = formatterZone.map { resolvedZone(local, zone: $0) } ?? resolvedZone(local, zone: zoned.zone)
+                return runtime.newString(try formatLocal(local, pattern: pattern, zone: zone))
+            }
+            if let offsetDateTime: VMOffsetDateTimePayload = runtime.payload(temporal, as: VMOffsetDateTimePayload.self) {
+                let local = offsetDateTime.local
+                let zone = formatterZone.map { resolvedZone(local, zone: $0) } ?? offsetDateTime.offset
+                return runtime.newString(try formatLocal(local, pattern: pattern, zone: zone))
+            }
+            if let time: VMLocalTimePayload = runtime.payload(temporal, as: VMLocalTimePayload.self) {
+                let local = VMLocalDateTimePayload(hour: time.hour, minute: time.minute, second: time.second, nano: time.nano)
+                // LocalTime has no offset field in java.time.
+                return runtime.newString(try formatLocal(local, pattern: pattern, hasDate: false))
+            }
+            if let instant: VMInstantPayload = runtime.payload(temporal, as: VMInstantPayload.self) {
+                let date = Date(timeIntervalSince1970: Double(instant.epochMilli) / 1000)
+                // java.time formats instants by projecting through the override
+                // zone, falling back to the system default zone.
+                let zone = formatterZone.map { adjustZone($0, at: date) } ?? systemDefaultZone(for: date)
+                return runtime.newString(try formatLocal(localFromDate(date, zone: zone), pattern: pattern, zone: zone))
+            }
+            throw VMJavaException("Ljava/time/temporal/UnsupportedTemporalTypeException;", "unsupported temporal")
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             let source: VMDateTimeFormatterPayload? = runtime.payload(args[0], as: VMDateTimeFormatterPayload.self)
@@ -193,7 +250,7 @@ enum JavaTimeRuntime {
             return runtime.makeNative("Ljava/time/LocalDateTime;", payload: parsed)
         }
         cls.staticMethod("now", "()Ljava/time/LocalDateTime;") { runtime, _, _ in
-            runtime.makeNative("Ljava/time/LocalDateTime;", payload: localFromDate(Date(), zone: utc))
+            runtime.makeNative("Ljava/time/LocalDateTime;", payload: localFromDate(Date(), zone: systemDefaultZone()))
         }
         cls.staticMethod("of", "(IIIIII)Ljava/time/LocalDateTime;") { runtime, args, _ in
             runtime.makeNative("Ljava/time/LocalDateTime;", payload: VMLocalDateTimePayload(
@@ -205,13 +262,16 @@ enum JavaTimeRuntime {
             let local: VMLocalDateTimePayload? = runtime.payload(args[0], as: VMLocalDateTimePayload.self)
             let zone: VMZonePayload? = runtime.payload(args[1], as: VMZonePayload.self)
             guard let local else { return .null }
-            return runtime.makeNative("Ljava/time/ZonedDateTime;", payload: VMZonedDateTimePayload(local: local, zone: zone ?? utc))
+            return runtime.makeNative("Ljava/time/ZonedDateTime;", payload: VMZonedDateTimePayload(local: local.copy(), zone: zone ?? utc))
         }
         cls.method("toLocalDate", "()Ljava/time/LocalDate;") { runtime, args, _ in
             guard let local: VMLocalDateTimePayload = runtime.payload(args[0], as: VMLocalDateTimePayload.self) else { return .null }
             return runtime.makeNative("Ljava/time/LocalDate;", payload: VMLocalDatePayload(year: local.year, month: local.month, day: local.day))
         }
-        cls.method("toLocalTime", "()Ljava/time/LocalTime;") { _, _, _ in .null }
+        cls.method("toLocalTime", "()Ljava/time/LocalTime;") { runtime, args, _ in
+            guard let local: VMLocalDateTimePayload = runtime.payload(args[0], as: VMLocalDateTimePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/time/LocalTime;", payload: VMLocalTimePayload(hour: local.hour, minute: local.minute, second: local.second, nano: local.nano))
+        }
         cls.method("getYear", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalDateTimePayload.self) ?? VMLocalDateTimePayload()).year)) }
         cls.method("getMonthValue", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalDateTimePayload.self) ?? VMLocalDateTimePayload()).month)) }
         cls.method("getDayOfMonth", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalDateTimePayload.self) ?? VMLocalDateTimePayload()).day)) }
@@ -222,11 +282,12 @@ enum JavaTimeRuntime {
             let local: VMLocalDateTimePayload? = runtime.payload(args[0], as: VMLocalDateTimePayload.self)
             let formatter: VMDateTimeFormatterPayload? = runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)
             guard let local else { return .null }
-            return runtime.newString(formatLocal(local, pattern: formatter?.pattern ?? "yyyy-MM-dd'T'HH:mm:ss"))
+            let overrideZone = formatter.flatMap { $0.zone }
+            return runtime.newString(try formatLocal(local, pattern: formatter?.pattern ?? "yyyy-MM-dd'T'HH:mm:ss", zone: overrideZone.map { resolvedZone(local, zone: $0) }))
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             guard let local: VMLocalDateTimePayload = runtime.payload(args[0], as: VMLocalDateTimePayload.self) else { return .null }
-            return runtime.newString(formatLocal(local, pattern: "yyyy-MM-dd'T'HH:mm:ss"))
+            return runtime.newString(try formatLocal(local, pattern: "yyyy-MM-dd'T'HH:mm:ss"))
         }
         return cls
     }
@@ -249,7 +310,7 @@ enum JavaTimeRuntime {
             return runtime.makeNative("Ljava/time/LocalDate;", payload: VMLocalDatePayload(year: parsed.year, month: parsed.month, day: parsed.day))
         }
         cls.staticMethod("now", "()Ljava/time/LocalDate;") { runtime, _, _ in
-            let local = localFromDate(Date(), zone: utc)
+            let local = localFromDate(Date(), zone: systemDefaultZone())
             return runtime.makeNative("Ljava/time/LocalDate;", payload: VMLocalDatePayload(year: local.year, month: local.month, day: local.day))
         }
         cls.method("atStartOfDay", "()Ljava/time/LocalDateTime;") { runtime, args, _ in
@@ -292,7 +353,53 @@ enum JavaTimeRuntime {
         cls.method("format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;") { runtime, args, _ in
             guard let date: VMLocalDatePayload = runtime.payload(args[0], as: VMLocalDatePayload.self) else { return .null }
             let formatter: VMDateTimeFormatterPayload? = runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)
-            return runtime.newString(formatLocal(VMLocalDateTimePayload(year: date.year, month: date.month, day: date.day), pattern: formatter?.pattern ?? "yyyy-MM-dd"))
+            let local = VMLocalDateTimePayload(year: date.year, month: date.month, day: date.day)
+            let overrideZone = formatter.flatMap { $0.zone }
+            return runtime.newString(try formatLocal(local, pattern: formatter?.pattern ?? "yyyy-MM-dd", zone: overrideZone.map { resolvedZone(local, zone: $0) }, hasTime: false))
+        }
+        return cls
+    }
+
+    private static func localTimeClass() -> NativeClass {
+        let cls = NativeClass("Ljava/time/LocalTime;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/time/temporal/TemporalAccessor;"])
+        cls.staticMethod("now", "()Ljava/time/LocalTime;") { runtime, _, _ in
+            let local = localFromDate(Date(), zone: systemDefaultZone())
+            return runtime.makeNative("Ljava/time/LocalTime;", payload: VMLocalTimePayload(hour: local.hour, minute: local.minute, second: local.second, nano: local.nano))
+        }
+        cls.staticMethod("of", "(II)Ljava/time/LocalTime;") { runtime, args, _ in
+            runtime.makeNative("Ljava/time/LocalTime;", payload: VMLocalTimePayload(hour: Int(args[0].asInt32), minute: Int(args[1].asInt32)))
+        }
+        cls.staticMethod("of", "(III)Ljava/time/LocalTime;") { runtime, args, _ in
+            runtime.makeNative("Ljava/time/LocalTime;", payload: VMLocalTimePayload(hour: Int(args[0].asInt32), minute: Int(args[1].asInt32), second: Int(args[2].asInt32)))
+        }
+        cls.staticMethod("of", "(IIII)Ljava/time/LocalTime;") { runtime, args, _ in
+            runtime.makeNative("Ljava/time/LocalTime;", payload: VMLocalTimePayload(
+                hour: Int(args[0].asInt32), minute: Int(args[1].asInt32),
+                second: Int(args[2].asInt32), nano: Int(args[3].asInt32)
+            ))
+        }
+        cls.method("getHour", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalTimePayload.self) ?? VMLocalTimePayload()).hour)) }
+        cls.method("getMinute", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalTimePayload.self) ?? VMLocalTimePayload()).minute)) }
+        cls.method("getSecond", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalTimePayload.self) ?? VMLocalTimePayload()).second)) }
+        cls.method("getNano", "()I") { runtime, args, _ in .int32(Int32((runtime.payload(args[0], as: VMLocalTimePayload.self) ?? VMLocalTimePayload()).nano)) }
+        cls.method("atDate", "(Ljava/time/LocalDate;)Ljava/time/LocalDateTime;") { runtime, args, _ in
+            guard let time: VMLocalTimePayload = runtime.payload(args[0], as: VMLocalTimePayload.self),
+                  let date: VMLocalDatePayload = runtime.payload(args[1], as: VMLocalDatePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/time/LocalDateTime;", payload: VMLocalDateTimePayload(
+                year: date.year, month: date.month, day: date.day,
+                hour: time.hour, minute: time.minute, second: time.second, nano: time.nano
+            ))
+        }
+        cls.method("format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;") { runtime, args, _ in
+            guard let time: VMLocalTimePayload = runtime.payload(args[0], as: VMLocalTimePayload.self) else { return .null }
+            let formatter: VMDateTimeFormatterPayload? = runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)
+            let local = VMLocalDateTimePayload(hour: time.hour, minute: time.minute, second: time.second, nano: time.nano)
+            return runtime.newString(try formatLocal(local, pattern: formatter?.pattern ?? "HH:mm:ss", hasDate: false))
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let time: VMLocalTimePayload = runtime.payload(args[0], as: VMLocalTimePayload.self) else { return .null }
+            let local = VMLocalDateTimePayload(hour: time.hour, minute: time.minute, second: time.second, nano: time.nano)
+            return runtime.newString(try formatLocal(local, pattern: "HH:mm:ss", hasDate: false))
         }
         return cls
     }
@@ -305,7 +412,7 @@ enum JavaTimeRuntime {
         }
         cls.method("toLocalDateTime", "()Ljava/time/LocalDateTime;") { runtime, args, _ in
             guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .null }
-            return runtime.makeNative("Ljava/time/LocalDateTime;", payload: zoned.local)
+            return runtime.makeNative("Ljava/time/LocalDateTime;", payload: zoned.local.copy())
         }
         cls.method("toLocalDate", "()Ljava/time/LocalDate;") { runtime, args, _ in
             guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .null }
@@ -332,11 +439,66 @@ enum JavaTimeRuntime {
         cls.method("format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;") { runtime, args, _ in
             guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .null }
             let formatter: VMDateTimeFormatterPayload? = runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)
-            return runtime.newString(formatLocal(zoned.local, pattern: formatter?.pattern ?? "yyyy-MM-dd'T'HH:mm:ss"))
+            let overrideZone = formatter.flatMap { $0.zone }
+            let zone = overrideZone.map { resolvedZone(zoned.local, zone: $0) } ?? resolvedZone(zoned.local, zone: zoned.zone)
+            return runtime.newString(try formatLocal(zoned.local, pattern: formatter?.pattern ?? "yyyy-MM-dd'T'HH:mm:ss", zone: zone))
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             guard let zoned: VMZonedDateTimePayload = runtime.payload(args[0], as: VMZonedDateTimePayload.self) else { return .null }
-            return runtime.newString(formatLocal(zoned.local, pattern: "yyyy-MM-dd'T'HH:mm:ss") + zoned.zone.id)
+            let zone = resolvedZone(zoned.local, zone: zoned.zone)
+            let body = try formatLocal(zoned.local, pattern: "yyyy-MM-dd'T'HH:mm:ss", zone: zone)
+            return runtime.newString(body + zoneSuffix(zone))
+        }
+        return cls
+    }
+
+    private static func offsetDateTimeClass() -> NativeClass {
+        let cls = NativeClass("Ljava/time/OffsetDateTime;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/time/temporal/TemporalAccessor;", "Ljava/time/temporal/Temporal;"])
+        cls.staticMethod("now", "()Ljava/time/OffsetDateTime;") { runtime, _, _ in
+            let zone = systemDefaultZone()
+            return runtime.makeNative("Ljava/time/OffsetDateTime;", payload: VMOffsetDateTimePayload(local: localFromDate(Date(), zone: zone), offset: zone))
+        }
+        cls.staticMethod("of", "(Ljava/time/LocalDateTime;Ljava/time/ZoneOffset;)Ljava/time/OffsetDateTime;") { runtime, args, _ in
+            guard let local: VMLocalDateTimePayload = runtime.payload(args[0], as: VMLocalDateTimePayload.self),
+                  let offset: VMZonePayload = runtime.payload(args[1], as: VMZonePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/time/OffsetDateTime;", payload: VMOffsetDateTimePayload(local: local.copy(), offset: offset))
+        }
+        cls.method("toLocalDateTime", "()Ljava/time/LocalDateTime;") { runtime, args, _ in
+            guard let value: VMOffsetDateTimePayload = runtime.payload(args[0], as: VMOffsetDateTimePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/time/LocalDateTime;", payload: value.local.copy())
+        }
+        cls.method("toInstant", "()Ljava/time/Instant;") { runtime, args, _ in
+            guard let value: VMOffsetDateTimePayload = runtime.payload(args[0], as: VMOffsetDateTimePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/time/Instant;", payload: VMInstantPayload(epochMilli: epochMilli(value.local, zone: value.offset)))
+        }
+        cls.method("getOffset", "()Ljava/time/ZoneOffset;") { runtime, args, _ in
+            guard let value: VMOffsetDateTimePayload = runtime.payload(args[0], as: VMOffsetDateTimePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/time/ZoneOffset;", payload: value.offset)
+        }
+        for (name, get) in [
+            ("getYear", { (l: VMLocalDateTimePayload) in l.year }),
+            ("getMonthValue", { (l: VMLocalDateTimePayload) in l.month }),
+            ("getDayOfMonth", { (l: VMLocalDateTimePayload) in l.day }),
+            ("getHour", { (l: VMLocalDateTimePayload) in l.hour }),
+            ("getMinute", { (l: VMLocalDateTimePayload) in l.minute }),
+            ("getSecond", { (l: VMLocalDateTimePayload) in l.second }),
+            ("getNano", { (l: VMLocalDateTimePayload) in l.nano }),
+        ] {
+            cls.method(name, "()I") { runtime, args, _ in
+                guard let value: VMOffsetDateTimePayload = runtime.payload(args[0], as: VMOffsetDateTimePayload.self) else { return .int32(0) }
+                return .int32(Int32(get(value.local)))
+            }
+        }
+        cls.method("format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;") { runtime, args, _ in
+            guard let value: VMOffsetDateTimePayload = runtime.payload(args[0], as: VMOffsetDateTimePayload.self) else { return .null }
+            let formatter: VMDateTimeFormatterPayload? = runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)
+            let overrideZone = formatter.flatMap { $0.zone }
+            return runtime.newString(try formatLocal(value.local, pattern: formatter?.pattern ?? "yyyy-MM-dd'T'HH:mm:ss", zone: overrideZone.map { resolvedZone(value.local, zone: $0) } ?? value.offset))
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let value: VMOffsetDateTimePayload = runtime.payload(args[0], as: VMOffsetDateTimePayload.self) else { return .null }
+            let body = try formatLocal(value.local, pattern: "yyyy-MM-dd'T'HH:mm:ss", zone: value.offset)
+            return runtime.newString(body + zoneSuffix(value.offset))
         }
         return cls
     }
@@ -378,7 +540,42 @@ enum JavaTimeRuntime {
         return cls
     }
 
+    private static func unsupportedTemporalTypeException() -> NativeClass {
+        NativeClass("Ljava/time/temporal/UnsupportedTemporalTypeException;", superclass: "Ljava/lang/RuntimeException;")
+    }
+
     // MARK: - Zone helpers
+
+    /// The device zone, resolved for the given instant so region zones keep
+    /// their daylight-saving offset.
+    static func systemDefaultZone(for date: Date = Date()) -> VMZonePayload {
+        let zone = TimeZone.current
+        return VMZonePayload(id: zone.identifier, secondsFromGMT: zone.secondsFromGMT(for: date))
+    }
+
+    static func foundationTimeZone(_ zone: VMZonePayload) -> TimeZone {
+        TimeZone(identifier: zone.id) ?? TimeZone(secondsFromGMT: zone.secondsFromGMT) ?? TimeZone(secondsFromGMT: 0)!
+    }
+
+    /// Region zones carry daylight-saving rules; fixed offsets keep their value.
+    static func adjustZone(_ zone: VMZonePayload, at date: Date) -> VMZonePayload {
+        guard let timeZone = TimeZone(identifier: zone.id) else { return zone }
+        let seconds = timeZone.secondsFromGMT(for: date)
+        return seconds == zone.secondsFromGMT ? zone : VMZonePayload(id: zone.id, secondsFromGMT: seconds)
+    }
+
+    static func resolvedZone(_ local: VMLocalDateTimePayload, zone: VMZonePayload) -> VMZonePayload {
+        adjustZone(zone, at: Date(timeIntervalSince1970: Double(epochMilli(local, zone: zone)) / 1000))
+    }
+
+    /// Java renders the offset first and appends the region id in brackets;
+    /// pure offsets stop at the offset.
+    static func zoneSuffix(_ zone: VMZonePayload) -> String {
+        let offset = zone.secondsFromGMT == 0 ? "Z" : offsetId(zone.secondsFromGMT)
+        let id = zone.id
+        if id.hasPrefix("+") || id.hasPrefix("-") || id == "Z" { return offset }
+        return offset + "[" + id + "]"
+    }
 
     static func parseZoneId(_ text: String) -> VMZonePayload {
         let value = text.trimmingCharacters(in: .whitespaces)
@@ -407,7 +604,7 @@ enum JavaTimeRuntime {
 
     static func epochMilli(_ local: VMLocalDateTimePayload, zone: VMZonePayload) -> Int64 {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: zone.secondsFromGMT) ?? TimeZone(secondsFromGMT: 0)!
+        calendar.timeZone = foundationTimeZone(zone)
         var components = DateComponents()
         components.year = local.year
         components.month = local.month
@@ -421,7 +618,7 @@ enum JavaTimeRuntime {
 
     static func localFromDate(_ date: Date, zone: VMZonePayload) -> VMLocalDateTimePayload {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: zone.secondsFromGMT) ?? TimeZone(secondsFromGMT: 0)!
+        calendar.timeZone = foundationTimeZone(zone)
         let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second, .nanosecond], from: date)
         return VMLocalDateTimePayload(
             year: components.year ?? 1970,
@@ -443,6 +640,8 @@ enum JavaTimeRuntime {
         var inputIndex = 0
         var tokenIndex = 0
         var amPM: String?
+        var missingField = false
+        var parsedField = false
 
         func readNumber(_ maxDigits: Int) -> Int? {
             var digits = ""
@@ -451,6 +650,14 @@ enum JavaTimeRuntime {
                 inputIndex += 1
             }
             return Int(digits)
+        }
+
+        func readRequired(_ maxDigits: Int) -> Int? {
+            guard let value = readNumber(maxDigits) else {
+                missingField = true
+                return nil
+            }
+            return value
         }
 
         while tokenIndex < tokens.count {
@@ -474,7 +681,10 @@ enum JavaTimeRuntime {
             let field = String(repeating: token, count: length)
             switch token {
             case "y":
-                result.year = readNumber(length == 2 ? 2 : 4) ?? result.year
+                if let value = readRequired(length == 2 ? 2 : 4) {
+                    result.year = value
+                    parsedField = true
+                }
             case "M":
                 if length >= 3 {
                     var word = ""
@@ -483,37 +693,65 @@ enum JavaTimeRuntime {
                         inputIndex += 1
                     }
                     let cleaned = word.lowercased().replacingOccurrences(of: ".", with: "")
-                    if let index = monthNames.firstIndex(where: { $0.hasPrefix(cleaned) || cleaned.hasPrefix($0.prefix(3)) }) {
+                    if cleaned.isEmpty {
+                        missingField = true
+                    } else if let index = monthNames.firstIndex(where: { $0.hasPrefix(cleaned) || cleaned.hasPrefix($0.prefix(3)) }) {
                         result.month = index + 1
+                        parsedField = true
+                    } else {
+                        missingField = true
                     }
-                } else {
-                    result.month = readNumber(2) ?? result.month
+                } else if let value = readRequired(2) {
+                    result.month = value
+                    parsedField = true
                 }
             case "d":
-                result.day = readNumber(2) ?? result.day
+                if let value = readRequired(2) {
+                    result.day = value
+                    parsedField = true
+                }
             case "H":
-                result.hour = readNumber(2) ?? result.hour
+                if let value = readRequired(2) {
+                    result.hour = value
+                    parsedField = true
+                }
             case "h":
-                result.hour = readNumber(2) ?? result.hour
+                if let value = readRequired(2) {
+                    result.hour = value
+                    parsedField = true
+                }
             case "m":
-                result.minute = readNumber(2) ?? result.minute
+                if let value = readRequired(2) {
+                    result.minute = value
+                    parsedField = true
+                }
             case "s":
-                result.second = readNumber(2) ?? result.second
+                if let value = readRequired(2) {
+                    result.second = value
+                    parsedField = true
+                }
             case "S":
                 let fraction = readNumber(9) ?? 0
                 result.nano = fraction * Int(pow(10, Double(9 - length)))
+                parsedField = true
             case "a":
                 var word = ""
                 while inputIndex < input.count, input[inputIndex].isLetter {
                     word.append(input[inputIndex])
                     inputIndex += 1
                 }
-                amPM = word.uppercased()
+                if word.isEmpty {
+                    missingField = true
+                } else {
+                    amPM = word.uppercased()
+                    parsedField = true
+                }
             case "E":
                 while inputIndex < input.count, input[inputIndex].isLetter || input[inputIndex] == "." { inputIndex += 1 }
             case "Z", "X", "z":
                 while inputIndex < input.count, !input[inputIndex].isNumber { inputIndex += 1 }
                 _ = readNumber(2); _ = readNumber(2)
+                parsedField = true
             default:
                 if inputIndex < input.count, input[inputIndex] == token { inputIndex += 1 }
             }
@@ -524,16 +762,26 @@ enum JavaTimeRuntime {
             if amPM == "PM", result.hour < 12 { result.hour += 12 }
             if amPM == "AM", result.hour == 12 { result.hour = 0 }
         }
-        guard result.year != 1970 || result.month != 1 || result.day != 1 || text.contains("1970") else {
-            return nil
-        }
+        // Epoch values such as 1970-01-01 are valid; only inputs missing a
+        // required field are rejected.
+        guard parsedField, !missingField else { return nil }
         _ = zone
         return result
     }
 
     // MARK: - Pattern format
 
-    static func formatLocal(_ local: VMLocalDateTimePayload, pattern: String) -> String {
+    /// Renders a date-time the way java.time does for the pattern letters the
+    /// extensions use. Width controls zero padding (`d` vs `dd`) and names
+    /// (`E`/`EEE` vs `EEEE`). Fields the temporal does not carry throw instead
+    /// of being rendered as invented values.
+    static func formatLocal(
+        _ local: VMLocalDateTimePayload,
+        pattern: String,
+        zone: VMZonePayload? = nil,
+        hasDate: Bool = true,
+        hasTime: Bool = true
+    ) throws -> String {
         let tokens = Array(pattern)
         var output = ""
         var index = 0
@@ -556,34 +804,142 @@ enum JavaTimeRuntime {
             var length = 1
             while index + length < tokens.count, tokens[index + length] == token { length += 1 }
             switch token {
-            case "y":
-                output += length == 2 ? String(format: "%02d", local.year % 100) : String(format: "%04d", local.year)
-            case "M":
-                if length >= 4 { output += monthNames[max(0, min(11, local.month - 1))].capitalized }
-                else if length == 3 { output += monthShort[max(0, min(11, local.month - 1))].capitalized }
-                else { output += String(format: "%02d", local.month) }
+            case "y", "u":
+                try require(hasDate, pattern)
+                let year = length == 2 ? local.year % 100 : local.year
+                output += length == 2 ? String(format: "%02d", year) : String(format: "%0\(max(4, length))d", year)
+            case "M", "L":
+                try require(hasDate, pattern)
+                let month = max(1, min(12, local.month))
+                if length == 1 {
+                    output += String(month)
+                } else if length == 2 {
+                    output += String(format: "%02d", month)
+                } else if length == 3 {
+                    output += monthShort[month - 1].capitalized
+                } else if length == 4 {
+                    output += monthNames[month - 1].capitalized
+                } else {
+                    output += String(monthNames[month - 1].prefix(1)).uppercased()
+                }
             case "d":
-                output += String(format: "%02d", local.day)
-            case "H":
-                output += String(format: "%02d", local.hour)
-            case "h":
-                output += String(format: "%02d", local.hour % 12 == 0 ? 12 : local.hour % 12)
-            case "m":
-                output += String(format: "%02d", local.minute)
-            case "s":
-                output += String(format: "%02d", local.second)
-            case "S":
-                output += String(format: "%0\(length)d", local.nano / Int(pow(10, Double(9 - length))))
-            case "a":
-                output += local.hour < 12 ? "AM" : "PM"
+                try require(hasDate, pattern)
+                output += padded(local.day, length)
             case "E":
-                output += String(format: "EEE")
+                try require(hasDate, pattern)
+                output += weekdayName(weekdayIndex(local), length: length)
+            case "H":
+                try require(hasTime, pattern)
+                output += padded(local.hour, length)
+            case "k":
+                try require(hasTime, pattern)
+                output += padded(local.hour == 0 ? 24 : local.hour, length)
+            case "h":
+                try require(hasTime, pattern)
+                output += padded(local.hour % 12 == 0 ? 12 : local.hour % 12, length)
+            case "K":
+                try require(hasTime, pattern)
+                output += padded(local.hour % 12, length)
+            case "m":
+                try require(hasTime, pattern)
+                output += padded(local.minute, length)
+            case "s":
+                try require(hasTime, pattern)
+                output += padded(local.second, length)
+            case "S":
+                try require(hasTime, pattern)
+                let digits = max(1, min(9, length))
+                output += String(format: "%0\(digits)d", local.nano / Int(pow(10, Double(9 - digits))))
+            case "a":
+                try require(hasTime, pattern)
+                output += local.hour < 12 ? "AM" : "PM"
+            case "Z":
+                guard let zone else { throw unsupported(pattern) }
+                if length >= 4 {
+                    output += zone.secondsFromGMT == 0 ? "GMT" : "GMT" + offsetId(zone.secondsFromGMT)
+                } else {
+                    output += compactOffset(zone.secondsFromGMT)
+                }
+            case "X", "x":
+                guard let zone else { throw unsupported(pattern) }
+                output += offsetText(zone.secondsFromGMT, length: length, zeroIsZ: token == "X")
+            case "z":
+                guard let zone else { throw unsupported(pattern) }
+                output += zone.id
+            case "O":
+                guard let zone else { throw unsupported(pattern) }
+                output += zone.secondsFromGMT == 0 ? "GMT" : "GMT" + offsetId(zone.secondsFromGMT)
             default:
-                output += String(token)
+                output += String(repeating: token, count: length)
             }
             index += length
         }
         return output
+    }
+
+    private static func require(_ available: Bool, _ pattern: String) throws {
+        if !available { throw unsupported(pattern) }
+    }
+
+    private static func unsupported(_ pattern: String) -> VMJavaException {
+        VMJavaException(
+            "Ljava/time/temporal/UnsupportedTemporalTypeException;",
+            "pattern \(pattern) requires a field the temporal does not have"
+        )
+    }
+
+    static func padded(_ value: Int, _ length: Int) -> String {
+        String(format: "%0\(max(1, length))d", value)
+    }
+
+    /// Monday-based weekday index for the date.
+    static func weekdayIndex(_ local: VMLocalDateTimePayload) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var components = DateComponents()
+        components.year = local.year
+        components.month = local.month
+        components.day = local.day
+        guard let date = calendar.date(from: components) else { return 0 }
+        // Calendar weekdays start at Sunday.
+        return (calendar.component(.weekday, from: date) + 5) % 7
+    }
+
+    static func weekdayName(_ index: Int, length: Int) -> String {
+        let clamped = max(0, min(6, index))
+        if length >= 5 { return String(weekdayNames[clamped].prefix(1)) }
+        if length == 4 { return weekdayNames[clamped] }
+        return weekdayShort[clamped]
+    }
+
+    static func compactOffset(_ seconds: Int) -> String {
+        if seconds == 0 { return "+0000" }
+        let sign = seconds < 0 ? "-" : "+"
+        let magnitude = abs(seconds)
+        return String(format: "%@%02d%02d", sign, magnitude / 3600, (magnitude % 3600) / 60)
+    }
+
+    static func offsetText(_ seconds: Int, length: Int, zeroIsZ: Bool) -> String {
+        if seconds == 0, zeroIsZ { return "Z" }
+        let sign = seconds < 0 ? "-" : "+"
+        let magnitude = abs(seconds)
+        let hours = magnitude / 3600
+        let minutes = (magnitude % 3600) / 60
+        let extraSeconds = magnitude % 60
+        switch length {
+        case 1:
+            return minutes == 0 && extraSeconds == 0
+                ? String(format: "%@%02d", sign, hours)
+                : String(format: "%@%02d%02d", sign, hours, minutes)
+        case 2:
+            return String(format: "%@%02d%02d", sign, hours, minutes)
+        case 3:
+            return String(format: "%@%02d:%02d", sign, hours, minutes)
+        case 4:
+            return String(format: "%@%02d%02d%02d", sign, hours, minutes, extraSeconds)
+        default:
+            return String(format: "%@%02d:%02d:%02d", sign, hours, minutes, extraSeconds)
+        }
     }
 }
 

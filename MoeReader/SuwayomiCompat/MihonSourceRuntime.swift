@@ -4,6 +4,8 @@ struct MihonManga: Identifiable, Hashable, Sendable {
     var id: String
     var title: String
     var coverURL: URL?
+    /// Request headers the source needs to fetch its cover images.
+    var coverHeaders: [String: String]
     var description: String?
     var author: String?
     var artist: String?
@@ -15,6 +17,7 @@ struct MihonManga: Identifiable, Hashable, Sendable {
         id: String,
         title: String,
         coverURL: URL? = nil,
+        coverHeaders: [String: String] = [:],
         description: String? = nil,
         author: String? = nil,
         artist: String? = nil,
@@ -25,6 +28,7 @@ struct MihonManga: Identifiable, Hashable, Sendable {
         self.id = id
         self.title = title
         self.coverURL = coverURL
+        self.coverHeaders = coverHeaders
         self.description = description
         self.author = author
         self.artist = artist
@@ -139,6 +143,47 @@ struct MihonFilterSelection: Hashable, Sendable {
     init(value: String, ascending: Bool = true) {
         self.value = value
         self.ascending = ascending
+    }
+}
+
+/// Persists the last applied filter selection per source identity so a browse
+/// view recreated by SwiftUI reopens with the same filters.
+struct MihonFilterSelectionStore {
+    static let keyPrefix = "mihon.filters."
+
+    private struct StoredSelection: Codable {
+        var value: String
+        var ascending: Bool
+    }
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func selections(forSourceIdentity identity: String) -> [String: MihonFilterSelection] {
+        guard let data = defaults.data(forKey: Self.key(for: identity)),
+              let stored = try? JSONDecoder().decode([String: StoredSelection].self, from: data)
+        else { return [:] }
+        return stored.mapValues { MihonFilterSelection(value: $0.value, ascending: $0.ascending) }
+    }
+
+    func save(_ selections: [String: MihonFilterSelection], forSourceIdentity identity: String) {
+        let key = Self.key(for: identity)
+        guard !selections.isEmpty else {
+            // An empty set means "filters reset"; drop the stored entry so a
+            // later load cannot resurrect the previous selection.
+            defaults.removeObject(forKey: key)
+            return
+        }
+        let stored = selections.mapValues { StoredSelection(value: $0.value, ascending: $0.ascending) }
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    private static func key(for identity: String) -> String {
+        keyPrefix + identity
     }
 }
 

@@ -257,21 +257,31 @@ final class DexFile: @unchecked Sendable {
               methodCount >= 0, classDefsCount >= 0
         else { throw DexError("\(name): negative table size") }
 
-        strings.reserveCapacity(stringCount)
+        // Validate every table before reserving capacity: a lying header could
+        // otherwise make `reserveCapacity` attempt a multi-gigabyte allocation
+        // before the range check runs.
+        try Self.checkRange(offset: stringIdsOffset, count: stringCount, element: 4, limit: buffer.count)
+        try Self.checkRange(offset: typeIdsOffset, count: typeCount, element: 4, limit: buffer.count)
+        try Self.checkRange(offset: protoIdsOffset, count: protoCount, element: 12, limit: buffer.count)
+        try Self.checkRange(offset: fieldIdsOffset, count: fieldCount, element: 8, limit: buffer.count)
+        try Self.checkRange(offset: methodIdsOffset, count: methodCount, element: 8, limit: buffer.count)
+        try Self.checkRange(offset: classDefsOffset, count: classDefsCount, element: 32, limit: buffer.count)
+
+        strings.reserveCapacity(min(stringCount, 4_096))
 
         try Self.forEachRange(offset: stringIdsOffset, count: stringCount, element: 4, limit: buffer.count) { index in
             let stringOffset = Int(buffer.u32(stringIdsOffset + index * 4))
             strings.append(try Self.readMUTF8(buffer, offset: stringOffset))
         }
 
-        types.reserveCapacity(typeCount)
+        types.reserveCapacity(min(typeCount, 4_096))
         try Self.forEachRange(offset: typeIdsOffset, count: typeCount, element: 4, limit: buffer.count) { index in
             let stringIndex = Int(buffer.u32(typeIdsOffset + index * 4))
             guard stringIndex < strings.count else { throw DexError("\(name): bad type string index") }
             types.append(strings[stringIndex])
         }
 
-        protos.reserveCapacity(protoCount)
+        protos.reserveCapacity(min(protoCount, 4_096))
         let typeCountSnapshot = types.count
         try Self.forEachRange(offset: protoIdsOffset, count: protoCount, element: 12, limit: buffer.count) { index in
             let base = protoIdsOffset + index * 12
@@ -291,7 +301,7 @@ final class DexFile: @unchecked Sendable {
                       parametersOffset + 4 + parameterCount * 2 <= buffer.count else {
                     throw DexError("\(name): bad proto parameters")
                 }
-                parameters.reserveCapacity(parameterCount)
+                parameters.reserveCapacity(min(parameterCount, 4_096))
                 for parameter in 0..<parameterCount {
                     let typeIndex = Int(buffer.u16(parametersOffset + 4 + parameter * 2))
                     guard typeIndex < typeCountSnapshot else { throw DexError("\(name): bad proto parameter type") }
@@ -305,7 +315,7 @@ final class DexFile: @unchecked Sendable {
             ))
         }
 
-        fieldRefs.reserveCapacity(fieldCount)
+        fieldRefs.reserveCapacity(min(fieldCount, 4_096))
         try Self.forEachRange(offset: fieldIdsOffset, count: fieldCount, element: 8, limit: buffer.count) { index in
             let base = fieldIdsOffset + index * 8
             let classIndex = Int(buffer.u16(base))
@@ -321,7 +331,7 @@ final class DexFile: @unchecked Sendable {
             ))
         }
 
-        methodRefs.reserveCapacity(methodCount)
+        methodRefs.reserveCapacity(min(methodCount, 4_096))
         let protoCountSnapshot = protos.count
         try Self.forEachRange(offset: methodIdsOffset, count: methodCount, element: 8, limit: buffer.count) { index in
             let base = methodIdsOffset + index * 8
@@ -344,6 +354,8 @@ final class DexFile: @unchecked Sendable {
             guard classIndex < typeCountSnapshot else { throw DexError("\(name): bad class def") }
             classIndexOfDescriptor[types[classIndex]] = index
         }
+
+        try validateClassData()
     }
 
     var classCount: Int { classDefsCount }
@@ -396,6 +408,52 @@ final class DexFile: @unchecked Sendable {
     }
 
     // MARK: - Class definition decoding
+
+    /// Walks every `class_data_item` once at load so that lazy decoding is only
+    /// ever handed structurally valid data. Nothing is materialised here: the
+    /// walk proves counts and uleb128 payloads fit inside the buffer, which
+    /// keeps malformed class data from stalling or over-reading the decoder.
+    private func validateClassData() throws {
+        var visited: Set<Int> = []
+        for index in 0..<classDefsCount {
+            let base = classDefsOffset + index * 32
+            let classDataOffset = Int(buffer.u32(base + 24))
+            guard classDataOffset != 0 else { continue }
+            guard classDataOffset < buffer.count else {
+                throw DexError("\(name): class data offset out of bounds")
+            }
+            // Malformed dex files may point several class defs at one item;
+            // walking each unique offset once keeps load time linear.
+            guard visited.insert(classDataOffset).inserted else { continue }
+
+            var cursor = classDataOffset
+            let staticFieldCount = try strictUleb(&cursor)
+            let instanceFieldCount = try strictUleb(&cursor)
+            let directMethodCount = try strictUleb(&cursor)
+            let virtualMethodCount = try strictUleb(&cursor)
+
+            // Every field entry is at least two ulebs (index delta, access).
+            let fieldCount = staticFieldCount + instanceFieldCount
+            guard fieldCount <= (buffer.count - cursor) / 2 else {
+                throw DexError("\(name): class field list out of bounds")
+            }
+            for _ in 0..<fieldCount {
+                _ = try strictUleb(&cursor)
+                _ = try strictUleb(&cursor)
+            }
+
+            // Every method entry is at least three ulebs (delta, access, code).
+            let methodCount = directMethodCount + virtualMethodCount
+            guard methodCount <= (buffer.count - cursor) / 3 else {
+                throw DexError("\(name): class method list out of bounds")
+            }
+            for _ in 0..<methodCount {
+                _ = try strictUleb(&cursor)
+                _ = try strictUleb(&cursor)
+                _ = try strictUleb(&cursor)
+            }
+        }
+    }
 
     private func decodeClassDef(index: Int) -> DexClassDef {
         let base = classDefsOffset + index * 32
@@ -473,32 +531,54 @@ final class DexFile: @unchecked Sendable {
         isStatic: Bool,
         values: [DexValue] = []
     ) -> [DexFieldDef] {
-        guard count > 0 else { return [] }
+        guard count > 0, cursor >= 0, cursor <= buffer.count else { return [] }
+        // Two ulebs per entry: never loop past what the buffer can hold.
+        let entryCount = min(count, (buffer.count - cursor) / 2)
+        guard entryCount > 0 else { return [] }
         var result: [DexFieldDef] = []
-        result.reserveCapacity(min(count, 512))
+        result.reserveCapacity(min(entryCount, 512))
         var fieldIndex = 0
-        for item in 0..<count {
-            fieldIndex += readUleb(&cursor)
+        for item in 0..<entryCount {
+            let delta = readUleb(&cursor)
+            guard fieldIndex <= Int.max - delta else { break }
+            fieldIndex += delta
             let access = readUleb(&cursor)
             guard fieldIndex < fieldRefs.count else { break }
             let value: DexValue? = isStatic && item < values.count ? values[item] : nil
-            result.append(DexFieldDef(access: UInt32(access), field: fieldRefs[fieldIndex], staticValue: value))
+            result.append(
+                DexFieldDef(
+                    access: UInt32(truncatingIfNeeded: access),
+                    field: fieldRefs[fieldIndex],
+                    staticValue: value
+                )
+            )
         }
         return result
     }
 
     private func decodeMethods(_ cursor: inout Int, count: Int) -> [DexMethodDef] {
-        guard count > 0 else { return [] }
+        guard count > 0, cursor >= 0, cursor <= buffer.count else { return [] }
+        // Three ulebs per entry: never loop past what the buffer can hold.
+        let entryCount = min(count, (buffer.count - cursor) / 3)
+        guard entryCount > 0 else { return [] }
         var result: [DexMethodDef] = []
-        result.reserveCapacity(min(count, 512))
+        result.reserveCapacity(min(entryCount, 512))
         var methodIndex = 0
-        for _ in 0..<count {
-            methodIndex += readUleb(&cursor)
+        for _ in 0..<entryCount {
+            let delta = readUleb(&cursor)
+            guard methodIndex <= Int.max - delta else { break }
+            methodIndex += delta
             let access = readUleb(&cursor)
             let codeOffset = readUleb(&cursor)
             guard methodIndex < methodRefs.count else { break }
             let code = codeOffset == 0 ? nil : decodeCode(codeOffset)
-            result.append(DexMethodDef(access: UInt32(access), method: methodRefs[methodIndex], code: code))
+            result.append(
+                DexMethodDef(
+                    access: UInt32(truncatingIfNeeded: access),
+                    method: methodRefs[methodIndex],
+                    code: code
+                )
+            )
         }
         return result
     }
@@ -529,13 +609,18 @@ final class DexFile: @unchecked Sendable {
             var lists: [Int: (typed: [(String?, Int)], catchAll: Int?)] = [:]
             var listCursor = handlersOffset
             let listCount = readUleb(&listCursor)
-            for _ in 0..<max(0, min(listCount, 4096)) {
+            let listLimit = max(0, min(listCount, min(4_096, (buffer.count - listCursor) / 2)))
+            for _ in 0..<listLimit {
                 let listStart = listCursor
                 let size = readSleb(&listCursor)
-                guard abs(size) <= 4096 else { break }
+                // `abs(Int.min)` traps; a sign-extended 5-byte sleb can get
+                // close to that range on malformed input.
+                guard size != Int.min else { break }
+                let handlerCount = abs(size)
+                guard handlerCount <= 4_096 else { break }
                 var typed: [(String?, Int)] = []
-                typed.reserveCapacity(abs(size))
-                for _ in 0..<abs(size) {
+                typed.reserveCapacity(handlerCount)
+                for _ in 0..<handlerCount {
                     let typeIndex = readUleb(&listCursor)
                     let address = readUleb(&listCursor)
                     let type = typeIndex < types.count ? types[typeIndex] : nil
@@ -576,34 +661,35 @@ final class DexFile: @unchecked Sendable {
 
     // MARK: - encoded_value
 
-    private func decodeEncodedArray(_ cursor: inout Int) throws -> [DexValue] {
+    private func decodeEncodedArray(_ cursor: inout Int, depth: Int = 0) throws -> [DexValue] {
+        guard depth < 16 else { throw DexError("\(name): encoded array nesting too deep") }
         let count = readUleb(&cursor)
         guard count < 4096 else { throw DexError("\(name): oversized encoded array") }
         var values: [DexValue] = []
         values.reserveCapacity(count)
         for _ in 0..<count {
-            values.append(try decodeEncodedValue(&cursor))
+            values.append(try decodeEncodedValue(&cursor, depth: depth + 1))
         }
         return values
     }
 
-    private func decodeEncodedValue(_ cursor: inout Int) throws -> DexValue {
+    private func decodeEncodedValue(_ cursor: inout Int, depth: Int = 0) throws -> DexValue {
         guard cursor < buffer.count else { throw DexError("\(name): truncated encoded value") }
         let header = buffer.u8(cursor)
         cursor += 1
         let valueType = header & 0x1F
         let valueArg = Int(header >> 5)
         switch valueType {
-        case 0x00: return .byte(Int8(bitPattern: UInt8(readSigned(&cursor, size: valueArg + 1))))
+        case 0x00: return .byte(Int8(bitPattern: UInt8(truncatingIfNeeded: readSigned(&cursor, size: valueArg + 1))))
         case 0x02: return .short(Int16(bitPattern: UInt16(truncatingIfNeeded: readSigned(&cursor, size: valueArg + 1))))
         case 0x03: return .char(UInt16(truncatingIfNeeded: readUnsigned(&cursor, size: valueArg + 1)))
         case 0x04: return .int(Int32(truncatingIfNeeded: readSigned(&cursor, size: valueArg + 1)))
         case 0x06: return .long(readSigned(&cursor, size: valueArg + 1))
         case 0x10: return .float(Float32(bitPattern: UInt32(truncatingIfNeeded: readUnsigned(&cursor, size: 4))).bitPattern)
         case 0x11: return .double(Float64(bitPattern: UInt64(truncatingIfNeeded: readUnsigned(&cursor, size: 8))).bitPattern)
-        case 0x17: return .string(Int(readUnsigned(&cursor, size: valueArg + 1)))
-        case 0x18: return .type(Int(readUnsigned(&cursor, size: valueArg + 1)))
-        case 0x1c: return .array(try decodeEncodedArray(&cursor))
+        case 0x17: return .string(Int(clamping: readUnsigned(&cursor, size: valueArg + 1)))
+        case 0x18: return .type(Int(clamping: readUnsigned(&cursor, size: valueArg + 1)))
+        case 0x1c: return .array(try decodeEncodedArray(&cursor, depth: depth))
         case 0x1e: return .null
         case 0x1f: return .boolean(valueArg != 0)
         default:
@@ -620,7 +706,7 @@ final class DexFile: @unchecked Sendable {
     @inline(__always) private func readUnsigned(_ cursor: inout Int, size: Int) -> UInt64 {
         var value: UInt64 = 0
         var shift = 0
-        for _ in 0..<size {
+        for _ in 0..<max(0, min(size, 8)) {
             guard cursor < buffer.count else { break }
             value |= UInt64(buffer.u8(cursor)) << UInt64(shift)
             cursor += 1
@@ -630,6 +716,7 @@ final class DexFile: @unchecked Sendable {
     }
 
     @inline(__always) private func readSigned(_ cursor: inout Int, size: Int) -> Int64 {
+        guard size > 0 else { return 0 }
         let raw = readUnsigned(&cursor, size: size)
         let bits = size * 8
         if bits >= 64 { return Int64(bitPattern: raw) }
@@ -670,6 +757,34 @@ final class DexFile: @unchecked Sendable {
         return result
     }
 
+    /// Bounds-checked uleb128 used only by load-time validation: unlike the
+    /// hot `readUleb`, a truncated encoding is an error rather than a zero.
+    private func strictUleb(_ cursor: inout Int) throws -> Int {
+        var result = 0
+        var shift = 0
+        while cursor < buffer.count, shift < 35 {
+            let byte = buffer.u8(cursor)
+            cursor += 1
+            result |= Int(byte & 0x7F) << shift
+            if byte & 0x80 == 0 { return result }
+            shift += 7
+        }
+        throw DexError("\(name): truncated uleb128")
+    }
+
+    private static func checkRange(
+        offset: Int,
+        count: Int,
+        element: Int,
+        limit: Int
+    ) throws {
+        guard count > 0 else { return }
+        guard offset >= 0, element > 0, offset <= limit,
+              count <= (limit - offset) / element else {
+            throw DexError("table out of bounds")
+        }
+    }
+
     private static func forEachRange(
         offset: Int,
         count: Int,
@@ -678,9 +793,7 @@ final class DexFile: @unchecked Sendable {
         body: (Int) throws -> Void
     ) throws {
         guard count > 0 else { return }
-        guard offset >= 0, element > 0, count <= (limit - offset) / element else {
-            throw DexError("table out of bounds")
-        }
+        try checkRange(offset: offset, count: count, element: element, limit: limit)
         for index in 0..<count { try body(index) }
     }
 

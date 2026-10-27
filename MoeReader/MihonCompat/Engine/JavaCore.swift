@@ -37,6 +37,25 @@ enum JavaCore {
         return result
     }
 
+    /// `Character.isWhitespace` for a single UTF-16 code unit: the ASCII
+    /// whitespace controls plus Unicode space/line/paragraph separators, but
+    /// not the non-breaking spaces Java excludes from the definition.
+    static func isJavaWhitespace(_ unit: UInt16) -> Bool {
+        switch unit {
+        case 0x09...0x0D, 0x1C...0x1F:
+            return true
+        default:
+            break
+        }
+        guard let scalar = UnicodeScalar(UInt32(unit)) else { return false }
+        switch scalar.properties.generalCategory {
+        case .spaceSeparator, .lineSeparator, .paragraphSeparator:
+            return unit != 0x00A0 && unit != 0x2007 && unit != 0x202F
+        default:
+            return false
+        }
+    }
+
     // MARK: - java.lang.Object
 
     private static func objectClass() -> [NativeClass] {
@@ -327,7 +346,12 @@ enum JavaCore {
             return runtime.newString(units: units)
         }
         cls.method("strip", "()Ljava/lang/String;") { runtime, args, _ in
-            runtime.newString(runtime.stringValue(args[0])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+            let units = runtime.stringUnits(args[0]) ?? []
+            var start = 0
+            var end = units.count
+            while start < end, JavaCore.isJavaWhitespace(units[start]) { start += 1 }
+            while end > start, JavaCore.isJavaWhitespace(units[end - 1]) { end -= 1 }
+            return runtime.newString(units: Array(units[start..<end]))
         }
         cls.method("toLowerCase", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.stringValue(args[0])?.lowercased() ?? "")
@@ -892,7 +916,7 @@ enum JavaCore {
             return .boolean(CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar))
         }
         cls.staticMethod("isWhitespace", "(C)Z") { _, args, _ in
-            .boolean(CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
+            .boolean(JavaCore.isJavaWhitespace(UInt16(truncatingIfNeeded: args[0].asInt32)))
         }
         cls.staticMethod("isUpperCase", "(C)Z") { _, args, _ in
             let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
@@ -1158,6 +1182,24 @@ enum JavaCore {
         return [cls]
     }
 
+    /// Resolves a field for `Class.getField`/`getDeclaredField`. Instance
+    /// fields are already flattened down the hierarchy (offsets are relative to
+    /// the queried class); static fields are declared per class, so walk the
+    /// superclass chain and return the declaring owner that holds their slot.
+    private static func reflectedField(in target: VMClass, named name: String) -> (VMClass, VMField)? {
+        if let field = target.instanceFields.last(where: { $0.name == name }) {
+            return (target, field)
+        }
+        var cursor: VMClass? = target
+        while let cls = cursor {
+            if let field = cls.staticFields.first(where: { $0.name == name }) {
+                return (cls, field)
+            }
+            cursor = cls.superclass
+        }
+        return nil
+    }
+
     private static func classClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/lang/Class;")
         cls.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
@@ -1202,19 +1244,18 @@ enum JavaCore {
         cls.method("getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
             guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
-            let field = target.instanceFields.last(where: { $0.name == name }) ?? target.staticFields.first(where: { $0.name == name })
-            guard let field else {
+            guard let resolved = reflectedField(in: target, named: name) else {
                 throw VMJavaException("Ljava/lang/NoSuchFieldException;", "\(target.displayName).\(name)")
             }
-            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: target, field: field))
+            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: resolved.0, field: resolved.1))
         }
         cls.method("getField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
             guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
-            guard let field = target.instanceFields.last(where: { $0.name == name }) ?? target.staticFields.first(where: { $0.name == name }) else {
+            guard let resolved = reflectedField(in: target, named: name) else {
                 throw VMJavaException("Ljava/lang/NoSuchFieldException;", name)
             }
-            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: target, field: field))
+            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: resolved.0, field: resolved.1))
         }
         cls.method("getDeclaredFields", "()[Ljava/lang/reflect/Field;") { runtime, args, _ in
             guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
@@ -1331,6 +1372,7 @@ enum JavaCore {
             ("Ljava/io/UncheckedIOException;", "Ljava/lang/RuntimeException;"),
             ("Ljava/io/FileNotFoundException;", "Ljava/io/IOException;"),
             ("Ljava/util/NoSuchElementException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/util/MissingResourceException;", "Ljava/lang/RuntimeException;"),
             ("Ljava/util/ConcurrentModificationException;", "Ljava/lang/RuntimeException;"),
             ("Ljava/util/regex/PatternSyntaxException;", "Ljava/lang/IllegalArgumentException;"),
             ("Ljava/lang/SecurityException;", "Ljava/lang/RuntimeException;"),

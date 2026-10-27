@@ -33,10 +33,12 @@ profiles, and SwiftUI screens.
 - **Browsing and reading.** The layer includes its own source browser, manga
   detail/chapter list, remote image pipeline, and paged reader. Search filters
   are rendered from the extension's `FilterList` and replayed onto a fresh list
-  for each search. Source preferences are edited in a sheet, including text,
-  single-choice, toggle, and multi-select controls backed by `SharedPreferences`
-  string sets. Reading progress is stored in `UserDefaults`; it does not touch
-  the local library model.
+  for each search, persisted per source, and re-applied after view recreation.
+  Source preferences are edited in a sheet, including text, single-choice,
+  toggle, and multi-select controls backed by `SharedPreferences` string sets;
+  only changed keys are written. Covers use the source's request headers.
+  Reading progress is stored in `UserDefaults`; it does not touch the local
+  library model.
 
 ## Relationship to the engine
 
@@ -110,7 +112,13 @@ not.
 - Remote image requests share the app cookie jar so clearance/session cookies
   obtained by the engine or challenge solver apply to covers and pages.
 - Runtime pools are keyed by package and installed APK hash, so an extension
-  update never reuses the removed package’s engine.
+  update never reuses the removed package’s engine; busy runtimes are never
+  evicted mid-call, and deferred unloads run after the queue drains.
+- Repository and installed-state mutations roll back on persistence failure;
+  content-addressed APKs are removed only when no remaining install references
+  them.
+- Engine HTTP responses, repository indexes, APKs and images are size-capped;
+  extension file access is confined to its per-package Caches directory.
 - The signing key is pinned from the index. A key change on refresh is rejected
   until the repository is removed and re-added.
 - APK admission checks the package name, version code, v2/v3 signer certificate

@@ -19,8 +19,114 @@ import WebKit
 
 // MARK: - Host services
 
+/// Streaming byte accumulator for one host response. It refuses to grow past
+/// the cap, so an extension cannot make the engine buffer an unbounded body.
+final class MihonResponseBuffer: @unchecked Sendable {
+    /// Matches the APK/package size limits enforced by the compat store.
+    static let maximumBytes = 64 * 1024 * 1024
+
+    let limit: Int
+    private(set) var data = Data()
+
+    init(limit: Int = MihonResponseBuffer.maximumBytes) {
+        self.limit = limit
+    }
+
+    /// Rejects a declared `Content-Length` before the body is downloaded.
+    func validateContentLength(_ value: String?) throws {
+        guard let value,
+              let length = Int(value.trimmingCharacters(in: .whitespaces)),
+              length > 0 else { return }
+        guard length <= limit else { throw overflow() }
+    }
+
+    func append(_ chunk: Data) throws {
+        guard chunk.count <= limit - data.count else { throw overflow() }
+        data.append(chunk)
+    }
+
+    private func overflow() -> VMJavaException {
+        VMJavaException("Ljava/io/IOException;", "response exceeds \(limit)-byte limit")
+    }
+}
+
+/// Delegate-backed response reader: the task is cancelled as soon as the body
+/// crosses the cap instead of downloading it whole and then checking.
+final class MihonResponseDownloader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    final class Pending: @unchecked Sendable {
+        let semaphore = DispatchSemaphore(value: 0)
+        let buffer = MihonResponseBuffer()
+        var response: HTTPURLResponse?
+        var error: Error?
+    }
+
+    private let lock = NSLock()
+    private var pending: [Int: Pending] = [:]
+
+    func register(_ task: URLSessionTask) -> Pending {
+        let box = Pending()
+        lock.lock()
+        pending[task.taskIdentifier] = box
+        lock.unlock()
+        return box
+    }
+
+    func discard(_ task: URLSessionTask) {
+        lock.lock()
+        pending.removeValue(forKey: task.taskIdentifier)
+        lock.unlock()
+    }
+
+    private func box(for identifier: Int) -> Pending? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending[identifier]
+    }
+
+    private func finish(_ identifier: Int) -> Pending? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.removeValue(forKey: identifier)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let box = box(for: dataTask.taskIdentifier), box.error == nil else { return }
+        if box.response == nil {
+            box.response = dataTask.response as? HTTPURLResponse
+            do {
+                try box.buffer.validateContentLength(box.response?.value(forHTTPHeaderField: "Content-Length"))
+            } catch {
+                box.error = error
+                dataTask.cancel()
+                return
+            }
+        }
+        do {
+            try box.buffer.append(data)
+        } catch {
+            box.error = error
+            dataTask.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let box = finish(task.taskIdentifier) else { return }
+        if box.response == nil { box.response = task.response as? HTTPURLResponse }
+        if box.error == nil { box.error = error }
+        if box.error == nil {
+            do {
+                try box.buffer.validateContentLength(box.response?.value(forHTTPHeaderField: "Content-Length"))
+            } catch let failure {
+                box.error = failure
+            }
+        }
+        box.semaphore.signal()
+    }
+}
+
 final class MihonEngineHost: VMHost {
     private let session: URLSession
+    private let downloader: MihonResponseDownloader
     private let preferencesStore: VMPreferences
     private let logHandler: (String) -> Void
     private let fileRoot: String
@@ -32,7 +138,9 @@ final class MihonEngineHost: VMHost {
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpCookieStorage = HTTPCookieStorage.shared
         configuration.httpShouldSetCookies = true
-        self.session = URLSession(configuration: configuration)
+        let downloader = MihonResponseDownloader()
+        self.downloader = downloader
+        self.session = URLSession(configuration: configuration, delegate: downloader, delegateQueue: nil)
         self.preferencesStore = VMUserDefaultsPreferences(prefix: prefix)
         self.logHandler = log
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
@@ -57,21 +165,17 @@ final class MihonEngineHost: VMHost {
             urlRequest.addValue(value, forHTTPHeaderField: name)
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = ResponseBox()
-        let task = session.dataTask(with: urlRequest) { data, response, error in
-            box.data = data ?? Data()
-            box.response = response as? HTTPURLResponse
-            box.error = error
-            semaphore.signal()
-        }
+        let task = session.dataTask(with: urlRequest)
+        let box = downloader.register(task)
         task.resume()
 
-        if semaphore.wait(timeout: .now() + 60) == .timedOut {
+        if box.semaphore.wait(timeout: .now() + 60) == .timedOut {
             task.cancel()
+            downloader.discard(task)
             throw VMJavaException("Ljava/io/IOException;", "timed out: \(request.url)")
         }
         if let error = box.error {
+            if let exception = error as? VMJavaException { throw exception }
             throw VMJavaException("Ljava/io/IOException;", error.localizedDescription)
         }
         guard let response = box.response else {
@@ -86,7 +190,7 @@ final class MihonEngineHost: VMHost {
             code: response.statusCode,
             message: HTTPURLResponse.localizedString(forStatusCode: response.statusCode),
             headers: headers,
-            body: box.data
+            body: box.buffer.data
         )
     }
 
@@ -104,12 +208,6 @@ final class MihonEngineHost: VMHost {
         return false
         #endif
     }
-}
-
-private final class ResponseBox: @unchecked Sendable {
-    var data = Data()
-    var response: HTTPURLResponse?
-    var error: Error?
 }
 
 final class VMUserDefaultsPreferences: VMPreferences {
@@ -169,13 +267,32 @@ final class MihonEnginePool: @unchecked Sendable {
         let runtime = MihonEngineRuntime(packageName: packageName, apkURL: apkURL)
         runtimes[identifier] = runtime
         order.append(identifier)
-        while order.count > limit, let oldest = order.first {
-            order.removeFirst()
-            if let evicted = runtimes.removeValue(forKey: oldest) {
-                evicted.unload()
-            }
-        }
+        trimToLimit(keeping: identifier)
         return runtime
+    }
+
+    /// Drops idle runtimes in least-recently-used order, never the runtime that
+    /// was just handed out. A runtime with work in flight is skipped, so the
+    /// pool may temporarily exceed `limit` rather than unload an engine mid-call.
+    private func trimToLimit(keeping identifier: String) {
+        var index = 0
+        while order.count > limit, index < order.count {
+            let candidate = order[index]
+            if candidate == identifier {
+                index += 1
+                continue
+            }
+            guard let runtime = runtimes[candidate] else {
+                order.remove(at: index)
+                continue
+            }
+            guard runtime.unload() else {
+                index += 1
+                continue
+            }
+            runtimes.removeValue(forKey: candidate)
+            order.remove(at: index)
+        }
     }
 
     func evict(packageName: String) {
@@ -212,6 +329,13 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
     private var engine: MihonEngine?
     private var sources: [MihonEngineSourceInfo] = []
 
+    /// Guards the operation bookkeeping below. Engine state stays on `queue`;
+    /// only these counters are read from other threads.
+    private let stateLock = NSLock()
+    private var activeOperations = 0
+    private var pendingUnload = false
+    private var unloaded = false
+
     init(packageName: String, apkURL: URL) {
         self.packageName = packageName
         self.apkURL = apkURL
@@ -223,11 +347,71 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
         )
     }
 
-    func unload() {
+    /// True while a call is queued or running. The pool consults this so an
+    /// in-flight engine is never unloaded.
+    var isBusy: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeOperations > 0
+    }
+
+    /// True once the runtime released its engine and no call has used it since.
+    /// A later call lazily reloads the package, matching the pool's old
+    /// behaviour when a screen still holds a runtime that was evicted.
+    var isUnloaded: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return unloaded
+    }
+
+    /// Releases the engine, or defers the release until in-flight work drains.
+    /// Returns false when an operation is still queued or running; the pool
+    /// then keeps the runtime resident instead of unloading it mid-call.
+    @discardableResult
+    func unload() -> Bool {
+        guard requestUnload() else { return false }
+        clearEngine()
+        return true
+    }
+
+    /// Asks the runtime to release its engine. Returns false when work is in
+    /// flight; `endOperation` clears it once the queue drains.
+    private func requestUnload() -> Bool {
+        stateLock.lock()
+        if activeOperations > 0 {
+            pendingUnload = true
+            stateLock.unlock()
+            return false
+        }
+        unloaded = true
+        stateLock.unlock()
+        return true
+    }
+
+    private func clearEngine() {
         queue.async { [weak self] in
             self?.engine = nil
             self?.sources = []
         }
+    }
+
+    private func beginOperation() {
+        stateLock.lock()
+        unloaded = false
+        activeOperations += 1
+        stateLock.unlock()
+    }
+
+    private func endOperation() {
+        stateLock.lock()
+        activeOperations -= 1
+        let shouldUnload = activeOperations == 0 && pendingUnload
+        if shouldUnload {
+            pendingUnload = false
+            unloaded = true
+        }
+        stateLock.unlock()
+        if shouldUnload { clearEngine() }
     }
 
     // MARK: Protocol
@@ -311,22 +495,39 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
 
     // MARK: Engine access
 
-    private func perform<T>(source: MihonSource, _ body: @escaping @Sendable (MihonEngine, Int) throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
+    private func perform<T: Sendable>(
+        source: MihonSource,
+        _ body: @escaping @Sendable (MihonEngine, Int) throws -> T
+    ) async throws -> T {
+        try await performOperation {
+            let engine = try self.loadEngine()
+            let index = try self.sourceIndex(for: source, in: engine)
+            return try body(engine, index)
+        }
+    }
+
+    /// Runs `body` on the runtime's serial queue as a tracked operation. The
+    /// pool reads `isBusy`, so engines are only released between calls.
+    func performOperation<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        beginOperation()
+        return try await withCheckedThrowingContinuation { continuation in
             queue.async { [weak self] in
                 guard let self else {
                     continuation.resume(throwing: MihonEngineFailure("engine released"))
                     return
                 }
                 do {
-                    let engine = try self.loadEngine()
-                    let index = try self.sourceIndex(for: source, in: engine)
-                    continuation.resume(returning: try body(engine, index))
+                    let value = try body()
+                    self.endOperation()
+                    continuation.resume(returning: value)
                 } catch let exception as VMJavaException {
+                    self.endOperation()
                     continuation.resume(throwing: MihonEngineFailure(exception.display))
                 } catch let error as VMError {
+                    self.endOperation()
                     continuation.resume(throwing: MihonEngineFailure(error.description))
                 } catch {
+                    self.endOperation()
                     continuation.resume(throwing: error)
                 }
             }

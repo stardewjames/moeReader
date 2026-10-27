@@ -159,7 +159,7 @@ final class MihonEngine: @unchecked Sendable {
         defer { recycleIfNeeded() }
         let source = try source(at: sourceIndex)
         let result = try callSuspend(source, "getPopularManga(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;", [.int32(Int32(page))])
-        return try mangasPage(result)
+        return try mangasPage(result, source: source)
     }
 
     func latest(sourceIndex: Int, page: Int) throws -> (items: [MihonManga], hasMore: Bool) {
@@ -167,7 +167,7 @@ final class MihonEngine: @unchecked Sendable {
         defer { recycleIfNeeded() }
         let source = try source(at: sourceIndex)
         let result = try callSuspend(source, "getLatestUpdates(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;", [.int32(Int32(page))])
-        return try mangasPage(result)
+        return try mangasPage(result, source: source)
     }
 
     func search(sourceIndex: Int, query: String, page: Int) throws -> (items: [MihonManga], hasMore: Bool) {
@@ -190,7 +190,7 @@ final class MihonEngine: @unchecked Sendable {
             "getSearchManga(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
             [.int32(Int32(page)), runtime.newString(query), filters]
         )
-        return try mangasPage(result)
+        return try mangasPage(result, source: source)
     }
 
     /// Snapshot of the source's filter list for the filter UI. Each filter's
@@ -218,7 +218,7 @@ final class MihonEngine: @unchecked Sendable {
         let payload: VMMangaUpdatePayload? = runtime.payload(update, as: VMMangaUpdatePayload.self)
         guard let payload else { throw MihonEngineError("source returned no manga update") }
         let details = payload.manga.bits != 0 ? payload.manga : manga
-        return convertManga(details)
+        return convertManga(details, source: source)
     }
 
     func chapters(sourceIndex: Int, mangaURL: String, mangaTitle: String) throws -> [MihonChapter] {
@@ -404,18 +404,18 @@ final class MihonEngine: @unchecked Sendable {
         return (try? runtime.invoke(method, [source])) ?? runtime.makeFilterList([])
     }
 
-    private func mangasPage(_ value: VMValue) throws -> (items: [MihonManga], hasMore: Bool) {
+    private func mangasPage(_ value: VMValue, source: VMValue) throws -> (items: [MihonManga], hasMore: Bool) {
         guard let payload: VMMangasPagePayload = runtime.payload(value, as: VMMangasPagePayload.self) else {
             throw MihonEngineError("source returned no MangasPage")
         }
         let items = runtime.listItems(payload.mangas) ?? []
-        return (items.map { convertManga($0) }, payload.hasNextPage)
+        return (items.map { convertManga($0, source: source) }, payload.hasNextPage)
     }
 
-    private func convertManga(_ value: VMValue) -> MihonManga {
+    private func convertManga(_ value: VMValue, source: VMValue) -> MihonManga {
         let payload = runtime.manga(value)
         let url = runtime.stringValue(payload.url) ?? ""
-        return MihonManga(
+        var manga = MihonManga(
             id: url,
             title: runtime.stringValue(payload.title) ?? "",
             coverURL: runtime.stringValue(payload.thumbnail).flatMap { URL(string: $0) },
@@ -426,6 +426,8 @@ final class MihonEngine: @unchecked Sendable {
             genres: convertGenres(payload),
             language: runtime.stringValue(payload.language)
         )
+        manga.coverHeaders = sourceHeaders(source)
+        return manga
     }
 
     private func statusName(_ status: Int32) -> String? {
@@ -466,6 +468,16 @@ final class MihonEngine: @unchecked Sendable {
             publishedAt: date,
             language: runtime.stringValue(payload.language)
         )
+    }
+
+    /// Default headers the source attaches to its requests. The reader reuses
+    /// them for cover images, which come from the same origin.
+    private func sourceHeaders(_ source: VMValue) -> [String: String] {
+        let headers = runtime.callVirtual(source, "getHeaders()Lokhttp3/Headers;", []) ?? .null
+        guard let payload: VMHeadersPayload = runtime.payload(headers, as: VMHeadersPayload.self) else { return [:] }
+        var result: [String: String] = [:]
+        for (name, value) in payload.entries where !name.isEmpty { result[name] = value }
+        return result
     }
 
     private func imageRequestHeaders(source: VMValue, page: VMValue) -> [String: String]? {

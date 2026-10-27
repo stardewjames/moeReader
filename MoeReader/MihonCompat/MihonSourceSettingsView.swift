@@ -4,7 +4,9 @@
 //
 //  Generic source preference form. The extension builds the controls through
 //  setupPreferenceScreen; edits are written to the engine's shared preferences,
-//  which the extension reads on its next call.
+//  which the extension reads on its next call. Toggles, lists, and submitted
+//  text fields apply immediately; multi-select sets and unsubmitted text edits
+//  commit once when the form closes.
 //
 
 import SwiftUI
@@ -17,6 +19,8 @@ struct MihonSourceSettingsView: View {
     @State private var preferences: [MihonEnginePreference] = []
     @State private var values: [String: String] = [:]
     @State private var selections: [String: Set<String>] = [:]
+    @State private var persistedValues: [String: String] = [:]
+    @State private var persistedSelections: [String: Set<String>] = [:]
     @State private var isLoading = true
     @State private var errorMessage: String?
 
@@ -135,8 +139,10 @@ struct MihonSourceSettingsView: View {
     }
 
     private func setSelected(_ selected: Set<String>, for preference: MihonEnginePreference) {
+        // Multi-select edits stay local until dismissal: a selection that is
+        // changed and then reverted before Done must not reach the engine.
         selections[preference.key] = selected
-        update(preference, value: selected.sorted().joined(separator: ","), values: Array(selected))
+        values[preference.key] = selected.sorted().joined(separator: ",")
     }
 
     private func load() async {
@@ -147,22 +153,33 @@ struct MihonSourceSettingsView: View {
             preferences = loaded
             for item in loaded {
                 values[item.key] = item.value
-                if item.kind == .multiSelect { selections[item.key] = Set(item.values) }
+                persistedValues[item.key] = item.value
+                if item.kind == .multiSelect {
+                    selections[item.key] = Set(item.values)
+                    persistedSelections[item.key] = Set(item.values)
+                }
             }
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    private func update(_ preference: MihonEnginePreference, value: String, values newValues: [String]? = nil) {
+    private func update(_ preference: MihonEnginePreference, value: String) {
         values[preference.key] = value
-        let selected = newValues ?? Array(selected(for: preference))
+        guard preference.kind != .multiSelect else { return }
+        persist(preference, value: value)
+    }
+
+    private func persist(_ preference: MihonEnginePreference, value: String) {
+        // Record the value optimistically so a later saveAll() (Done followed
+        // by onDisappear) does not send the same edit twice.
+        persistedValues[preference.key] = value
         Task {
             do {
                 try await runtime.setPreference(
                     key: preference.key,
                     value: value,
-                    values: selected,
+                    values: [],
                     kind: preference.kind,
                     source: source
                 )
@@ -173,34 +190,34 @@ struct MihonSourceSettingsView: View {
     }
 
     private func saveAll() {
-        let snapshot = preferences.filter { !$0.key.isEmpty }
-        let pending = values
-        let selected = selections
+        var edits: [(preference: MihonEnginePreference, value: String, selected: [String])] = []
+        for preference in preferences where !preference.key.isEmpty {
+            if preference.kind == .multiSelect {
+                let current = selections[preference.key] ?? Set(preference.values)
+                let persisted = persistedSelections[preference.key] ?? Set(preference.values)
+                guard current != persisted else { continue }
+                let value = current.sorted().joined(separator: ",")
+                let selected = current.sorted()
+                values[preference.key] = value
+                persistedValues[preference.key] = value
+                persistedSelections[preference.key] = current
+                edits.append((preference, value, selected))
+                continue
+            }
+            guard let value = values[preference.key],
+                  value != (persistedValues[preference.key] ?? preference.value) else { continue }
+            persistedValues[preference.key] = value
+            edits.append((preference, value, []))
+        }
+        guard !edits.isEmpty else { return }
         Task {
-            for preference in snapshot {
-                if preference.kind == .multiSelect {
-                    let values = selected[preference.key] ?? Set(preference.values)
-                    guard values != Set(preference.values) else { continue }
-                    do {
-                        try await runtime.setPreference(
-                            key: preference.key,
-                            value: values.sorted().joined(separator: ","),
-                            values: Array(values),
-                            kind: preference.kind,
-                            source: source
-                        )
-                    } catch {
-                        errorMessage = error.localizedDescription
-                    }
-                    continue
-                }
-                guard let value = pending[preference.key], value != preference.value else { continue }
+            for edit in edits {
                 do {
                     try await runtime.setPreference(
-                        key: preference.key,
-                        value: value,
-                        values: [],
-                        kind: preference.kind,
+                        key: edit.preference.key,
+                        value: edit.value,
+                        values: edit.selected,
+                        kind: edit.preference.kind,
                         source: source
                     )
                 } catch {

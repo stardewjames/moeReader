@@ -4,13 +4,15 @@
 //
 //  java.util collections. Payloads are plain Swift arrays: iteration copies a
 //  snapshot, so a concurrent modification inside extension code cannot corrupt
-//  the interpreter. Maps are small (a few dozen entries) and use Java equality
-//  so Kotlin data-class keys behave exactly as they do on the JVM.
+//  the interpreter. Map key/value/entry sets, Arrays.asList and List.subList
+//  are live views over their backing payload rather than copies. Maps are
+//  small (a few dozen entries) and use Java equality so Kotlin data-class keys
+//  behave exactly as they do on the JVM.
 //
 
 import Foundation
 
-final class VMListPayload {
+class VMListPayload {
     private var storage: [VMValue]
     var owner: VMClientPayload?
     var network = false
@@ -43,7 +45,7 @@ final class VMListPayload {
     }
 }
 
-final class VMSetPayload {
+class VMSetPayload {
     var items: [VMValue]
     var immutable: Bool
     init(_ items: [VMValue] = [], immutable: Bool = false) {
@@ -66,9 +68,16 @@ final class VMListIteratorPayload {
     var index = 0
     var owner: VMListPayload?
     var lastIndex: Int?
-    init(_ snapshot: [VMValue], owner: VMListPayload? = nil) {
+    /// Fixed-size views (Arrays.asList, unmodifiable lists) reject `remove()`.
+    var immutable = false
+    /// Map views iterate keys (or values); `remove()` deletes the backing entry.
+    var mapOwner: VMMapPayload?
+    var mapRemovesKeys = false
+    var mapRemovesEntries = false
+    init(_ snapshot: [VMValue], owner: VMListPayload? = nil, immutable: Bool = false) {
         self.snapshot = snapshot
         self.owner = owner
+        self.immutable = immutable
     }
 }
 
@@ -83,6 +92,128 @@ final class VMEntryPayload {
     }
 }
 
+/// `Arrays.asList` / `List.subList` view over VM array slots. Writes go back
+/// into the array; the size is fixed, exactly like `java.util.Arrays$ArrayList`.
+final class VMArrayViewList: VMListPayload {
+    let array: VMValue
+    let offset: Int
+    let count: Int
+
+    init(array: VMValue, offset: Int, count: Int) {
+        self.array = array
+        self.offset = offset
+        self.count = count
+        super.init()
+    }
+
+    override var items: [VMValue] {
+        get {
+            guard let pointer = array.object, offset >= 0 else { return [] }
+            let length = visibleCount
+            guard length > 0 else { return [] }
+            return (offset..<(offset + length)).map { VMObjectLayout.slot(pointer, $0).pointee }
+        }
+        set {
+            guard let pointer = array.object, offset >= 0 else { return }
+            let end = offset + visibleCount
+            guard offset <= end else { return }
+            for (index, value) in newValue.enumerated() where offset + index < end {
+                VMObjectLayout.slot(pointer, offset + index).pointee = value
+            }
+        }
+    }
+
+    /// Number of visible slots without materialising the array.
+    var visibleCount: Int {
+        guard let pointer = array.object, offset >= 0 else { return 0 }
+        let total = Int(VMObjectLayout.aux(pointer))
+        return max(0, min(offset + count, total) - offset)
+    }
+}
+
+/// Live `List.subList(from, to)` projection. Reads and writes address the
+/// parent payload, so `set` writes through and structural edits made through
+/// the view (add/remove/clear/iterator.remove) update the parent in place.
+final class VMSubListView: VMListPayload {
+    let parent: VMListPayload
+    let offset: Int
+    private(set) var viewCount: Int
+
+    init(parent: VMListPayload, offset: Int, count: Int) {
+        self.parent = parent
+        self.offset = offset
+        self.viewCount = count
+        super.init()
+        self.immutable = parent.immutable
+    }
+
+    override var items: [VMValue] {
+        get {
+            let all = parent.items
+            guard offset >= 0, offset <= all.count else { return [] }
+            let end = min(offset + viewCount, all.count)
+            guard offset <= end else { return [] }
+            return Array(all[offset..<end])
+        }
+        set {
+            var all = parent.items
+            guard offset >= 0, offset <= all.count else { return }
+            let end = min(offset + viewCount, all.count)
+            all.replaceSubrange(offset..<end, with: newValue)
+            parent.items = all
+            viewCount = newValue.count
+        }
+    }
+}
+
+/// Live `Map.keySet()` view. Reads always come from the backing map.
+final class VMKeySetViewPayload: VMSetPayload {
+    let map: VMMapPayload
+
+    init(map: VMMapPayload) {
+        self.map = map
+        super.init()
+        self.immutable = map.immutable
+    }
+
+    override var items: [VMValue] {
+        get { map.entries.map(\.key) }
+        set {
+            var entries = map.entries
+            for (index, key) in newValue.enumerated() where index < entries.count {
+                entries[index].key = key
+            }
+            while entries.count < newValue.count {
+                entries.append((newValue[entries.count], .null))
+            }
+            if newValue.count < entries.count { entries.removeSubrange(newValue.count...) }
+            map.entries = entries
+        }
+    }
+}
+
+/// Live `Map.values()` view. Reads always come from the backing map.
+final class VMValuesViewPayload: VMListPayload {
+    let map: VMMapPayload
+
+    init(map: VMMapPayload) {
+        self.map = map
+        super.init()
+        self.immutable = map.immutable
+    }
+
+    override var items: [VMValue] {
+        get { map.entries.map(\.value) }
+        set {
+            var entries = map.entries
+            for (index, value) in newValue.enumerated() where index < entries.count {
+                entries[index].value = value
+            }
+            map.entries = entries
+        }
+    }
+}
+
 enum JavaUtil {
     static let listClassDescriptor = "Ljava/util/ArrayList;"
     static let mapClassDescriptor = "Ljava/util/LinkedHashMap;"
@@ -94,6 +225,7 @@ enum JavaUtil {
         result += linkedListClasses()
         result += setClasses()
         result += mapClasses()
+        result += collectionViews()
         result += iteratorClasses()
         result += entryClasses()
         result += collectionsClass()
@@ -380,13 +512,18 @@ enum JavaUtil {
             return array
         }
         cls.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
-            let items = runtime.listPayload(args[0])?.items ?? []
+            let list = runtime.listPayload(args[0])
+            let items = list?.items ?? []
             let start = Int(args[1].asInt32)
             let end = Int(args[2].asInt32)
             guard start >= 0, end <= items.count, start <= end else {
                 throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(start)..<\(end), size \(items.count)")
             }
-            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(Array(items[start..<end])))
+            let parent = list ?? VMListPayload()
+            return runtime.makeNative(
+                "Ljava/util/AbstractList$SubList;",
+                payload: VMSubListView(parent: parent, offset: start, count: end - start)
+            )
         }
         cls.method("sort", "(Ljava/util/Comparator;)V") { runtime, args, _ in
             try runtime.sortList(args[0], comparator: args[1])
@@ -610,12 +747,12 @@ enum JavaUtil {
             return .zero
         }
         cls.method("keySet", "()Ljava/util/Set;") { runtime, args, _ in
-            let keys = runtime.mapPayload(args[0])?.entries.map(\.key) ?? []
-            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(keys))
+            let owner = runtime.mapPayload(args[0]) ?? VMMapPayload()
+            return runtime.makeNative("Ljava/util/HashMap$KeySet;", payload: VMKeySetViewPayload(map: owner))
         }
         cls.method("values", "()Ljava/util/Collection;") { runtime, args, _ in
-            let values = runtime.mapPayload(args[0])?.entries.map(\.value) ?? []
-            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+            let owner = runtime.mapPayload(args[0]) ?? VMMapPayload()
+            return runtime.makeNative("Ljava/util/HashMap$Values;", payload: VMValuesViewPayload(map: owner))
         }
         cls.method("entrySet", "()Ljava/util/Set;") { runtime, args, _ in
             let map = runtime.mapPayload(args[0])
@@ -651,6 +788,451 @@ enum JavaUtil {
         }
     }
 
+    // MARK: - Live collection views
+
+    private static func collectionViews() -> [NativeClass] {
+        [arrayViewListClass(), subListViewClass(), keySetViewClass(), valuesViewClass()]
+    }
+
+    private static func objectArray(_ runtime: VMRuntime, _ items: [VMValue]) -> VMValue {
+        let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
+        for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+        return array
+    }
+
+    private static func fillArray(_ runtime: VMRuntime, _ supplied: VMValue, items: [VMValue]) -> VMValue {
+        let capacity = runtime.arrayLength(supplied)
+        if capacity >= items.count {
+            for (index, item) in items.enumerated() { runtime.setArrayElement(supplied, index: index, value: item) }
+            if capacity > items.count { runtime.setArrayElement(supplied, index: items.count, value: .null) }
+            return supplied
+        }
+        let component = runtime.classOf(supplied)?.arrayComponent ?? "Ljava/lang/Object;"
+        let array = runtime.newArray(component: component, count: items.count)
+        for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+        return array
+    }
+
+    private static func viewString(_ runtime: VMRuntime, _ items: [VMValue]) -> VMValue {
+        let parts = items.map { runtime.stringValue(runtime.javaToString($0)) ?? "null" }
+        return runtime.newString("[" + parts.joined(separator: ", ") + "]")
+    }
+
+    private static func viewItems(_ runtime: VMRuntime, _ value: VMValue) throws -> [VMValue] {
+        if let view: VMSubListView = runtime.payload(value, as: VMSubListView.self) {
+            try validateSubList(view)
+            return view.items
+        }
+        return runtime.listPayload(value)?.items ?? []
+    }
+
+    private static func viewCount(_ runtime: VMRuntime, _ value: VMValue) throws -> Int {
+        if let view: VMSubListView = runtime.payload(value, as: VMSubListView.self) {
+            try validateSubList(view)
+            return view.viewCount
+        }
+        if let view: VMArrayViewList = runtime.payload(value, as: VMArrayViewList.self) {
+            return view.visibleCount
+        }
+        return runtime.listPayload(value)?.items.count ?? 0
+    }
+
+    private static func viewElement(_ runtime: VMRuntime, _ value: VMValue, at index: Int) throws -> VMValue {
+        if let view: VMArrayViewList = runtime.payload(value, as: VMArrayViewList.self) {
+            return runtime.arrayElement(view.array, view.offset + index)
+        }
+        if let view: VMSubListView = runtime.payload(value, as: VMSubListView.self) {
+            return view.parent.items[view.offset + index]
+        }
+        return try viewItems(runtime, value)[index]
+    }
+
+    private static func validateSubList(_ view: VMSubListView) throws {
+        let available = view.parent.items.count
+        guard view.offset >= 0, view.viewCount >= 0, view.offset + view.viewCount <= available else {
+            throw VMJavaException("Ljava/util/ConcurrentModificationException;")
+        }
+    }
+
+    private static func subListView(_ runtime: VMRuntime, _ value: VMValue) throws -> VMSubListView {
+        guard let view: VMSubListView = runtime.payload(value, as: VMSubListView.self) else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "not a subList view")
+        }
+        try validateSubList(view)
+        return view
+    }
+
+    /// Writable view backing a list method: array-backed lists accept writes but
+    /// not resizes, subList views forward structural edits to their parent.
+    private static func mutableViewList(_ runtime: VMRuntime, _ value: VMValue) throws -> VMListPayload {
+        if let view: VMSubListView = runtime.payload(value, as: VMSubListView.self) {
+            try validateSubList(view)
+            if view.immutable || view.parent.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+            return view
+        }
+        guard let view: VMArrayViewList = runtime.payload(value, as: VMArrayViewList.self) else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "not a collection view")
+        }
+        if view.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+        return view
+    }
+
+    private static func keySetView(_ runtime: VMRuntime, _ value: VMValue) throws -> VMKeySetViewPayload {
+        guard let view: VMKeySetViewPayload = runtime.payload(value, as: VMKeySetViewPayload.self) else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "not a key set view")
+        }
+        return view
+    }
+
+    private static func valuesView(_ runtime: VMRuntime, _ value: VMValue) throws -> VMValuesViewPayload {
+        guard let view: VMValuesViewPayload = runtime.payload(value, as: VMValuesViewPayload.self) else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "not a values view")
+        }
+        return view
+    }
+
+    private static func mutableMapOwner(_ map: VMMapPayload) throws -> VMMapPayload {
+        if map.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+        return map
+    }
+
+    /// Reads shared by the fixed-size array-backed list and the live subList.
+    private static func viewListReadMethods(_ cls: NativeClass) {
+        cls.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(try viewCount(runtime, args[0])))
+        }
+        cls.method("isEmpty", "()Z") { runtime, args, _ in
+            let count = try viewCount(runtime, args[0])
+            return .boolean(count == 0)
+        }
+        cls.method("get", "(I)Ljava/lang/Object;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            let count = try viewCount(runtime, args[0])
+            guard index >= 0, index < count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(count)")
+            }
+            return try viewElement(runtime, args[0], at: index)
+        }
+        cls.method("set", "(ILjava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            let count = try viewCount(runtime, args[0])
+            guard index >= 0, index < count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(count)")
+            }
+            if let arrayView: VMArrayViewList = runtime.payload(args[0], as: VMArrayViewList.self) {
+                let previous = runtime.arrayElement(arrayView.array, arrayView.offset + index)
+                runtime.setArrayElement(arrayView.array, index: arrayView.offset + index, value: args[2])
+                return previous
+            }
+            var items = try viewItems(runtime, args[0])
+            let previous = items[index]
+            items[index] = args[2]
+            view.items = items
+            return previous
+        }
+        cls.method("indexOf", "(Ljava/lang/Object;)I") { runtime, args, _ in
+            let items = try viewItems(runtime, args[0])
+            let found = items.firstIndex { runtime.javaEquals($0, args[1]) }
+            return .int32(found.map { Int32($0) } ?? -1)
+        }
+        cls.method("lastIndexOf", "(Ljava/lang/Object;)I") { runtime, args, _ in
+            let items = try viewItems(runtime, args[0])
+            let found = items.lastIndex { runtime.javaEquals($0, args[1]) }
+            return .int32(found.map { Int32($0) } ?? -1)
+        }
+        cls.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let items = try viewItems(runtime, args[0])
+            return .boolean(items.contains { runtime.javaEquals($0, args[1]) })
+        }
+        cls.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
+            objectArray(runtime, try viewItems(runtime, args[0]))
+        }
+        cls.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            fillArray(runtime, args[1], items: try viewItems(runtime, args[0]))
+        }
+        cls.method("sort", "(Ljava/util/Comparator;)V") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            let items = try viewItems(runtime, args[0])
+            let temp = runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+            try runtime.sortList(temp, comparator: args[1])
+            view.items = runtime.listPayload(temp)?.items ?? items
+            return .zero
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            viewString(runtime, try viewItems(runtime, args[0]))
+        }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let items = try viewItems(runtime, args[0])
+            guard let other = runtime.listItems(args[1]), other.count == items.count else { return .boolean(false) }
+            for (index, item) in items.enumerated() where !runtime.javaEquals(item, other[index]) {
+                return .boolean(false)
+            }
+            return .boolean(true)
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in
+            let items = try viewItems(runtime, args[0])
+            var hash: Int32 = 1
+            for item in items { hash = 31 &* hash &+ runtime.javaHashCode(item) }
+            return .int32(hash)
+        }
+    }
+
+    private static func arrayViewListClass() -> NativeClass {
+        let cls = NativeClass(
+            "Ljava/util/Arrays$ArrayList;",
+            superclass: "Ljava/util/AbstractList;",
+            interfaces: ["Ljava/util/List;"]
+        )
+        viewListReadMethods(cls)
+        for (name, signature) in [
+            ("add", "(Ljava/lang/Object;)Z"),
+            ("add", "(ILjava/lang/Object;)V"),
+            ("addAll", "(Ljava/util/Collection;)Z"),
+            ("remove", "(I)Ljava/lang/Object;"),
+            ("remove", "(Ljava/lang/Object;)Z"),
+            ("clear", "()V"),
+        ] {
+            cls.method(name, signature) { _, _, _ in
+                throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "Arrays.asList is fixed-size")
+            }
+        }
+        cls.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(try viewItems(runtime, args[0]), immutable: true))
+        }
+        cls.method("listIterator", "()Ljava/util/ListIterator;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(try viewItems(runtime, args[0]), immutable: true))
+        }
+        cls.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
+            guard let view: VMArrayViewList = runtime.payload(args[0], as: VMArrayViewList.self) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "not an array-backed list")
+            }
+            let items = view.items
+            let start = Int(args[1].asInt32)
+            let end = Int(args[2].asInt32)
+            guard start >= 0, end <= items.count, start <= end else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(start)..<\(end), size \(items.count)")
+            }
+            return runtime.makeNative(
+                "Ljava/util/Arrays$ArrayList;",
+                payload: VMArrayViewList(array: view.array, offset: view.offset + start, count: end - start)
+            )
+        }
+        return cls
+    }
+
+    private static func subListViewClass() -> NativeClass {
+        let cls = NativeClass(
+            "Ljava/util/AbstractList$SubList;",
+            superclass: "Ljava/util/AbstractList;",
+            interfaces: ["Ljava/util/List;"]
+        )
+        viewListReadMethods(cls)
+        cls.method("add", "(ILjava/lang/Object;)V") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            var items = try viewItems(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index <= items.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(items.count)")
+            }
+            items.insert(args[2], at: index)
+            view.items = items
+            return .zero
+        }
+        cls.method("add", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            view.items = try viewItems(runtime, args[0]) + [args[1]]
+            return .boolean(true)
+        }
+        cls.method("addAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            let incoming = runtime.listItems(args[1]) ?? []
+            guard !incoming.isEmpty else { return .boolean(false) }
+            let view = try mutableViewList(runtime, args[0])
+            view.items = try viewItems(runtime, args[0]) + incoming
+            return .boolean(true)
+        }
+        cls.method("remove", "(I)Ljava/lang/Object;") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            var items = try viewItems(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < items.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(items.count)")
+            }
+            let removed = items.remove(at: index)
+            view.items = items
+            return removed
+        }
+        cls.method("remove", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            var items = try viewItems(runtime, args[0])
+            guard let index = items.firstIndex(where: { runtime.javaEquals($0, args[1]) }) else {
+                return .boolean(false)
+            }
+            items.remove(at: index)
+            view.items = items
+            return .boolean(true)
+        }
+        cls.method("clear", "()V") { runtime, args, _ in
+            let view = try mutableViewList(runtime, args[0])
+            view.items = []
+            return .zero
+        }
+        cls.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            let view = try subListView(runtime, args[0])
+            let iterator = VMListIteratorPayload(view.items, owner: view)
+            iterator.immutable = view.immutable || view.parent.immutable
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
+        cls.method("listIterator", "()Ljava/util/ListIterator;") { runtime, args, _ in
+            let view = try subListView(runtime, args[0])
+            let iterator = VMListIteratorPayload(view.items, owner: view)
+            iterator.immutable = view.immutable || view.parent.immutable
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
+        cls.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
+            let view = try subListView(runtime, args[0])
+            let items = view.items
+            let start = Int(args[1].asInt32)
+            let end = Int(args[2].asInt32)
+            guard start >= 0, end <= items.count, start <= end else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(start)..<\(end), size \(items.count)")
+            }
+            return runtime.makeNative(
+                "Ljava/util/AbstractList$SubList;",
+                payload: VMSubListView(parent: view, offset: start, count: end - start)
+            )
+        }
+        return cls
+    }
+
+    private static func keySetViewClass() -> NativeClass {
+        let cls = NativeClass(
+            "Ljava/util/HashMap$KeySet;",
+            superclass: "Ljava/util/AbstractSet;",
+            interfaces: ["Ljava/util/Set;"]
+        )
+        cls.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(try keySetView(runtime, args[0]).map.entries.count))
+        }
+        cls.method("isEmpty", "()Z") { runtime, args, _ in
+            let view = try keySetView(runtime, args[0])
+            return .boolean(view.map.entries.isEmpty)
+        }
+        cls.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let view = try keySetView(runtime, args[0])
+            return .boolean(view.map.entries.contains { runtime.javaEquals($0.key, args[1]) })
+        }
+        cls.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            let view = try keySetView(runtime, args[0])
+            let iterator = VMListIteratorPayload(view.items)
+            iterator.mapOwner = view.map
+            iterator.mapRemovesKeys = true
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
+        cls.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
+            objectArray(runtime, try keySetView(runtime, args[0]).items)
+        }
+        cls.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            fillArray(runtime, args[1], items: try keySetView(runtime, args[0]).items)
+        }
+        for (name, signature) in [
+            ("add", "(Ljava/lang/Object;)Z"),
+            ("addAll", "(Ljava/util/Collection;)Z"),
+        ] {
+            cls.method(name, signature) { _, _, _ in
+                throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "keySet is backed by the map")
+            }
+        }
+        cls.method("remove", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let view = try keySetView(runtime, args[0])
+            let map = try mutableMapOwner(view.map)
+            guard let index = map.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else {
+                return .boolean(false)
+            }
+            map.entries.remove(at: index)
+            return .boolean(true)
+        }
+        cls.method("clear", "()V") { runtime, args, _ in
+            let view = try keySetView(runtime, args[0])
+            try mutableMapOwner(view.map).entries.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            viewString(runtime, try keySetView(runtime, args[0]).items)
+        }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let items = try keySetView(runtime, args[0]).items
+            guard let other = runtime.listItems(args[1]), other.count == items.count else { return .boolean(false) }
+            for item in other where !items.contains(where: { runtime.javaEquals($0, item) }) { return .boolean(false) }
+            return .boolean(true)
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in
+            let keys = try keySetView(runtime, args[0]).items
+            var hash: Int32 = 0
+            for key in keys { hash = hash &+ runtime.javaHashCode(key) }
+            return .int32(hash)
+        }
+        return cls
+    }
+
+    private static func valuesViewClass() -> NativeClass {
+        let cls = NativeClass(
+            "Ljava/util/HashMap$Values;",
+            superclass: "Ljava/util/AbstractCollection;",
+            interfaces: ["Ljava/util/Collection;"]
+        )
+        cls.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(try valuesView(runtime, args[0]).map.entries.count))
+        }
+        cls.method("isEmpty", "()Z") { runtime, args, _ in
+            let view = try valuesView(runtime, args[0])
+            return .boolean(view.map.entries.isEmpty)
+        }
+        cls.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let view = try valuesView(runtime, args[0])
+            return .boolean(view.map.entries.contains { runtime.javaEquals($0.value, args[1]) })
+        }
+        cls.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            let view = try valuesView(runtime, args[0])
+            let iterator = VMListIteratorPayload(view.items)
+            iterator.mapOwner = view.map
+            iterator.mapRemovesKeys = false
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
+        cls.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
+            objectArray(runtime, try valuesView(runtime, args[0]).items)
+        }
+        cls.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            fillArray(runtime, args[1], items: try valuesView(runtime, args[0]).items)
+        }
+        for (name, signature) in [
+            ("add", "(Ljava/lang/Object;)Z"),
+            ("addAll", "(Ljava/util/Collection;)Z"),
+        ] {
+            cls.method(name, signature) { _, _, _ in
+                throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "values is backed by the map")
+            }
+        }
+        cls.method("remove", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let view = try valuesView(runtime, args[0])
+            let map = try mutableMapOwner(view.map)
+            guard let index = map.entries.firstIndex(where: { runtime.javaEquals($0.value, args[1]) }) else {
+                return .boolean(false)
+            }
+            map.entries.remove(at: index)
+            return .boolean(true)
+        }
+        cls.method("clear", "()V") { runtime, args, _ in
+            let view = try valuesView(runtime, args[0])
+            try mutableMapOwner(view.map).entries.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            viewString(runtime, try valuesView(runtime, args[0]).items)
+        }
+        return cls
+    }
+
     // MARK: - Iterators and entries
 
     private static func iteratorClasses() -> [NativeClass] {
@@ -678,14 +1260,35 @@ enum JavaUtil {
             return iterator.snapshot[iterator.index]
         }
         cls.method("remove", "()V") { runtime, args, _ in
-            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self),
-                  let last = iterator.lastIndex,
-                  let owner = iterator.owner else { return .zero }
-            if last >= 0, last < owner.items.count {
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .zero }
+            defer { iterator.lastIndex = nil }
+            if iterator.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+            guard let last = iterator.lastIndex, last >= 0, last < iterator.snapshot.count else { return .zero }
+            if let mapOwner = iterator.mapOwner {
+                if mapOwner.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+                let probe = iterator.snapshot[last]
+                let index: Int?
+                if iterator.mapRemovesKeys {
+                    index = mapOwner.entries.firstIndex { runtime.javaEquals($0.key, probe) }
+                } else if iterator.mapRemovesEntries,
+                          let entry: VMEntryPayload = runtime.payload(probe, as: VMEntryPayload.self) {
+                    index = mapOwner.entries.firstIndex {
+                        runtime.javaEquals($0.key, entry.key) && runtime.javaEquals($0.value, entry.value)
+                    }
+                } else {
+                    index = mapOwner.entries.firstIndex { runtime.javaEquals($0.value, probe) }
+                }
+                if let index {
+                    mapOwner.entries.remove(at: index)
+                    iterator.index = max(0, iterator.index - 1)
+                }
+                return .zero
+            }
+            guard let owner = iterator.owner else { return .zero }
+            if last < owner.items.count {
                 owner.items.remove(at: last)
                 iterator.index = max(0, iterator.index - 1)
             }
-            iterator.lastIndex = nil
             return .zero
         }
         cls.method("forEachRemaining", "(Ljava/util/function/Consumer;)V") { runtime, args, _ in
@@ -708,7 +1311,10 @@ enum JavaUtil {
                     payload: VMEntryPayload(key: entry.key, value: entry.value, owner: set.owner)
                 )
             }
-            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(entries))
+            let iterator = VMListIteratorPayload(entries)
+            iterator.mapOwner = set.owner
+            iterator.mapRemovesEntries = true
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
         }
         entrySet.method("size", "()I") { runtime, args, _ in
             let set: VMEntrySetPayload? = runtime.payload(args[0], as: VMEntrySetPayload.self)
@@ -718,11 +1324,75 @@ enum JavaUtil {
             let set: VMEntrySetPayload? = runtime.payload(args[0], as: VMEntrySetPayload.self)
             return .boolean((set?.entries.count ?? 0) == 0)
         }
+        entrySet.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let set: VMEntrySetPayload = runtime.payload(args[0], as: VMEntrySetPayload.self),
+                  let candidate: VMEntryPayload = runtime.payload(args[1], as: VMEntryPayload.self) else {
+                return .boolean(false)
+            }
+            return .boolean(set.entries.contains {
+                runtime.javaEquals($0.key, candidate.key) && runtime.javaEquals($0.value, candidate.value)
+            })
+        }
+        entrySet.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
+            let set: VMEntrySetPayload? = runtime.payload(args[0], as: VMEntrySetPayload.self)
+            let entries = set?.entries ?? []
+            let array = runtime.newArray(component: "Ljava/lang/Object;", count: entries.count)
+            for (index, entry) in entries.enumerated() {
+                runtime.setArrayElement(
+                    array,
+                    index: index,
+                    value: runtime.makeNative(
+                        "Ljava/util/MapEntry;",
+                        payload: VMEntryPayload(key: entry.key, value: entry.value, owner: set?.owner)
+                    )
+                )
+            }
+            return array
+        }
+        entrySet.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            let set: VMEntrySetPayload? = runtime.payload(args[0], as: VMEntrySetPayload.self)
+            let entries = set?.entries ?? []
+            let capacity = runtime.arrayLength(args[1])
+            let destination: VMValue
+            if capacity >= entries.count {
+                destination = args[1]
+            } else {
+                destination = runtime.newArray(component: "Ljava/lang/Object;", count: entries.count)
+            }
+            for (index, entry) in entries.enumerated() {
+                runtime.setArrayElement(
+                    destination,
+                    index: index,
+                    value: runtime.makeNative(
+                        "Ljava/util/MapEntry;",
+                        payload: VMEntryPayload(key: entry.key, value: entry.value, owner: set?.owner)
+                    )
+                )
+            }
+            if capacity > entries.count { runtime.setArrayElement(destination, index: entries.count, value: .null) }
+            return destination
+        }
+        entrySet.method("remove", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let set: VMEntrySetPayload = runtime.payload(args[0], as: VMEntrySetPayload.self),
+                  let owner = set.owner,
+                  let candidate: VMEntryPayload = runtime.payload(args[1], as: VMEntryPayload.self) else {
+                return .boolean(false)
+            }
+            if owner.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+            guard let index = owner.entries.firstIndex(where: {
+                runtime.javaEquals($0.key, candidate.key) && runtime.javaEquals($0.value, candidate.value)
+            }) else { return .boolean(false) }
+            owner.entries.remove(at: index)
+            return .boolean(true)
+        }
         entrySet.method("forEach", "(Ljava/util/function/Consumer;)V") { runtime, args, _ in
             guard let set: VMEntrySetPayload = runtime.payload(args[0], as: VMEntrySetPayload.self),
                   let method = runtime.classOf(args[1])?.lookupVirtual(key: "accept(Ljava/lang/Object;)V") else { return .zero }
             for entry in set.entries {
-                let pair = runtime.makeNative("Ljava/util/MapEntry;", payload: VMEntryPayload(key: entry.key, value: entry.value))
+                let pair = runtime.makeNative(
+                    "Ljava/util/MapEntry;",
+                    payload: VMEntryPayload(key: entry.key, value: entry.value, owner: set.owner)
+                )
                 _ = try runtime.invoke(method, [args[1], pair])
             }
             return .zero
@@ -842,10 +1512,10 @@ enum JavaUtil {
         let cls = NativeClass("Ljava/util/Arrays;")
         cls.staticMethod("asList", "([Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
             let count = runtime.arrayLength(args[0])
-            var items: [VMValue] = []
-            items.reserveCapacity(count)
-            for index in 0..<count { items.append(runtime.arrayElement(args[0], index)) }
-            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+            return runtime.makeNative(
+                "Ljava/util/Arrays$ArrayList;",
+                payload: VMArrayViewList(array: args[0], offset: 0, count: count)
+            )
         }
         cls.staticMethod("toString", "([Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             runtime.arrayToString(args[0])
@@ -1137,10 +1807,17 @@ final class VMStringJoinerPayload {
 }
 
 final class VMEntrySetPayload {
-    let entries: [(key: VMValue, value: VMValue)]
+    private let snapshot: [(key: VMValue, value: VMValue)]
     var owner: VMMapPayload?
+
+    /// Live when a map owner is present; detached snapshots keep working for
+    /// JSON trees and other synthetic entry sets.
+    var entries: [(key: VMValue, value: VMValue)] {
+        owner?.entries ?? snapshot
+    }
+
     init(entries: [(key: VMValue, value: VMValue)], owner: VMMapPayload? = nil) {
-        self.entries = entries
+        self.snapshot = entries
         self.owner = owner
     }
 }

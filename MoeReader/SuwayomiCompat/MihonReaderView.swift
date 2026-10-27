@@ -13,6 +13,7 @@ struct MihonReaderView: View {
     @State private var isLoading = true
     @State private var errorMessage: String?
     @State private var didLoad = false
+    @State private var didRestoreProgress = false
 
     private var progressKey: String {
         "MihonCompat.Progress.\(packageName).\(source.identity).\(chapter.id)"
@@ -120,8 +121,11 @@ struct MihonReaderView: View {
             guard !pages.isEmpty else {
                 throw MihonError.malformedResponse("No pages in this chapter.")
             }
-            let saved = UserDefaults.standard.integer(forKey: progressKey)
-            pageIndex = min(max(saved, 0), pages.count - 1)
+            if !didRestoreProgress {
+                didRestoreProgress = true
+                let saved = UserDefaults.standard.integer(forKey: progressKey)
+                pageIndex = min(max(saved, 0), pages.count - 1)
+            }
             prefetchAroundCurrentPage()
         } catch is CancellationError {
             return

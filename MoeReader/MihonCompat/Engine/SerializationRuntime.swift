@@ -2,11 +2,13 @@
 //  SerializationRuntime.swift
 //  MihonCompat
 //
-//  kotlinx.serialization decode path. Extension serializers are generated
-//  classes in the dex: they build descriptors, ask a JsonDecoder for fields and
-//  construct their data classes. This file supplies those descriptors, builtins
-//  and a native JSON parser/decoder. Encoding is intentionally not implemented
-//  yet and fails with a typed error.
+//  kotlinx.serialization JSON path. Extension serializers are generated classes
+//  in the dex: they build descriptors, ask a JsonDecoder for fields and construct
+//  their data classes. This file supplies those descriptors, builtins, a native
+//  JSON parser/decoder, and the matching encoder (`mihoncompat/JsonEncoder`).
+//  Encoding is reachable through `Json.encodeToString`, `Json.encodeToJsonElement`
+//  and `OkioStreamsKt.encodeToBufferedSink`; unsupported shapes fail with a typed
+//  `SerializationException` instead of producing partial output.
 //
 
 import Foundation
@@ -1020,8 +1022,12 @@ struct SerializationRuntime {
             let tree = try VMJsonParser.parse(runtime.stringValue(args[1]) ?? "")
             return runtime.jsonElementValue(tree)
         }
-        json.method("getSerializersModule", "()Lkotlinx/serialization/modules/SerializersModule;") { runtime, _, _ in
-            runtime.makeNative("Lkotlinx/serialization/modules/SerializersModule;", payload: NSNull())
+        json.method("getSerializersModule", "()Lkotlinx/serialization/modules/SerializersModule;") { runtime, args, _ in
+            let config = runtime.payload(args[0], as: VMJsonConfigPayload.self)
+            return runtime.makeNative(
+                "Lkotlinx/serialization/modules/SerializersModule;",
+                payload: config?.module ?? VMSerializersModulePayload()
+            )
         }
         json.method("encodeToString", "(Lkotlinx/serialization/SerializationStrategy;Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             let root = runtime.makeNative("Lmihoncompat/JsonEncoder;", payload: VMJsonEncoderPayload())
@@ -1089,12 +1095,16 @@ struct SerializationRuntime {
                 throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid serializer")
             }
             _ = try runtime.invoke(method, [args[1], root, args[2]])
-            guard let payload: VMJsonEncoderPayload = runtime.payload(root, as: VMJsonEncoderPayload.self) else { return .zero }
+            guard let payload: VMJsonEncoderPayload = runtime.payload(root, as: VMJsonEncoderPayload.self) else {
+                throw VMJavaException(SerializationRuntime.serializationException, "serializer produced no value")
+            }
             let text = SerializationRuntime.jsonText(payload.result())
             if let sink: VMOkioBufferedSinkPayload = runtime.payload(args[3], as: VMOkioBufferedSinkPayload.self) {
                 sink.sink.data.append(Data(text.utf8))
             } else if let sink: VMOkioSinkPayload = runtime.payload(args[3], as: VMOkioSinkPayload.self) {
                 sink.data.append(Data(text.utf8))
+            } else {
+                throw VMJavaException("Ljava/io/IOException;", "missing buffered sink")
             }
             return .zero
         }
@@ -1114,12 +1124,12 @@ struct SerializationRuntime {
             if let module: VMSerializersModulePayload = runtime.payload(args[1], as: VMSerializersModulePayload.self) { config.module = module }
             return .zero
         }
-        for setter in ["setIgnoreUnknownKeys", "setIsLenient", "setLenient", "setAllowSpecialFloatingPointValues", "setEncodeDefaults", "setCoerceInputValues", "setAllowTrailingComma", "setExplicitNulls", "setUseAlternativeNames", "setPrettyPrint", "setSerializersModule"] {
-            if setter == "setSerializersModule" {
-                builder.method(setter, "(Lkotlinx/serialization/modules/SerializersModule;)V") { _, _, _ in .zero }
-            } else {
-                builder.method(setter, "(Z)V") { _, _, _ in .zero }
-            }
+        // Unknown decoding is tolerated by the decoder (it only walks descriptor
+        // elements), so these flags are accepted for API compatibility. Only
+        // `setSerializersModule` carries state and is registered above; registering
+        // it here as a no-op would overwrite the working implementation.
+        for setter in ["setIgnoreUnknownKeys", "setIsLenient", "setLenient", "setAllowSpecialFloatingPointValues", "setEncodeDefaults", "setCoerceInputValues", "setAllowTrailingComma", "setExplicitNulls", "setUseAlternativeNames", "setPrettyPrint"] {
+            builder.method(setter, "(Z)V") { _, _, _ in .zero }
         }
         result.append(builder)
 
@@ -1251,7 +1261,9 @@ struct SerializationRuntime {
         }
         encoder.method("encodeSerializableValue", "(Lkotlinx/serialization/SerializationStrategy;Ljava/lang/Object;)V") { runtime, args, _ in
             guard let cls = runtime.classOf(args[1]),
-                  let method = cls.lookupVirtual(key: "serialize(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") else { return .zero }
+                  let method = cls.lookupVirtual(key: "serialize(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") else {
+                throw VMJavaException(SerializationRuntime.serializationException, "invalid serializer")
+            }
             _ = try runtime.invoke(method, [args[1], args[0], args[2]])
             return .zero
         }
@@ -1294,7 +1306,12 @@ struct SerializationRuntime {
         polySerializer.method("<init>", "(Lkotlin/reflect/KClass;)V") { _, _, _ in .zero }
         polySerializer.method("<init>", "(Lkotlin/reflect/KClass;[Ljava/lang/annotation/Annotation;)V") { _, _, _ in .zero }
         polySerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
-        polySerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { _, _, _ in .zero }
+        polySerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { _, _, _ in
+            // The generated extension serializers never encode polymorphic values,
+            // and this encoder has no serializers-module state to resolve the
+            // concrete serializer. Fail loudly instead of writing `{}`.
+            throw VMJavaException(SerializationRuntime.serializationException, "polymorphic serialization is unsupported")
+        }
         polySerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
             guard let payload: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self),
                   case .object(let fields) = payload.tree.kind else {

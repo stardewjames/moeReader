@@ -13,6 +13,26 @@ final class VMPropertiesPayload {
     init(values: [String: String] = [:]) { self.values = values }
 }
 
+/// `java.io.Reader` state over an in-memory byte buffer. Reading advances the
+/// offset, so repeated `read()` calls walk the whole payload.
+final class VMReaderPayload {
+    let data: Data
+    var offset = 0
+    init(data: Data) { self.data = data }
+
+    var remaining: Data {
+        guard offset < data.count else { return Data() }
+        return Data(data.dropFirst(offset))
+    }
+
+    func readByte() -> Int32 {
+        guard offset < data.count else { return -1 }
+        let byte = data[data.startIndex + offset]
+        offset += 1
+        return Int32(byte)
+    }
+}
+
 enum I18nRuntime {
     static func classes() -> [NativeClass] {
         var result: [NativeClass] = []
@@ -52,48 +72,73 @@ enum I18nRuntime {
             return .zero
         }
         propertyBundle.method("<init>", "(Ljava/io/Reader;)V") { runtime, args, _ in
-            let data: Data = runtime.payload(args[1], as: Data.self) ?? Data()
+            let data: Data
+            if let reader: VMReaderPayload = runtime.payload(args[1], as: VMReaderPayload.self) {
+                data = reader.remaining
+            } else {
+                data = runtime.payload(args[1], as: Data.self) ?? Data()
+            }
             runtime.setPayload(args[0], VMPropertiesPayload(values: parse(data)))
             return .zero
         }
         result.append(propertyBundle)
-        result.append(NativeClass("Ljava/util/MissingResourceException;", superclass: "Ljava/lang/RuntimeException;"))
         result.append(NativeClass("Ljava/io/Reader;", superclass: "Ljava/lang/Object;"))
         let inputStreamReader = NativeClass("Ljava/io/InputStreamReader;", superclass: "Ljava/io/Reader;")
         inputStreamReader.method("<init>", "(Ljava/io/InputStream;)V") { runtime, args, _ in
             let data: Data = runtime.payload(args[1], as: Data.self) ?? Data()
-            runtime.setPayload(args[0], data)
+            runtime.setPayload(args[0], VMReaderPayload(data: data))
             return .zero
         }
         inputStreamReader.method("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V") { runtime, args, _ in
             let data: Data = runtime.payload(args[1], as: Data.self) ?? Data()
-            runtime.setPayload(args[0], data)
+            runtime.setPayload(args[0], VMReaderPayload(data: data))
             return .zero
         }
         inputStreamReader.method("<init>", "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V") { runtime, args, _ in
             let data: Data = runtime.payload(args[1], as: Data.self) ?? Data()
-            runtime.setPayload(args[0], data)
+            runtime.setPayload(args[0], VMReaderPayload(data: data))
             return .zero
         }
-        inputStreamReader.method("read", "()I") { _, _, _ in .int32(-1) }
+        inputStreamReader.method("read", "()I") { runtime, args, _ in
+            let reader: VMReaderPayload = try runtime.payloadBox(args[0])
+            return .int32(reader.readByte())
+        }
         inputStreamReader.method("close", "()V") { _, _, _ in .zero }
         result.append(inputStreamReader)
         return result
     }
 
+    /// `java.util.Properties` line syntax: `#`/`!` comments, `=`, `:` or
+    /// whitespace as the key/value separator, and both CRLF and lone CR as
+    /// line terminators.
     static func parse(_ data: Data) -> [String: String] {
         let text = String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
         var values: [String: String] = [:]
-        for rawLine in text.split(whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") || line.hasPrefix("!") { continue }
-            if let separator = line.firstIndex(where: { $0 == "=" || $0 == ":" }) {
-                let key = String(line[..<separator]).trimmingCharacters(in: .whitespaces)
-                let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
-                values[key] = value
-            } else {
-                values[line] = ""
+            var key = ""
+            var index = line.startIndex
+            while index < line.endIndex {
+                let character = line[index]
+                if character == "=" || character == ":" || character.isWhitespace { break }
+                key.append(character)
+                index = line.index(after: index)
             }
+            var valueStart = index
+            while valueStart < line.endIndex, line[valueStart].isWhitespace {
+                valueStart = line.index(after: valueStart)
+            }
+            if valueStart < line.endIndex, line[valueStart] == "=" || line[valueStart] == ":" {
+                valueStart = line.index(after: valueStart)
+                while valueStart < line.endIndex, line[valueStart].isWhitespace {
+                    valueStart = line.index(after: valueStart)
+                }
+            }
+            let value = String(line[valueStart...]).trimmingCharacters(in: .whitespaces)
+            values[key] = value
         }
         return values
     }
@@ -111,6 +156,9 @@ extension VMRuntime {
                 return makeNative("Ljava/util/PropertyResourceBundle;", payload: VMPropertiesPayload(values: I18nRuntime.parse(data)))
             }
         }
-        return makeNative("Ljava/util/PropertyResourceBundle;", payload: VMPropertiesPayload())
+        throw VMJavaException(
+            "Ljava/util/MissingResourceException;",
+            "Can't find bundle for base name \(baseName), locale \(language)"
+        )
     }
 }

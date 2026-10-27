@@ -79,9 +79,11 @@ currently implemented surface covers request/parse-style lib-1.4/1.5 sources
 and the suspend lib-1.6 API in practice:
 
 - **Java**: `java.lang` core (UTF-16 strings, boxed values, Math, System),
-  `java.util` collections, `java.io` byte streams and `File` (metadata, mkdir,
-  rename, temp files, listing), `java.time` parsing and formatting,
-  `java.lang.reflect.Field`, atomics, `ConcurrentHashMap`, `ReentrantLock`.
+  `java.util` collections with live map/list views and backed `Arrays.asList`,
+  `java.io` byte streams and `File` (metadata, mkdir, rename, temp files,
+  listing), `java.time` parsing/formatting with zoned/offset/instant support,
+  `java.lang.reflect.Field`/`Method` names, atomics and stateful locks,
+  `ConcurrentHashMap`, `ReentrantLock`.
 - **Kotlin**: `Intrinsics`, `Unit`, `Pair`/`Triple`, `Result` (including
   `getOrNull`/`getOrThrow`/unboxing), `Lazy`, collection/text/ranges helpers,
   `Regex` with iterable `MatchResult` and `IntRange` groups, sequences,
@@ -126,15 +128,27 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   parsing failures, boxed boolean identity, list bounds/typed `toArray`,
   `Map.Entry.setValue`, regex `next`/group ranges, and okio byte-count/buffer
   semantics.
-- `MihonEngineArrayTests` runs a generated DEX fixture through the interpreter:
-  byte/char/short/boolean array widening and truncation, `filled-new-array`,
-  and sign-extended `const-wide/high16`.
+- `MihonEngineArrayTests` runs directly constructed `DexCode` items through the
+  interpreter: byte/char/short/boolean array widening and truncation,
+  `filled-new-array`, and sign-extended `const-wide/high16`.
 - `MihonEngineLifecycleTests` verifies that installing a different APK creates
   a fresh runtime instead of reusing the removed package.
 - `MihonAPIContractTests` covers the deprecated `HttpSource` request/parse
   defaults, `ParsedHttpSource` selector parsers, legacy `imageUrlParse`
   resolution, filter tree rehydration, string-set preferences, `java.io.File`
   with okio, JSON element conversion, and the `HttpSourceKt`/companion helpers.
+- `MihonCollectionSemanticsTests` covers live map key/value/entry views,
+  array-backed `Arrays.asList`, live sublists and fixed-size mutation errors.
+- `MihonTimeSemanticsTests` covers formatter widths/names/offsets, zoned and
+  instant formatting, epoch parsing and system default zones.
+- `MihonKotlinReflectionTests` covers Java whitespace, static field reflection,
+  method names, null field targets, lazy modes, array bounds, resource bundles
+  and property parsing.
+- `MihonAPIRemainingTests` covers immutable `FilterList` behavior and model copy
+  helpers.
+- `MihonSecurityBoundsTests` covers ZIP/ZIP64 truncation and overflow, DEX
+  class-data validation, store rollback and shared-APK cleanup.
+- `MihonFilterStateTests` covers per-source filter persistence and reset.
 - `scripts/analyze_compat.py` audits an APK's host API references against the
   engine registry. See "Auditing the native surface" below.
 - An opt-in extension test runs a real lib-1.6 extension through the whole
@@ -247,9 +261,12 @@ per source operation.
 - Extension file paths resolve under `Caches/MihonCompat/Files/<package>`;
   `..` and absolute paths outside that root are clamped to the root. Caches is
   excluded from backup.
-- Engine requests accept only `http`/`https` URLs; repository, index-list, APK
-  and image downloads are size-capped, and repository indexes must remain HTTPS
-  after redirects.
+- Engine requests accept only `http`/`https` URLs and are capped at 64 MiB per
+  response; repository, index-list, APK and image downloads are size-capped,
+  and repository indexes must remain HTTPS after redirects.
+- DEX tables and class data are bounds-validated at load; ZIP64 arithmetic and
+  central-directory counts are checked before allocation. Runtime pools evict
+  only idle engines.
 - Native methods can throw Java exceptions but cannot escape the engine's
   serial queue.
 

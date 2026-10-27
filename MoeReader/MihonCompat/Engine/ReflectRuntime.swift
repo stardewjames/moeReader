@@ -17,6 +17,17 @@ final class VMFieldRefPayload {
     }
 }
 
+/// Minimal `java.lang.reflect.Method` payload: the VM method it reflects and
+/// the class that declared it.
+final class VMMethodRefPayload {
+    let owner: VMClass
+    let method: VMMethod
+    init(owner: VMClass, method: VMMethod) {
+        self.owner = owner
+        self.method = method
+    }
+}
+
 enum ReflectRuntime {
     static func classes() -> [NativeClass] {
         var result: [NativeClass] = []
@@ -57,45 +68,54 @@ enum ReflectRuntime {
         }
         field.method("setAccessible", "(Z)V") { _, _, _ in .zero }
         field.method("getInt", "(Ljava/lang/Object;)I") { runtime, args, _ in
-            guard let payload: VMFieldRefPayload = runtime.payload(args[0], as: VMFieldRefPayload.self) else { return .int32(0) }
-            let value = payload.field.isStatic
-                ? payload.owner.staticValue(payload.field)
-                : args[1].object.map { VMObjectLayout.slot($0, payload.field.offset).pointee } ?? .zero
-            return .int32(value.asInt32)
+            let payload: VMFieldRefPayload = try runtime.payloadBox(args[0])
+            if payload.field.isStatic { return .int32(payload.owner.staticValue(payload.field).asInt32) }
+            guard let target = args[1].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return .int32(VMObjectLayout.slot(target, payload.field.offset).pointee.asInt32)
         }
         field.method("getLong", "(Ljava/lang/Object;)J") { runtime, args, _ in
-            guard let payload: VMFieldRefPayload = runtime.payload(args[0], as: VMFieldRefPayload.self) else { return .int64(0) }
-            let value = payload.field.isStatic
-                ? payload.owner.staticValue(payload.field)
-                : args[1].object.map { VMObjectLayout.slot($0, payload.field.offset).pointee } ?? .zero
-            return .int64(value.asInt64)
+            let payload: VMFieldRefPayload = try runtime.payloadBox(args[0])
+            if payload.field.isStatic { return .int64(payload.owner.staticValue(payload.field).asInt64) }
+            guard let target = args[1].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return .int64(VMObjectLayout.slot(target, payload.field.offset).pointee.asInt64)
         }
         field.method("getBoolean", "(Ljava/lang/Object;)Z") { runtime, args, _ in
-            guard let payload: VMFieldRefPayload = runtime.payload(args[0], as: VMFieldRefPayload.self) else { return .boolean(false) }
-            let value = payload.field.isStatic
-                ? payload.owner.staticValue(payload.field)
-                : args[1].object.map { VMObjectLayout.slot($0, payload.field.offset).pointee } ?? .zero
-            return .boolean(value.asBoolean)
+            let payload: VMFieldRefPayload = try runtime.payloadBox(args[0])
+            if payload.field.isStatic { return .boolean(payload.owner.staticValue(payload.field).asBoolean) }
+            guard let target = args[1].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return .boolean(VMObjectLayout.slot(target, payload.field.offset).pointee.asBoolean)
         }
         field.method("setInt", "(Ljava/lang/Object;I)V") { runtime, args, _ in
-            guard let payload: VMFieldRefPayload = runtime.payload(args[0], as: VMFieldRefPayload.self) else { return .zero }
+            let payload: VMFieldRefPayload = try runtime.payloadBox(args[0])
             let value = VMValue.int32(args[2].asInt32)
-            if payload.field.isStatic { payload.owner.setStaticValue(payload.field, value) }
-            else if let target = args[1].object { VMObjectLayout.slot(target, payload.field.offset).pointee = value }
+            if payload.field.isStatic {
+                payload.owner.setStaticValue(payload.field, value)
+            } else {
+                guard let target = args[1].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                VMObjectLayout.slot(target, payload.field.offset).pointee = value
+            }
             return .zero
         }
         field.method("setLong", "(Ljava/lang/Object;J)V") { runtime, args, _ in
-            guard let payload: VMFieldRefPayload = runtime.payload(args[0], as: VMFieldRefPayload.self) else { return .zero }
+            let payload: VMFieldRefPayload = try runtime.payloadBox(args[0])
             let value = VMValue.int64(args[2].asInt64)
-            if payload.field.isStatic { payload.owner.setStaticValue(payload.field, value) }
-            else if let target = args[1].object { VMObjectLayout.slot(target, payload.field.offset).pointee = value }
+            if payload.field.isStatic {
+                payload.owner.setStaticValue(payload.field, value)
+            } else {
+                guard let target = args[1].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                VMObjectLayout.slot(target, payload.field.offset).pointee = value
+            }
             return .zero
         }
         field.method("setBoolean", "(Ljava/lang/Object;Z)V") { runtime, args, _ in
-            guard let payload: VMFieldRefPayload = runtime.payload(args[0], as: VMFieldRefPayload.self) else { return .zero }
+            let payload: VMFieldRefPayload = try runtime.payloadBox(args[0])
             let value = VMValue.boolean(args[2].asBoolean)
-            if payload.field.isStatic { payload.owner.setStaticValue(payload.field, value) }
-            else if let target = args[1].object { VMObjectLayout.slot(target, payload.field.offset).pointee = value }
+            if payload.field.isStatic {
+                payload.owner.setStaticValue(payload.field, value)
+            } else {
+                guard let target = args[1].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                VMObjectLayout.slot(target, payload.field.offset).pointee = value
+            }
             return .zero
         }
         field.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
@@ -106,7 +126,10 @@ enum ReflectRuntime {
 
         let method = NativeClass("Ljava/lang/reflect/Method;", superclass: "Ljava/lang/reflect/AccessibleObject;")
         method.method("setAccessible", "(Z)V") { _, _, _ in .zero }
-        method.method("getName", "()Ljava/lang/String;") { _, _, _ in .null }
+        method.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: VMMethodRefPayload = runtime.payload(args[0], as: VMMethodRefPayload.self) else { return .null }
+            return runtime.newString(payload.method.name)
+        }
         result.append(method)
 
         let constructor = NativeClass("Ljava/lang/reflect/Constructor;", superclass: "Ljava/lang/reflect/AccessibleObject;")
