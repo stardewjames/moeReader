@@ -14,6 +14,8 @@ Liquid Glass.
 - Horizontal paged reading (left-to-right or traditional right-to-left), vertical
   paged reading, and continuous long-strip modes with optional gaps.
 - A per-manga reading mode; `Default` uses the app-wide default configured in Settings.
+- Tap-to-turn pages with configurable side or top/bottom zones, normal or reversed;
+  center taps toggle the reader controls.
 - Pinch, pan, and double-tap zoom. Paging is disabled while a page is zoomed.
 - Liquid Glass reader chrome with page slider, page counter, and per-manga mode menu.
 - Per-manga progress and reading mode persist across launches.

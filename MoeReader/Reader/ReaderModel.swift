@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Observation
 
@@ -103,6 +104,66 @@ final class ReaderModel {
     func persistProgress() {
         guard pageCount > 0 else { return }
         library.updateProgress(bookID: book.id, page: visiblePage)
+    }
+
+    func tapAction(at location: CGPoint, in size: CGSize) -> ReaderTapAction {
+        let layout = library.tapZoneLayout
+        guard layout != .off, size.width > 0, size.height > 0 else {
+            return .toggleChrome
+        }
+
+        switch layout {
+        case .off:
+            return .toggleChrome
+        case .sides, .sidesReversed:
+            let band = size.width / 3
+            if location.x < band {
+                return sideAction(isLeft: true, layout: layout)
+            }
+            if location.x > size.width - band {
+                return sideAction(isLeft: false, layout: layout)
+            }
+            return .toggleChrome
+        case .topBottom, .bottomTop:
+            let band = size.height / 3
+            if location.y < band {
+                return rowAction(isTop: true, layout: layout)
+            }
+            if location.y > size.height - band {
+                return rowAction(isTop: false, layout: layout)
+            }
+            return .toggleChrome
+        }
+    }
+
+    private func sideAction(isLeft: Bool, layout: TapZoneLayout) -> ReaderTapAction {
+        let forwardIsLeft: Bool
+        switch readingMode {
+        case .pagedRightToLeft:
+            forwardIsLeft = true
+        case .pagedLeftToRight, .pagedVertical, .longStrip, .longStripWithGaps,
+             .defaultMode:
+            forwardIsLeft = false
+        }
+        let isForward = isLeft == forwardIsLeft
+        let action: ReaderTapAction = isForward ? .nextPage : .previousPage
+        return layout == .sidesReversed ? Self.opposite(action) : action
+    }
+
+    private func rowAction(isTop: Bool, layout: TapZoneLayout) -> ReaderTapAction {
+        let action: ReaderTapAction = isTop ? .previousPage : .nextPage
+        return layout == .bottomTop ? Self.opposite(action) : action
+    }
+
+    private static func opposite(_ action: ReaderTapAction) -> ReaderTapAction {
+        switch action {
+        case .previousPage:
+            return .nextPage
+        case .nextPage:
+            return .previousPage
+        case .toggleChrome:
+            return .toggleChrome
+        }
     }
 
     private static func pageOrder(for mode: ReadingMode, pageCount: Int) -> [Int] {

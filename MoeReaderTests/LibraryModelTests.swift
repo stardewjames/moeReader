@@ -62,12 +62,14 @@ final class LibraryModelTests: XCTestCase {
         library.updateProgress(bookID: book.id, page: 2)
         library.updateReadingMode(bookID: book.id, mode: .pagedVertical)
         library.updateDefaultReadingMode(.longStripWithGaps)
+        library.updateTapZoneLayout(.topBottom)
         await library.flush()
 
         let reloaded = LibraryModel(documents: documents, caches: caches)
         XCTAssertEqual(reloaded.books.first?.lastPage, 2)
         XCTAssertEqual(reloaded.books.first?.readingMode, .pagedVertical)
         XCTAssertEqual(reloaded.defaultReadingMode, .longStripWithGaps)
+        XCTAssertEqual(reloaded.tapZoneLayout, .topBottom)
     }
 
     @MainActor
@@ -106,6 +108,7 @@ final class LibraryModelTests: XCTestCase {
         let data = Data(#"{"version":1,"books":[]}"#.utf8)
         let index = try JSONDecoder().decode(LibraryIndex.self, from: data)
         XCTAssertEqual(index.defaultReadingMode, .pagedRightToLeft)
+        XCTAssertEqual(index.tapZoneLayout, .sides)
     }
 
     @MainActor

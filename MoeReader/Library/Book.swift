@@ -89,14 +89,15 @@ private enum LegacyReadingDirection: String, Codable {
 }
 
 struct LibraryIndex: Codable, Sendable {
-    var version = 2
+    var version = 3
     var books: [Book] = []
     var defaultReadingMode: ReadingMode = .pagedRightToLeft
+    var tapZoneLayout: TapZoneLayout = .sides
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case version, books, defaultReadingMode
+        case version, books, defaultReadingMode, tapZoneLayout
     }
 
     init(from decoder: any Decoder) throws {
@@ -109,6 +110,10 @@ struct LibraryIndex: Codable, Sendable {
         )
         defaultReadingMode = (stored ?? .pagedRightToLeft)
             .resolved(using: .pagedRightToLeft)
+        tapZoneLayout = try container.decodeIfPresent(
+            TapZoneLayout.self,
+            forKey: .tapZoneLayout
+        ) ?? .sides
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -116,5 +121,6 @@ struct LibraryIndex: Codable, Sendable {
         try container.encode(version, forKey: .version)
         try container.encode(books, forKey: .books)
         try container.encode(defaultReadingMode, forKey: .defaultReadingMode)
+        try container.encode(tapZoneLayout, forKey: .tapZoneLayout)
     }
 }

@@ -61,7 +61,7 @@ struct ReaderPageView: View {
         .frame(width: size.width, height: size.height)
         .clipped()
         .contentShape(Rectangle())
-        .simultaneousGesture(tapGesture)
+        .simultaneousGesture(tapGesture(in: size))
         .simultaneousGesture(magnifyGesture(in: size))
         .task(id: pixelSize) {
             await loadImage()
@@ -102,17 +102,34 @@ struct ReaderPageView: View {
         }
     }
 
-    private var tapGesture: some Gesture {
+    private func tapGesture(in size: CGSize) -> some Gesture {
         SpatialTapGesture(count: 2)
             .exclusively(before: SpatialTapGesture(count: 1))
             .onEnded { result in
                 switch result {
                 case .first:
                     toggleDoubleTap()
-                case .second:
-                    model.toggleChrome()
+                case .second(let value):
+                    handleSingleTap(at: value.location, in: size)
                 }
             }
+    }
+
+    private func handleSingleTap(at location: CGPoint, in size: CGSize) {
+        guard model.zoomedPage == nil else {
+            model.toggleChrome()
+            return
+        }
+        switch model.tapAction(at: location, in: size) {
+        case .previousPage:
+            model.seek(to: model.visiblePage - 1)
+            model.bumpChrome()
+        case .nextPage:
+            model.seek(to: model.visiblePage + 1)
+            model.bumpChrome()
+        case .toggleChrome:
+            model.toggleChrome()
+        }
     }
 
     private func magnifyGesture(in size: CGSize) -> some Gesture {

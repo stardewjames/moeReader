@@ -9,6 +9,7 @@ final class LibraryModel {
     let caches: URL
     private(set) var books: [Book]
     private(set) var defaultReadingMode: ReadingMode
+    private(set) var tapZoneLayout: TapZoneLayout
     var isImporting = false
     var errorMessage: String?
 
@@ -54,15 +55,18 @@ final class LibraryModel {
         if isUITesting {
             self.books = []
             self.defaultReadingMode = .pagedRightToLeft
+            self.tapZoneLayout = .sides
         } else {
             let index = Self.loadIndex(documents: documents)
             self.books = index.books
             self.defaultReadingMode = index.defaultReadingMode
+            self.tapZoneLayout = index.tapZoneLayout
         }
         #else
         let index = Self.loadIndex(documents: documents)
         self.books = index.books
         self.defaultReadingMode = index.defaultReadingMode
+        self.tapZoneLayout = index.tapZoneLayout
         #endif
     }
 
@@ -164,6 +168,12 @@ final class LibraryModel {
         scheduleSave()
     }
 
+    func updateTapZoneLayout(_ layout: TapZoneLayout) {
+        guard tapZoneLayout != layout else { return }
+        tapZoneLayout = layout
+        scheduleSave()
+    }
+
     func flush() async {
         saveTask?.cancel()
         saveTask = nil
@@ -189,6 +199,7 @@ final class LibraryModel {
         )
         books = []
         defaultReadingMode = .pagedRightToLeft
+        tapZoneLayout = .sides
         errorMessage = nil
         pendingURLs.removeAll()
 
@@ -219,6 +230,7 @@ final class LibraryModel {
         var index = LibraryIndex()
         index.books = books
         index.defaultReadingMode = defaultReadingMode
+        index.tapZoneLayout = tapZoneLayout
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(index) else {

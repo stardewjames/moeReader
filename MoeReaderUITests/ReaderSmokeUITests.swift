@@ -1,3 +1,4 @@
+import CoreGraphics
 import XCTest
 
 final class ReaderSmokeUITests: XCTestCase {
@@ -33,17 +34,26 @@ final class ReaderSmokeUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.5)
         attachScreenshot(named: "02-reader-page-1")
 
+        let leftTap = app.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5))
+        leftTap.tap()
+        waitForIndicator("2 / 3", indicator)
+        attachScreenshot(named: "03-reader-tap-next")
+
+        let rightTap = app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5))
+        rightTap.tap()
+        waitForIndicator("1 / 3", indicator)
+
         app.swipeRight()
         waitForIndicator("2 / 3", indicator)
         Thread.sleep(forTimeInterval: 0.3)
-        attachScreenshot(named: "03-reader-page-2-rtl")
+        attachScreenshot(named: "04-reader-page-2-rtl")
 
         selectMode("Paged (left to right)", in: app)
         XCTAssertEqual(indicator.label, "2 / 3")
         Thread.sleep(forTimeInterval: 0.3)
         app.swipeLeft()
         waitForIndicator("3 / 3", indicator)
-        attachScreenshot(named: "04-reader-page-3-ltr")
+        attachScreenshot(named: "05-reader-page-3-ltr")
 
         app.buttons["reader.chrome.prev"].tap()
         waitForIndicator("2 / 3", indicator)
@@ -53,7 +63,7 @@ final class ReaderSmokeUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.3)
         app.swipeUp()
         waitForIndicator("3 / 3", indicator)
-        attachScreenshot(named: "05-reader-paged-vertical")
+        attachScreenshot(named: "06-reader-paged-vertical")
 
         app.buttons["reader.chrome.prev"].tap()
         waitForIndicator("2 / 3", indicator)
@@ -62,11 +72,11 @@ final class ReaderSmokeUITests: XCTestCase {
 
         selectMode("Long strip", in: app)
         waitForIndicator("1 / 3", indicator)
-        attachScreenshot(named: "06-reader-long-strip")
+        attachScreenshot(named: "07-reader-long-strip")
 
         selectMode("Long strip with gaps", in: app)
         waitForIndicator("1 / 3", indicator)
-        attachScreenshot(named: "07-reader-long-strip-gaps")
+        attachScreenshot(named: "08-reader-long-strip-gaps")
 
         selectMode("Default", in: app)
         waitForIndicator("1 / 3", indicator)
@@ -84,7 +94,7 @@ final class ReaderSmokeUITests: XCTestCase {
         let ltrRow = app.buttons["settings.mode.pagedLeftToRight"]
         XCTAssertTrue(ltrRow.waitForExistence(timeout: 5))
         ltrRow.tap()
-        attachScreenshot(named: "08-settings-default-mode")
+        attachScreenshot(named: "09-settings-default-mode")
         settingsNavigation.buttons.firstMatch.tap()
         Thread.sleep(forTimeInterval: 0.4)
 
@@ -93,7 +103,7 @@ final class ReaderSmokeUITests: XCTestCase {
         XCTAssertEqual(indicator.label, "1 / 3")
         app.swipeLeft()
         waitForIndicator("2 / 3", indicator)
-        attachScreenshot(named: "09-reader-default-follows-settings")
+        attachScreenshot(named: "10-reader-default-follows-settings")
 
         app.buttons["reader.chrome.back"].tap()
         XCTAssertTrue(tile.waitForExistence(timeout: 10))

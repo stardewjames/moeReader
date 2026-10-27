@@ -13,16 +13,16 @@ struct ReaderChrome: View {
     var body: some View {
         ZStack(alignment: .top) {
             if model.chromeVisible {
-                GlassEffectContainer(spacing: 16) {
+                GlassEffectContainer(spacing: 12) {
                     VStack(spacing: 0) {
                         topBar
                         Spacer(minLength: 0)
                         bottomBar
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-                    .padding(.bottom, 12)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 6)
+                    .padding(.bottom, 10)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
@@ -31,7 +31,7 @@ struct ReaderChrome: View {
     }
 
     private var topBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Button(action: close) {
                 Image(systemName: "chevron.left")
                     .frame(width: 44, height: 44)
@@ -41,7 +41,7 @@ struct ReaderChrome: View {
             .accessibilityLabel("Back")
 
             Text(model.book.title)
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
                 .lineLimit(1)
                 .foregroundStyle(.white)
 
@@ -51,8 +51,8 @@ struct ReaderChrome: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .padding(14)
-        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
+        .padding(10)
+        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
     }
 
     private var modeMenu: some View {
@@ -88,13 +88,13 @@ struct ReaderChrome: View {
     }
 
     private var bottomBar: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             Text("\(shownPage + 1) / \(model.pageCount)")
-                .font(.subheadline.monospacedDigit())
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(.white)
                 .accessibilityIdentifier("reader.pageIndicator")
 
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 Button {
                     step(-1)
                 } label: {
@@ -141,9 +141,9 @@ struct ReaderChrome: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 14)
-        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 20))
     }
 
     private func step(_ delta: Int) {

@@ -9,7 +9,6 @@ struct LibraryView: View {
     @State private var isImporterPresented = false
     @State private var isSettingsPresented = false
     @State private var pendingDeletion: Book?
-    @Namespace private var zoomNamespace
     @Environment(\.scenePhase) private var scenePhase
 
     private static let allowedTypes: [UTType] = {
@@ -85,7 +84,6 @@ struct LibraryView: View {
             }
             .navigationDestination(item: $openBook) { book in
                 ReaderView(book: book, library: library)
-                    .navigationTransition(.zoom(sourceID: book.id, in: zoomNamespace))
             }
             .navigationDestination(isPresented: $isSettingsPresented) {
                 SettingsView(library: library)
@@ -143,7 +141,6 @@ struct LibraryView: View {
                             coverStore: coverStore,
                             documents: library.documents,
                             caches: library.caches,
-                            zoomNamespace: zoomNamespace,
                             onOpen: {
                                 library.markOpened(book)
                                 openBook = book
@@ -212,7 +209,6 @@ private struct BookTileView: View {
     let coverStore: CoverStore
     let documents: URL
     let caches: URL
-    let zoomNamespace: Namespace.ID
     let onOpen: () -> Void
     let onDelete: () -> Void
 
@@ -259,7 +255,6 @@ private struct BookTileView: View {
             }
         }
         .buttonStyle(.plain)
-        .matchedTransitionSource(id: book.id, in: zoomNamespace)
         .accessibilityIdentifier("bookTile.\(book.title)")
         .accessibilityLabel(
             "\(book.title), \(book.pageCount) pages, page \(book.lastPage + 1) of \(book.pageCount)"
