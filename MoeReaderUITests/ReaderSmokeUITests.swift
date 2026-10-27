@@ -38,6 +38,7 @@ final class ReaderSmokeUITests: XCTestCase {
             evaluatedWith: indicator
         )
         waitForExpectations(timeout: 10)
+        Thread.sleep(forTimeInterval: 0.3)
         attachScreenshot(named: "03-reader-page-2-rtl")
 
         app.buttons["reader.chrome.direction"].tap()
@@ -49,6 +50,7 @@ final class ReaderSmokeUITests: XCTestCase {
             evaluatedWith: indicator
         )
         waitForExpectations(timeout: 10)
+        Thread.sleep(forTimeInterval: 0.3)
         attachScreenshot(named: "04-reader-page-3-ltr")
 
         app.buttons["reader.chrome.prev"].tap()
