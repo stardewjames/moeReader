@@ -11,16 +11,18 @@ Liquid Glass.
 - ZIP central-directory random access: archives are opened, not extracted.
 - Stored ZIP/TAR pages are decoded directly from the mapped file (zero-copy payloads).
 - Off-main ImageIO downsampling with a bounded decoded-image cache and ±2-page prefetch.
-- Horizontal paged reader with right-to-left reading by default and a per-book toggle.
+- Horizontal paged reading (left-to-right or traditional right-to-left), vertical
+  paged reading, and continuous long-strip modes with optional gaps.
+- A per-book reading mode; `Default` follows the configurable app-wide default.
 - Pinch, pan, and double-tap zoom. Paging is disabled while a page is zoomed.
-- Liquid Glass reader chrome with page slider, page counter, and direction control.
-- Per-book progress and reading direction persist across launches.
+- Liquid Glass reader chrome with page slider, page counter, and reading-mode menu.
+- Per-book progress and reading mode persist across launches; the app-wide default
+  reading mode is configurable from the library.
 - Covers are generated on import and cached separately from the library.
 - Imported books are excluded from iCloud backup; covers live in Caches.
 
-Out of scope for this milestone: online sources, CBR, CB7, continuous vertical
-reading, and a settings screen. `PageSource` is the extension seam for future
-remote sources.
+Out of scope for this milestone: online sources, CBR, CB7, and a dedicated
+settings screen. `PageSource` is the extension seam for future remote sources.
 
 ## Requirements
 
@@ -98,9 +100,9 @@ MoeReader/
     Image/      ImageIO decoding, cache, JPEG covers
     Diagnostics Signposts
   Library/      Book model, persistence, import, covers, library UI
-  Reader/       Reader model, paging, zoom, chrome
+  Reader/       Reader model, scroll modes, zoom, chrome
 MoeReaderTests/ Unit tests and fixtures
-MoeReaderUITests/ End-to-end import/read/turn/direction test
+MoeReaderUITests/ End-to-end import/read/mode-switch test
 scripts/        Fixture generation and CI test script
 ```
 

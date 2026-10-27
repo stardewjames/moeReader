@@ -8,6 +8,7 @@ final class LibraryModel {
     let documents: URL
     let caches: URL
     private(set) var books: [Book]
+    private(set) var defaultReadingMode: ReadingMode
     var isImporting = false
     var errorMessage: String?
 
@@ -50,9 +51,18 @@ final class LibraryModel {
         try? booksDirectory.setResourceValues(values)
 
         #if DEBUG
-        self.books = isUITesting ? [] : Self.loadBooks(documents: documents)
+        if isUITesting {
+            self.books = []
+            self.defaultReadingMode = .pagedRightToLeft
+        } else {
+            let index = Self.loadIndex(documents: documents)
+            self.books = index.books
+            self.defaultReadingMode = index.defaultReadingMode
+        }
         #else
-        self.books = Self.loadBooks(documents: documents)
+        let index = Self.loadIndex(documents: documents)
+        self.books = index.books
+        self.defaultReadingMode = index.defaultReadingMode
         #endif
     }
 
@@ -140,10 +150,17 @@ final class LibraryModel {
         scheduleSave()
     }
 
-    func updateDirection(bookID: UUID, direction: ReadingDirection) {
+    func updateReadingMode(bookID: UUID, mode: ReadingMode) {
         guard let index = books.firstIndex(where: { $0.id == bookID }) else { return }
-        guard books[index].direction != direction else { return }
-        books[index].direction = direction
+        guard books[index].readingMode != mode else { return }
+        books[index].readingMode = mode
+        scheduleSave()
+    }
+
+    func updateDefaultReadingMode(_ mode: ReadingMode) {
+        let resolved = mode.resolved(using: .pagedRightToLeft)
+        guard defaultReadingMode != resolved else { return }
+        defaultReadingMode = resolved
         scheduleSave()
     }
 
@@ -171,6 +188,7 @@ final class LibraryModel {
             withIntermediateDirectories: true
         )
         books = []
+        defaultReadingMode = .pagedRightToLeft
         errorMessage = nil
         pendingURLs.removeAll()
 
@@ -200,6 +218,7 @@ final class LibraryModel {
     private func writeIndex() async {
         var index = LibraryIndex()
         index.books = books
+        index.defaultReadingMode = defaultReadingMode
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(index) else {
@@ -223,20 +242,21 @@ final class LibraryModel {
         try? FileManager.default.removeItem(at: url)
     }
 
-    private static func loadBooks(documents: URL) -> [Book] {
+    private static func loadIndex(documents: URL) -> LibraryIndex {
         let url = LibraryPaths.index(documents: documents)
         guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else {
-            return []
+            return LibraryIndex()
         }
         do {
             let data = try Data(contentsOf: url)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            let index = try decoder.decode(LibraryIndex.self, from: data)
-            return index.books.sorted { $0.addedAt > $1.addedAt }
+            var index = try decoder.decode(LibraryIndex.self, from: data)
+            index.books.sort { $0.addedAt > $1.addedAt }
+            return index
         } catch {
             logger.error("Failed to read library index: \(String(describing: error), privacy: .public)")
-            return []
+            return LibraryIndex()
         }
     }
 }

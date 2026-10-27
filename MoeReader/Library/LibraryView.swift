@@ -34,7 +34,31 @@ struct LibraryView: View {
                 }
             }
             .navigationTitle("Library")
+            .toolbarTitleDisplayMode(.inlineLarge)
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Section("Default reading mode") {
+                            ForEach(ReadingMode.concreteCases) { mode in
+                                Button {
+                                    library.updateDefaultReadingMode(mode)
+                                } label: {
+                                    if mode == library.defaultReadingMode {
+                                        Label(mode.title, systemImage: "checkmark")
+                                    } else {
+                                        Text(mode.title)
+                                    }
+                                }
+                                .accessibilityLabel(mode.title)
+                                .accessibilityHint(mode.summary)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .accessibilityIdentifier("library.defaultMode")
+                    .accessibilityLabel("Default reading mode")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         isImporterPresented = true

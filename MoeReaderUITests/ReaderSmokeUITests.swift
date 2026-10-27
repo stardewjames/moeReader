@@ -6,7 +6,7 @@ final class ReaderSmokeUITests: XCTestCase {
     }
 
     @MainActor
-    func testImportReadTurnPageAndDirection() throws {
+    func testImportReadModesAndDirection() throws {
         let app = XCUIApplication()
         app.launchArguments += ["-ui-testing"]
         app.launch()
@@ -34,35 +34,83 @@ final class ReaderSmokeUITests: XCTestCase {
         attachScreenshot(named: "02-reader-page-1")
 
         app.swipeRight()
-        expectation(
-            for: NSPredicate(format: "label == %@", "2 / 3"),
-            evaluatedWith: indicator
-        )
-        waitForExpectations(timeout: 10)
+        waitForIndicator("2 / 3", indicator)
         Thread.sleep(forTimeInterval: 0.3)
         attachScreenshot(named: "03-reader-page-2-rtl")
 
-        app.buttons["reader.chrome.direction"].tap()
+        selectMode("Paged (left to right)", in: app)
         XCTAssertEqual(indicator.label, "2 / 3")
-        Thread.sleep(forTimeInterval: 0.5)
-        app.swipeLeft()
-        expectation(
-            for: NSPredicate(format: "label == %@", "3 / 3"),
-            evaluatedWith: indicator
-        )
-        waitForExpectations(timeout: 10)
         Thread.sleep(forTimeInterval: 0.3)
+        app.swipeLeft()
+        waitForIndicator("3 / 3", indicator)
         attachScreenshot(named: "04-reader-page-3-ltr")
 
+        selectMode("Paged (vertical)", in: app)
+        XCTAssertEqual(indicator.label, "3 / 3")
+        Thread.sleep(forTimeInterval: 0.3)
+        app.swipeDown()
+        waitForIndicator("2 / 3", indicator)
+        attachScreenshot(named: "05-reader-paged-vertical")
+
         app.buttons["reader.chrome.prev"].tap()
-        expectation(
-            for: NSPredicate(format: "label == %@", "2 / 3"),
-            evaluatedWith: indicator
-        )
-        waitForExpectations(timeout: 10)
+        waitForIndicator("1 / 3", indicator)
+
+        selectMode("Long strip", in: app)
+        waitForIndicator("1 / 3", indicator)
+        attachScreenshot(named: "06-reader-long-strip")
+
+        selectMode("Long strip with gaps", in: app)
+        waitForIndicator("1 / 3", indicator)
+        attachScreenshot(named: "07-reader-long-strip-gaps")
+
+        selectMode("Default", in: app)
+        waitForIndicator("1 / 3", indicator)
 
         app.buttons["reader.chrome.back"].tap()
         XCTAssertTrue(tile.waitForExistence(timeout: 10))
+        Thread.sleep(forTimeInterval: 0.5)
+
+        let defaultMenu = app.buttons["library.defaultMode"]
+        XCTAssertTrue(defaultMenu.waitForExistence(timeout: 5))
+        defaultMenu.tap()
+        let ltr = app.buttons["Paged (left to right)"]
+        XCTAssertTrue(ltr.waitForExistence(timeout: 5))
+        ltr.tap()
+        Thread.sleep(forTimeInterval: 0.4)
+
+        tile.tap()
+        XCTAssertTrue(indicator.waitForExistence(timeout: 20))
+        XCTAssertEqual(indicator.label, "1 / 3")
+        app.swipeLeft()
+        waitForIndicator("2 / 3", indicator)
+        attachScreenshot(named: "08-reader-default-follows-app-setting")
+
+        app.buttons["reader.chrome.back"].tap()
+        XCTAssertTrue(tile.waitForExistence(timeout: 10))
+    }
+
+    @MainActor
+    private func selectMode(_ title: String, in app: XCUIApplication) {
+        app.buttons["reader.chrome.mode"].tap()
+        let menuButton = app.buttons[title]
+        if menuButton.waitForExistence(timeout: 3) {
+            menuButton.tap()
+            Thread.sleep(forTimeInterval: 0.4)
+            return
+        }
+        let menuItem = app.menuItems[title]
+        XCTAssertTrue(menuItem.waitForExistence(timeout: 3))
+        menuItem.tap()
+        Thread.sleep(forTimeInterval: 0.4)
+    }
+
+    @MainActor
+    private func waitForIndicator(_ label: String, _ indicator: XCUIElement) {
+        expectation(
+            for: NSPredicate(format: "label == %@", label),
+            evaluatedWith: indicator
+        )
+        waitForExpectations(timeout: 10)
     }
 
     @MainActor

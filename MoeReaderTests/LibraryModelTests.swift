@@ -27,6 +27,7 @@ final class LibraryModelTests: XCTestCase {
         XCTAssertEqual(book.sourceFileName, "mini.cbz")
         XCTAssertEqual(book.kind, .cbz)
         XCTAssertEqual(book.pageCount, 3)
+        XCTAssertEqual(book.readingMode, .defaultMode)
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: LibraryPaths.storedURL(for: book, documents: documents).path
         ))
@@ -50,7 +51,7 @@ final class LibraryModelTests: XCTestCase {
     }
 
     @MainActor
-    func testProgressAndDirectionPersist() async throws {
+    func testProgressAndReadingModePersist() async throws {
         let (library, documents, caches) = try makeLibrary()
         defer {
             try? FileManager.default.removeItem(at: documents)
@@ -59,12 +60,52 @@ final class LibraryModelTests: XCTestCase {
         await library.importURLs([TestFixtures.url("mini", "cbz")])
         guard let book = library.books.first else { return XCTFail("Missing book") }
         library.updateProgress(bookID: book.id, page: 2)
-        library.updateDirection(bookID: book.id, direction: .leftToRight)
+        library.updateReadingMode(bookID: book.id, mode: .pagedVertical)
+        library.updateDefaultReadingMode(.longStripWithGaps)
         await library.flush()
 
         let reloaded = LibraryModel(documents: documents, caches: caches)
         XCTAssertEqual(reloaded.books.first?.lastPage, 2)
-        XCTAssertEqual(reloaded.books.first?.direction, .leftToRight)
+        XCTAssertEqual(reloaded.books.first?.readingMode, .pagedVertical)
+        XCTAssertEqual(reloaded.defaultReadingMode, .longStripWithGaps)
+    }
+
+    @MainActor
+    func testDefaultReadingModeStaysAnOverride() async throws {
+        let (library, documents, caches) = try makeLibrary()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        await library.importURLs([TestFixtures.url("mini", "cbz")])
+        guard let book = library.books.first else { return XCTFail("Missing book") }
+        library.updateReadingMode(bookID: book.id, mode: .longStrip)
+        library.updateReadingMode(bookID: book.id, mode: .defaultMode)
+        library.updateDefaultReadingMode(.pagedLeftToRight)
+        await library.flush()
+
+        let reloaded = LibraryModel(documents: documents, caches: caches)
+        XCTAssertEqual(reloaded.books.first?.readingMode, .defaultMode)
+        XCTAssertEqual(reloaded.defaultReadingMode, .pagedLeftToRight)
+    }
+
+    func testLegacyDirectionDecodesIntoReadingMode() throws {
+        let json = """
+        {"id":"11111111-1111-1111-1111-111111111111","title":"Legacy",
+         "sourceFileName":"legacy.cbz","kind":"cbz","byteCount":10,
+         "pageCount":2,"lastPage":0,"addedAt":"2020-01-01T00:00:00Z",
+         "direction":"leftToRight"}
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let book = try decoder.decode(Book.self, from: Data(json.utf8))
+        XCTAssertEqual(book.readingMode, .pagedLeftToRight)
+    }
+
+    func testLegacyIndexDefaultsToRightToLeftMode() throws {
+        let data = Data(#"{"version":1,"books":[]}"#.utf8)
+        let index = try JSONDecoder().decode(LibraryIndex.self, from: data)
+        XCTAssertEqual(index.defaultReadingMode, .pagedRightToLeft)
     }
 
     @MainActor

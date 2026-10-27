@@ -74,7 +74,7 @@ enum ImportService {
             lastPage: 0,
             lastOpenedAt: nil,
             addedAt: .now,
-            direction: .rightToLeft
+            readingMode: .defaultMode
         )
 
         do {

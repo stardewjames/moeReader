@@ -9,28 +9,29 @@ final class ReaderModel {
     let loader: PageLoader
     let pageCount: Int
     private(set) var displayOrder: [Int]
+    private(set) var modeSetting: ReadingMode
+    private(set) var readingMode: ReadingMode
     var visiblePage: Int
-    var direction: ReadingDirection
     var zoomedPage: Int?
     var chromeVisible = true
     var pixelSize: Int
 
     @ObservationIgnored private var hideTask: Task<Void, Never>?
+    @ObservationIgnored private var prefetchTask: Task<Void, Never>?
 
     init(book: Book, source: any PageSource, library: LibraryModel) {
         self.book = book
         self.library = library
         self.loader = PageLoader(source: source)
         let count = source.pageNames.count
-        let resolvedDirection = book.direction
+        let setting = book.readingMode
+        let resolved = setting.resolved(using: library.defaultReadingMode)
         self.pageCount = count
         self.visiblePage = min(max(book.lastPage, 0), max(0, count - 1))
-        self.direction = resolvedDirection
+        self.modeSetting = setting
+        self.readingMode = resolved
         self.pixelSize = 2048
-        let order = Array(0..<count)
-        self.displayOrder = resolvedDirection == .rightToLeft
-            ? Array(order.reversed())
-            : order
+        self.displayOrder = Self.pageOrder(for: resolved, pageCount: count)
     }
 
     func updatePixelSize(_ size: Int) {
@@ -49,13 +50,16 @@ final class ReaderModel {
         prefetch()
     }
 
-    func setDirection(_ direction: ReadingDirection) {
-        guard self.direction != direction else { return }
-        self.direction = direction
-        let order = Array(0..<pageCount)
-        displayOrder = direction == .rightToLeft ? Array(order.reversed()) : order
+    func setReadingMode(_ setting: ReadingMode) {
+        guard modeSetting != setting else { return }
+        modeSetting = setting
+        library.updateReadingMode(bookID: book.id, mode: setting)
+
+        let resolved = setting.resolved(using: library.defaultReadingMode)
+        guard resolved != readingMode else { return }
+        readingMode = resolved
+        displayOrder = Self.pageOrder(for: resolved, pageCount: pageCount)
         zoomedPage = nil
-        library.updateDirection(bookID: book.id, direction: direction)
     }
 
     func toggleChrome() {
@@ -78,15 +82,20 @@ final class ReaderModel {
     }
 
     func prefetch() {
+        prefetchTask?.cancel()
         guard pageCount > 0 else { return }
         let loader = loader
         let pixelSize = pixelSize
         let lower = max(0, visiblePage - 2)
         let upper = min(pageCount - 1, visiblePage + 2)
         guard lower <= upper else { return }
-        for page in lower...upper {
-            Task.detached(priority: .utility) {
-                _ = await loader.image(at: page, maxPixelSize: pixelSize)
+        prefetchTask = Task {
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            for page in lower...upper {
+                Task.detached(priority: .utility) {
+                    _ = await loader.image(at: page, maxPixelSize: pixelSize)
+                }
             }
         }
     }
@@ -94,5 +103,10 @@ final class ReaderModel {
     func persistProgress() {
         guard pageCount > 0 else { return }
         library.updateProgress(bookID: book.id, page: visiblePage)
+    }
+
+    private static func pageOrder(for mode: ReadingMode, pageCount: Int) -> [Int] {
+        let order = Array(0..<pageCount)
+        return mode.reversesPageOrder ? Array(order.reversed()) : order
     }
 }

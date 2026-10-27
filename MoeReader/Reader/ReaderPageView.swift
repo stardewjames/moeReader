@@ -7,9 +7,15 @@ private enum PageImageState {
     case failed
 }
 
+enum ReaderPageLayout: Hashable, Sendable {
+    case paged
+    case strip(width: CGFloat)
+}
+
 struct ReaderPageView: View {
     let page: Int
     let pixelSize: Int
+    let layout: ReaderPageLayout
     let model: ReaderModel
 
     @State private var state: PageImageState = .loading
@@ -19,33 +25,55 @@ struct ReaderPageView: View {
     @GestureState private var dragTranslation: CGSize = .zero
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                Color.black
-                if scale > 1 {
-                    baseContent(in: geometry.size)
-                        .gesture(dragGesture(in: geometry.size))
-                } else {
-                    baseContent(in: geometry.size)
-                }
+        switch layout {
+        case .paged:
+            GeometryReader { geometry in
+                pageContent(size: geometry.size)
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .clipped()
-            .contentShape(Rectangle())
-            .simultaneousGesture(tapGesture)
-            .simultaneousGesture(magnifyGesture(in: geometry.size))
-            .task(id: pixelSize) {
-                await loadImage()
+        case .strip(let width):
+            pageContent(size: stripSize(width: width))
+        }
+    }
+
+    private func stripSize(width: CGFloat) -> CGSize {
+        guard width > 0 else { return .zero }
+        guard case .loaded(let image) = state else {
+            return CGSize(width: width, height: width * 1.4)
+        }
+        let imageWidth = CGFloat(image.cgImage.width)
+        let imageHeight = CGFloat(image.cgImage.height)
+        guard imageWidth > 0 else {
+            return CGSize(width: width, height: width * 1.4)
+        }
+        return CGSize(width: width, height: width * imageHeight / imageWidth)
+    }
+
+    private func pageContent(size: CGSize) -> some View {
+        ZStack {
+            Color.black
+            if scale > 1 {
+                baseContent(in: size)
+                    .gesture(dragGesture(in: size))
+            } else {
+                baseContent(in: size)
             }
-            .onChange(of: model.visiblePage) {
-                if model.visiblePage != page { resetZoom() }
-            }
-            .onChange(of: model.zoomedPage) {
-                if model.zoomedPage != page { resetZoom() }
-            }
-            .onDisappear {
-                resetZoom(animated: false)
-            }
+        }
+        .frame(width: size.width, height: size.height)
+        .clipped()
+        .contentShape(Rectangle())
+        .simultaneousGesture(tapGesture)
+        .simultaneousGesture(magnifyGesture(in: size))
+        .task(id: pixelSize) {
+            await loadImage()
+        }
+        .onChange(of: model.visiblePage) {
+            if model.visiblePage != page { resetZoom() }
+        }
+        .onChange(of: model.zoomedPage) {
+            if model.zoomedPage != page { resetZoom() }
+        }
+        .onDisappear {
+            resetZoom(animated: false)
         }
     }
 

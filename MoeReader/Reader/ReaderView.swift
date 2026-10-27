@@ -70,7 +70,7 @@ private struct ReaderContent: View {
                 max(2048, Int(longestSide * displayScale * 1.25))
             )
             ZStack(alignment: .top) {
-                PagedReaderView(model: model, pixelSize: pixelSize)
+                ReaderScrollView(model: model, pixelSize: pixelSize)
                     .ignoresSafeArea()
                 ReaderChrome(model: model, library: library)
             }

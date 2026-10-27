@@ -47,18 +47,37 @@ struct ReaderChrome: View {
 
             Spacer(minLength: 8)
 
-            Button(action: toggleDirection) {
-                Image(systemName: "arrow.left.arrow.right")
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityIdentifier("reader.chrome.direction")
-            .accessibilityLabel("Reading direction")
+            modeMenu
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
         .padding(14)
         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
+    }
+
+    private var modeMenu: some View {
+        Menu {
+            ForEach(ReadingMode.allCases) { mode in
+                Button {
+                    model.setReadingMode(mode)
+                    model.bumpChrome()
+                } label: {
+                    if mode == model.modeSetting {
+                        Label(mode.title, systemImage: "checkmark")
+                    } else {
+                        Text(mode.title)
+                    }
+                }
+                .accessibilityLabel(mode.title)
+                .accessibilityHint(mode.summary)
+            }
+        } label: {
+            Image(systemName: "book.pages")
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityIdentifier("reader.chrome.mode")
+        .accessibilityLabel("Reading mode")
     }
 
     private var bottomBar: some View {
@@ -122,11 +141,6 @@ struct ReaderChrome: View {
 
     private func step(_ delta: Int) {
         model.seek(to: model.visiblePage + delta)
-        model.bumpChrome()
-    }
-
-    private func toggleDirection() {
-        model.setDirection(model.direction == .rightToLeft ? .leftToRight : .rightToLeft)
         model.bumpChrome()
     }
 
