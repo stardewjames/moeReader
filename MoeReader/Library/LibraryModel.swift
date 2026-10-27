@@ -25,6 +25,13 @@ final class LibraryModel {
         self.caches = caches
 
         let fileManager = FileManager.default
+        #if DEBUG
+        let isUITesting = ProcessInfo.processInfo.arguments.contains("-ui-testing")
+        if isUITesting {
+            try? fileManager.removeItem(at: LibraryPaths.root(documents: documents))
+            try? fileManager.removeItem(at: LibraryPaths.coversDirectory(caches: caches))
+        }
+        #endif
         try? fileManager.createDirectory(
             at: LibraryPaths.root(documents: documents),
             withIntermediateDirectories: true
@@ -42,7 +49,11 @@ final class LibraryModel {
         values.isExcludedFromBackup = true
         try? booksDirectory.setResourceValues(values)
 
+        #if DEBUG
+        self.books = isUITesting ? [] : Self.loadBooks(documents: documents)
+        #else
         self.books = Self.loadBooks(documents: documents)
+        #endif
     }
 
     func importURLs(_ urls: [URL]) async {
@@ -163,7 +174,13 @@ final class LibraryModel {
         errorMessage = nil
         pendingURLs.removeAll()
 
-        guard let fixture = Bundle.main.url(forResource: "mini", withExtension: "cbz") else {
+        let fixture = Bundle.main.url(forResource: "mini", withExtension: "cbz")
+            ?? Bundle.main.url(
+                forResource: "mini",
+                withExtension: "cbz",
+                subdirectory: "Resources"
+            )
+        guard let fixture else {
             Self.logger.error("UI-test fixture missing from app bundle")
             return
         }

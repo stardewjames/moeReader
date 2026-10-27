@@ -35,6 +35,8 @@ targets:
       path: MoeReader/Info.plist
       properties:
         CFBundleDisplayName: MoeReader
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

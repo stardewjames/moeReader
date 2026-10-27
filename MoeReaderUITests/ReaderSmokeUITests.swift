@@ -16,6 +16,12 @@ final class ReaderSmokeUITests: XCTestCase {
         if importing.exists {
             XCTAssertTrue(importing.waitForNonExistence(timeout: 30))
         }
+        let hittable = expectation(
+            for: NSPredicate(format: "isHittable == true"),
+            evaluatedWith: tile
+        )
+        wait(for: [hittable], timeout: 30)
+        Thread.sleep(forTimeInterval: 0.5)
         attachScreenshot(named: "01-library")
 
         tile.tap()
@@ -23,6 +29,7 @@ final class ReaderSmokeUITests: XCTestCase {
         let indicator = app.staticTexts["reader.pageIndicator"]
         XCTAssertTrue(indicator.waitForExistence(timeout: 20))
         XCTAssertEqual(indicator.label, "1 / 3")
+        Thread.sleep(forTimeInterval: 0.5)
         attachScreenshot(named: "02-reader-page-1")
 
         app.swipeRight()
