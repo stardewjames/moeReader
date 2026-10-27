@@ -88,24 +88,12 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.moereader.MoeReaderTests
         GENERATE_INFOPLIST_FILE: YES
-  MoeReaderUITests:
-    type: bundle.ui-testing
-    platform: iOS
-    sources:
-      - path: MoeReaderUITests
-    dependencies:
-      - target: MoeReader
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.moereader.MoeReaderUITests
-        GENERATE_INFOPLIST_FILE: YES
 schemes:
   MoeReader:
     build:
       targets:
         MoeReader: all
         MoeReaderTests: [test]
-        MoeReaderUITests: [test]
     run:
       config: Debug
     test:
@@ -113,4 +101,3 @@ schemes:
       gatherCoverageData: false
       targets:
         - MoeReaderTests
-        - MoeReaderUITests

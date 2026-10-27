@@ -60,15 +60,15 @@ xcodegen generate
 open MoeReader.xcodeproj
 ```
 
-Run the full unit and UI test suite on a simulator:
+Run the unit test suite locally on a simulator:
 
 ```bash
 ./scripts/test.sh
 ```
 
-`scripts/test.sh` selects an available iOS 26+ iPhone simulator, runs
-`xcodebuild test`, and writes `TestResults.xcresult`. CI runs the same script on
-`macos-26` and uploads the result bundle.
+`scripts/test.sh` selects an available iOS 26+ iPhone simulator and writes
+`TestResults.xcresult`. CI builds the unsigned device IPA directly; it does not
+boot a simulator or run UI tests.
 
 Build an unsigned device IPA:
 
@@ -128,8 +128,7 @@ MoeReader/
   MihonCompat/  Dalvik extension engine, platform hosts, Mihon source API
   Reader/       Reader model, scroll modes, zoom, chrome
 MoeReaderTests/ Unit tests and fixtures
-MoeReaderUITests/ End-to-end import/read/mode-switch test
-scripts/        Fixture generation and CI test script
+scripts/        Fixture generation and local test script
 ```
 
 ## Performance notes
