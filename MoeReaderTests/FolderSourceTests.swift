@@ -5,9 +5,9 @@ import XCTest
 final class FolderSourceTests: XCTestCase {
     func testRecursiveImagesAreFilteredAndSorted() throws {
         let archive = try ZIPArchive(url: TestFixtures.url("mini", "cbz"))
-        let red = archive.payload(at: 0).cfData as Data
-        let green = archive.payload(at: 1).cfData as Data
-        let blue = archive.payload(at: 2).cfData as Data
+        let red = (try archive.payload(at: 0)).cfData as Data
+        let green = (try archive.payload(at: 1)).cfData as Data
+        let blue = (try archive.payload(at: 2)).cfData as Data
 
         let root = try TestFixtures.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
