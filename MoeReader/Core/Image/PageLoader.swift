@@ -38,7 +38,7 @@ actor PageLoader {
 
         let source = self.source
         let cache = self.cache
-        let task = Task.detached(priority: .userInitiated) { () -> DecodedImage? in
+        let task = Task.detached(priority: .userInitiated) { () async -> DecodedImage? in
             let state = Signpost.reader.beginInterval(
                 "decode-page", id: Signpost.reader.makeSignpostID()
             )
