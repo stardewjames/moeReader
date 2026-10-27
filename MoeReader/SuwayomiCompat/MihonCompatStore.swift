@@ -6,7 +6,7 @@ actor MihonCompatStore {
         var installed: [MihonInstalledExtension]
     }
 
-    let baseDirectory: URL
+    nonisolated let baseDirectory: URL
     private let service: MihonRepositoryService
     private var repositories: [MihonRepository]
     private var installed: [MihonInstalledExtension]
@@ -198,7 +198,9 @@ actor MihonCompatStore {
     }
 
     nonisolated func apkURL(for installedExtension: MihonInstalledExtension) -> URL {
-        extensionsDirectory.appendingPathComponent(installedExtension.apkFileName)
+        baseDirectory
+            .appendingPathComponent("Extensions", isDirectory: true)
+            .appendingPathComponent(installedExtension.apkFileName)
     }
 
     func repository(for installedExtension: MihonInstalledExtension) -> MihonRepository? {
