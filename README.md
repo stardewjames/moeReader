@@ -62,7 +62,8 @@ file as the `MoeReader-unsigned-ipa` artifact.
 
 ### Install with Sideloadly
 
-1. Download `MoeReader.ipa` from the latest green CI run's artifacts.
+1. Download the `MoeReader-unsigned-ipa` artifact from the latest green CI run
+   and unzip it to get `MoeReader.ipa`.
 2. Connect an iPhone or iPad running iOS 26 or later.
 3. Open Sideloadly, select the IPA, enter your Apple ID, and install.
 
