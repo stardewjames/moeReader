@@ -35,6 +35,7 @@ enum NativeLibrary {
         result += PlatformRuntime.classes()
         result += JavaTimeRuntime.classes()
         result += JavaShared.classes()
+        result += FileRuntime.classes()
         return result
     }
 }

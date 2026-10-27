@@ -169,16 +169,37 @@ final class MihonEngine: @unchecked Sendable {
     }
 
     func search(sourceIndex: Int, query: String, page: Int) throws -> (items: [MihonManga], hasMore: Bool) {
+        try search(sourceIndex: sourceIndex, query: query, page: page, selections: [:])
+    }
+
+    func search(
+        sourceIndex: Int,
+        query: String,
+        page: Int,
+        selections: [String: MihonFilterSelection]
+    ) throws -> (items: [MihonManga], hasMore: Bool) {
         runtime.resetBudget()
         defer { recycleIfNeeded() }
         let source = try source(at: sourceIndex)
         let filters = try filterList(source: source)
+        MihonFilters.apply(runtime: runtime, list: filters, selections: selections)
         let result = try callSuspend(
             source,
             "getSearchManga(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
             [.int32(Int32(page)), runtime.newString(query), filters]
         )
         return try mangasPage(result)
+    }
+
+    /// Snapshot of the source's filter list for the filter UI. Each filter's
+    /// `id` is its positional path in the tree, which is also the key used by
+    /// `search(...selections:)`.
+    func filterTree(sourceIndex: Int) throws -> [MihonFilter] {
+        runtime.resetBudget()
+        defer { recycleIfNeeded() }
+        let source = try source(at: sourceIndex)
+        let list = try filterList(source: source)
+        return MihonFilters.tree(runtime: runtime, list: list)
     }
 
     func manga(sourceIndex: Int, url: String) throws -> MihonManga {
@@ -231,10 +252,19 @@ final class MihonEngine: @unchecked Sendable {
         var pages: [MihonPage] = []
         for (index, item) in items.enumerated() {
             guard let payload: VMPagePayload = runtime.payload(item, as: VMPagePayload.self) else { continue }
-            let urlText = runtime.stringValue(payload.imageUrl.bits != 0 ? payload.imageUrl : payload.url) ?? ""
+            var resolved = payload.imageUrl
+            if resolved.bits == 0 {
+                resolved = try callSuspend(
+                    source,
+                    "getImageUrl(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+                    [item]
+                )
+                if resolved.bits != 0 { payload.imageUrl = resolved }
+            }
+            let urlText = runtime.stringValue(resolved.bits != 0 ? resolved : payload.url) ?? ""
             guard let url = URL(string: urlText) else { continue }
             var headers: [String: String] = [:]
-            if payload.imageUrl.bits != 0, let request = imageRequestHeaders(source: source, page: item) {
+            if let request = imageRequestHeaders(source: source, page: item) {
                 headers = request
             }
             pages.append(MihonPage(index: index, url: url, headers: headers))
@@ -262,36 +292,30 @@ final class MihonEngine: @unchecked Sendable {
         }
         let stored = runtime.host?.preferences()
         var result: [MihonEnginePreference] = []
-        func flatten(_ child: VMValue, into output: inout [MihonEnginePreference]) {
-            guard let pref: VMUiPreferencePayload = runtime.payload(child, as: VMUiPreferencePayload.self) else { return }
-            if !pref.title.isEmpty || !pref.key.isEmpty {
-                var value = pref.value
-                if !pref.key.isEmpty, let stored, stored.allKeys().contains(pref.key) {
-                    if let text = stored.string(forKey: pref.key) {
-                        value = text
-                    } else if stored.bool(forKey: pref.key) {
-                        value = "true"
-                    } else {
-                        value = String(stored.int(forKey: pref.key))
-                    }
+        func collect(_ children: [VMValue]) {
+            for child in children {
+                guard let pref: VMUiPreferencePayload = runtime.payload(child, as: VMUiPreferencePayload.self) else { continue }
+                if let preference = sourcePreference(pref, stored: stored) {
+                    result.append(preference)
                 }
-                output.append(MihonEnginePreference(
-                    key: pref.key,
-                    title: pref.title,
-                    summary: pref.summary,
-                    kind: pref.key.isEmpty ? .header : pref.kind,
-                    entries: pref.entries,
-                    entryValues: pref.entryValues,
-                    value: value
-                ))
+                collect(pref.children)
             }
-            for nested in pref.children { flatten(nested, into: &output) }
         }
-        for child in payload.children {
-            guard let pref: VMUiPreferencePayload = runtime.payload(child, as: VMUiPreferencePayload.self) else { continue }
-            if pref.title.isEmpty, pref.key.isEmpty, pref.children.isEmpty { continue }
-            var value = pref.value
-            if !pref.key.isEmpty, let stored, stored.allKeys().contains(pref.key) {
+        collect(payload.children)
+        return result
+    }
+
+    private func sourcePreference(
+        _ pref: VMUiPreferencePayload,
+        stored: VMPreferences?
+    ) -> MihonEnginePreference? {
+        guard !pref.title.isEmpty || !pref.key.isEmpty else { return nil }
+        var value = pref.value
+        var values = pref.values.sorted()
+        if !pref.key.isEmpty, let stored {
+            if pref.kind == .multiSelect {
+                if let set = stored.stringSet(forKey: pref.key) { values = set.sorted() }
+            } else if stored.allKeys().contains(pref.key) {
                 if let text = stored.string(forKey: pref.key) {
                     value = text
                 } else if stored.bool(forKey: pref.key) {
@@ -300,30 +324,34 @@ final class MihonEngine: @unchecked Sendable {
                     value = String(stored.int(forKey: pref.key))
                 }
             }
-            if !pref.title.isEmpty || !pref.key.isEmpty {
-                result.append(MihonEnginePreference(
-                    key: pref.key,
-                    title: pref.title,
-                    summary: pref.summary,
-                    kind: pref.key.isEmpty ? .header : pref.kind,
-                    entries: pref.entries,
-                    entryValues: pref.entryValues,
-                    value: value
-                ))
-            }
-            for nested in pref.children { flatten(nested, into: &result) }
         }
-        return result
+        return MihonEnginePreference(
+            key: pref.key,
+            title: pref.title,
+            summary: pref.summary,
+            dialogTitle: pref.dialogTitle,
+            kind: pref.key.isEmpty ? .header : pref.kind,
+            entries: pref.entries,
+            entryValues: pref.entryValues,
+            value: value,
+            values: values
+        )
     }
 
-    func setPreference(sourceIndex: Int, key: String, value: String, kind: MihonEnginePreference.Kind = .text) throws {
+    func setPreference(
+        sourceIndex: Int,
+        key: String,
+        value: String,
+        values: [String] = [],
+        kind: MihonEnginePreference.Kind = .text
+    ) throws {
         _ = try source(at: sourceIndex)
         guard !key.isEmpty, let preferences = runtime.host?.preferences() else { return }
         switch kind {
+        case .multiSelect:
+            preferences.setStringSet(Set(values), forKey: key)
         case .toggle:
             preferences.setBool(value == "true", forKey: key)
-        case .multiSelect:
-            preferences.setString(value, forKey: key)
         case .text, .list, .header:
             preferences.setString(value, forKey: key)
         }
@@ -391,10 +419,22 @@ final class MihonEngine: @unchecked Sendable {
             description: runtime.stringValue(payload.description),
             author: runtime.stringValue(payload.author),
             artist: runtime.stringValue(payload.artist),
-            status: payload.status == 2 ? "Completed" : (payload.status == 1 ? "Ongoing" : nil),
+            status: statusName(payload.status),
             genres: convertGenres(payload),
             language: runtime.stringValue(payload.language)
         )
+    }
+
+    private func statusName(_ status: Int32) -> String? {
+        switch status {
+        case 1: return "Ongoing"
+        case 2: return "Completed"
+        case 3: return "Licensed"
+        case 4: return "Publishing finished"
+        case 5: return "Cancelled"
+        case 6: return "On hiatus"
+        default: return nil
+        }
     }
 
     private func convertGenres(_ payload: VMMangaPayload) -> [String] {

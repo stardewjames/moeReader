@@ -571,6 +571,19 @@ enum KotlinRuntime {
         collections.staticMethod("firstOrNull", "(Ljava/lang/Iterable;)Ljava/lang/Object;") { runtime, args, _ in
             runtime.listItems(args[0])?.first ?? .null
         }
+        collections.staticMethod("maxWithOrThrow", "(Ljava/lang/Iterable;Ljava/util/Comparator;)Ljava/lang/Object;") { runtime, args, _ in
+            guard var best = runtime.listItems(args[0])?.first else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Collection is empty.")
+            }
+            guard let comparator = runtime.classOf(args[1]),
+                  let compare = comparator.lookupVirtual(key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I") else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "invalid comparator")
+            }
+            for item in (runtime.listItems(args[0]) ?? []).dropFirst() {
+                if try runtime.invoke(compare, [args[1], item, best]).asInt32 > 0 { best = item }
+            }
+            return best
+        }
         collections.staticMethod("first", "(Ljava/lang/Iterable;)Ljava/lang/Object;") { runtime, args, _ in
             guard let first = runtime.listItems(args[0])?.first else {
                 let cls = runtime.classOf(args[0])?.displayName ?? "null"
@@ -1054,6 +1067,20 @@ enum KotlinRuntime {
         arrays.staticMethod("isNotEmpty", "([Ljava/lang/Object;)Z") { runtime, args, _ in .boolean(runtime.arrayLength(args[0]) > 0) }
         arrays.staticMethod("isEmpty", "([Ljava/lang/Object;)Z") { runtime, args, _ in .boolean(runtime.arrayLength(args[0]) == 0) }
         arrays.staticMethod("getOrNull", "([Ljava/lang/Object;I)Ljava/lang/Object;") { runtime, args, _ in runtime.arrayElement(args[0], Int(args[1].asInt32)) }
+        arrays.staticMethod("zip", "([Ljava/lang/Object;[Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
+            let count = min(runtime.arrayLength(args[0]), runtime.arrayLength(args[1]))
+            var pairs: [VMValue] = []
+            for index in 0..<count {
+                pairs.append(runtime.makeNative(
+                    "Lkotlin/Pair;",
+                    payload: VMPairPayload(
+                        first: runtime.arrayElement(args[0], index),
+                        second: runtime.arrayElement(args[1], index)
+                    )
+                ))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(pairs))
+        }
         result.append(arrays)
 
         return result
@@ -1077,6 +1104,20 @@ enum KotlinRuntime {
         }
         strings.staticMethod("isNotEmpty", "(Ljava/lang/CharSequence;)Z") { runtime, args, _ in
             .boolean(!(runtime.stringUnits(args[0])?.isEmpty ?? true))
+        }
+        strings.staticMethod("firstOrNull", "(Ljava/lang/CharSequence;)Ljava/lang/Character;") { runtime, args, _ in
+            guard let first = runtime.stringUnits(args[0])?.first,
+                  let cls = runtime.findClass("Ljava/lang/Character;") else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.setAux(pointer, UInt64(first))
+            return .reference(pointer)
+        }
+        strings.staticMethod("lastOrNull", "(Ljava/lang/CharSequence;)Ljava/lang/Character;") { runtime, args, _ in
+            guard let last = runtime.stringUnits(args[0])?.last,
+                  let cls = runtime.findClass("Ljava/lang/Character;") else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.setAux(pointer, UInt64(last))
+            return .reference(pointer)
         }
         strings.staticMethod("trim", "(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;") { runtime, args, _ in
             runtime.newString((runtime.stringValue(args[0]) ?? "").trimmingCharacters(in: .whitespaces))
@@ -1821,6 +1862,13 @@ enum KotlinRuntime {
             return runtime.newString(ISO8601DateFormatter().string(from: date))
         }
         instant.staticMethod("now", "()J") { _, _, _ in .int64(Int64(Date().timeIntervalSince1970 * 1000)) }
+        instant.method("toEpochMilliseconds", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? args[0].asInt64)
+        }
+        instant.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let millis = runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0
+            return runtime.newString(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(millis) / 1000)))
+        }
         result.append(instant)
         let instantCompanion = NativeClass("Lkotlin/time/Instant$Companion;", superclass: "Ljava/lang/Object;")
         instantCompanion.method("fromEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
@@ -1831,6 +1879,16 @@ enum KotlinRuntime {
             runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: Int64(Date().timeIntervalSince1970 * 1000)))
         }
         instantCompanion.method("getEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
+        instantCompanion.method("parse", "(Ljava/lang/CharSequence;)Lkotlin/time/Instant;") { runtime, args, _ in
+            guard let millis = parseInstantMillis(runtime.stringValue(args[1]) ?? "") else {
+                throw VMJavaException("Ljava/time/format/DateTimeParseException;", "invalid instant")
+            }
+            return runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: millis))
+        }
+        instantCompanion.method("parseOrNull", "(Ljava/lang/CharSequence;)Lkotlin/time/Instant;") { runtime, args, _ in
+            guard let millis = parseInstantMillis(runtime.stringValue(args[1]) ?? "") else { return .null }
+            return runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: millis))
+        }
         result.append(instantCompanion)
 
         let instantConversions = NativeClass("Lkotlin/time/jdk8/InstantConversionsJDK8Kt;")
@@ -1988,4 +2046,17 @@ extension VMRuntime {
         }
         throw VMJavaException("Ljava/lang/NoSuchMethodError;", key)
     }
+}
+
+private func parseInstantMillis(_ text: String) -> Int64? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: text) {
+        return Int64((date.timeIntervalSince1970 * 1000).rounded())
+    }
+    formatter.formatOptions = [.withInternetDateTime]
+    if let date = formatter.date(from: text) {
+        return Int64((date.timeIntervalSince1970 * 1000).rounded())
+    }
+    return nil
 }

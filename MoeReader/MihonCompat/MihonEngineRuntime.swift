@@ -23,6 +23,7 @@ final class MihonEngineHost: VMHost {
     private let session: URLSession
     private let preferencesStore: VMPreferences
     private let logHandler: (String) -> Void
+    private let fileRoot: String
 
     init(prefix: String, log: @escaping (String) -> Void) {
         let configuration = URLSessionConfiguration.ephemeral
@@ -34,7 +35,13 @@ final class MihonEngineHost: VMHost {
         self.session = URLSession(configuration: configuration)
         self.preferencesStore = VMUserDefaultsPreferences(prefix: prefix)
         self.logHandler = log
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("MihonCompat/Files", isDirectory: true)
+            ?? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MihonCompat/Files", isDirectory: true)
+        self.fileRoot = base.appendingPathComponent(prefix, isDirectory: true).path
     }
+
+    func extensionFileRoot() -> String { fileRoot }
 
     func performRequest(_ request: VMHTTPRequest) throws -> VMHTTPResponse {
         guard let url = URL(string: request.url) else {
@@ -112,9 +119,13 @@ final class VMUserDefaultsPreferences: VMPreferences {
     func string(forKey key: String) -> String? { defaults.string(forKey: key) }
     func bool(forKey key: String) -> Bool { defaults.bool(forKey: key) }
     func int(forKey key: String) -> Int { defaults.integer(forKey: key) }
+    func stringSet(forKey key: String) -> Set<String>? {
+        defaults.stringArray(forKey: key).map(Set.init)
+    }
     func setString(_ value: String, forKey key: String) { defaults.set(value, forKey: key) }
     func setBool(_ value: Bool, forKey key: String) { defaults.set(value, forKey: key) }
     func setInt(_ value: Int, forKey key: String) { defaults.set(value, forKey: key) }
+    func setStringSet(_ value: Set<String>, forKey key: String) { defaults.set(Array(value).sorted(), forKey: key) }
     func allKeys() -> [String] { Array(defaults.dictionaryRepresentation().keys) }
     func removeValue(forKey key: String) { defaults.removeObject(forKey: key) }
 }
@@ -153,10 +164,16 @@ final class MihonEnginePool: @unchecked Sendable {
 
 protocol MihonSourcePreferencesProviding: Sendable {
     func preferences(source: MihonSource) async throws -> [MihonEnginePreference]
-    func setPreference(key: String, value: String, kind: MihonEnginePreference.Kind, source: MihonSource) async throws
+    func setPreference(
+        key: String,
+        value: String,
+        values: [String],
+        kind: MihonEnginePreference.Kind,
+        source: MihonSource
+    ) async throws
 }
 
-final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProviding, @unchecked Sendable {
+final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProviding, MihonSourceFilterProviding, @unchecked Sendable {
     let descriptor: MihonRuntimeDescriptor
 
     private let packageName: String
@@ -200,9 +217,29 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
     }
 
     func search(query: String, source: MihonSource, page: Int) async throws -> MihonMangaPage {
+        try await search(query: query, source: source, page: page, selections: [:])
+    }
+
+    func search(
+        query: String,
+        source: MihonSource,
+        page: Int,
+        selections: [String: MihonFilterSelection]
+    ) async throws -> MihonMangaPage {
         try await perform(source: source) { engine, index in
-            let result = try engine.search(sourceIndex: index, query: query, page: page)
+            let result = try engine.search(
+                sourceIndex: index,
+                query: query,
+                page: page,
+                selections: selections
+            )
             return MihonMangaPage(items: result.items, hasMore: result.hasMore)
+        }
+    }
+
+    func filters(source: MihonSource) async throws -> [MihonFilter] {
+        try await perform(source: source) { engine, index in
+            try engine.filterTree(sourceIndex: index)
         }
     }
 
@@ -230,9 +267,15 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
         }
     }
 
-    func setPreference(key: String, value: String, kind: MihonEnginePreference.Kind, source: MihonSource) async throws {
+    func setPreference(
+        key: String,
+        value: String,
+        values: [String],
+        kind: MihonEnginePreference.Kind,
+        source: MihonSource
+    ) async throws {
         try await perform(source: source) { engine, index in
-            try engine.setPreference(sourceIndex: index, key: key, value: value, kind: kind)
+            try engine.setPreference(sourceIndex: index, key: key, value: value, values: values, kind: kind)
         }
     }
 

@@ -20,6 +20,11 @@ protocol VMHost: AnyObject {
 
 extension VMHost {
     func solveChallenge(_ request: VMHTTPRequest) throws -> Bool { false }
+    /// Per-extension writable directory used by `java.io.File` and okio.
+    /// Hosts may override this to keep extension data inside the app sandbox.
+    func extensionFileRoot() -> String {
+        (NSTemporaryDirectory() as NSString).appendingPathComponent("mihoncompat")
+    }
 }
 
 struct VMHTTPRequest {
@@ -41,9 +46,11 @@ protocol VMPreferences: AnyObject {
     func string(forKey key: String) -> String?
     func bool(forKey key: String) -> Bool
     func int(forKey key: String) -> Int
+    func stringSet(forKey key: String) -> Set<String>?
     func setString(_ value: String, forKey key: String)
     func setBool(_ value: Bool, forKey key: String)
     func setInt(_ value: Int, forKey key: String)
+    func setStringSet(_ value: Set<String>, forKey key: String)
     func allKeys() -> [String]
     func removeValue(forKey key: String)
 }

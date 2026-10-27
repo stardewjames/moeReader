@@ -39,7 +39,9 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/KotlinRuntime.swift` | Kotlin stdlib entry points, `Result`, `Lazy`, sequences, coroutines driving, Duration |
 | `Engine/OkHttpRuntime.swift` | okhttp3 objects and interceptors over the host transport |
 | `Engine/JsoupRuntime.swift` | HTML parser, DOM, CSS selector engine |
-| `Engine/MihonAPI.swift` | `Source`, `HttpSource`, models, filters, `SourceFactory`, network helpers |
+| `Engine/MihonAPI.swift` | `Source`, `HttpSource`, `ParsedHttpSource`, models, filters, `SourceFactory`, network helpers |
+| `Engine/MihonFilters.swift` | FilterList → plain filter tree, selection replay for searches |
+| `Engine/FileRuntime.swift` | `java.io.File`, okio file source/sink/buffer, `kotlin.io.FilesKt.resolve` |
 | `Engine/JavaTimeRuntime.swift` | `java.time` subset used for chapter dates |
 | `Engine/SerializationRuntime.swift` | kotlinx.serialization decode: JSON parser, generated/plugin descriptors, builtins, collections, enums, polymorphic fallback |
 | `Engine/PreferencesRuntime.swift` | androidx.preference model exposed to the source settings UI |
@@ -63,34 +65,44 @@ engine takes the second path so idle cost can be driven to near zero:
    switch) completes inline, so Kotlin state machines never return
    `COROUTINE_SUSPENDED`. A real asynchronous suspension is reported as an
    error instead of hanging.
-5. Results are copied into plain Swift models before the arena is recycled.
+5. When a source does not override a suspend call, `HttpSource` supplies the
+   deprecated helper pipeline itself: build `*Request`, execute it with the
+   source client, then run `*Parse`. `ParsedHttpSource` supplies the selector
+   and `fromElement` parsers, so request/parse-style extensions keep working
+   without RxJava in the host.
+6. Results are copied into plain Swift models before the arena is recycled.
 
 ## Native surface
 
 Everything an extension can call must exist in the native registry. The
-currently implemented surface is the one common lib-1.6 extensions use in
-practice:
+currently implemented surface covers request/parse-style lib-1.4/1.5 sources
+and the suspend lib-1.6 API in practice:
 
 - **Java**: `java.lang` core (UTF-16 strings, boxed values, Math, System),
-  `java.util` collections, `java.io` (byte streams), `java.time` parsing and
-  formatting, `java.lang.reflect.Field`, atomics, `ConcurrentHashMap`,
-  `ReentrantLock`.
+  `java.util` collections, `java.io` byte streams and `File` (metadata, mkdir,
+  rename, temp files, listing), `java.time` parsing and formatting,
+  `java.lang.reflect.Field`, atomics, `ConcurrentHashMap`, `ReentrantLock`.
 - **Kotlin**: `Intrinsics`, `Unit`, `Pair`/`Triple`, `Result`, `Lazy`,
-  collection/text/ranges helpers, sequences, `Regex`, `Duration`,
-  `kotlin.coroutines` internals, and the `kotlinx.coroutines` builders needed by
-  sources (`coroutineScope`, `async`/`await`, `withContext`, `launch`, `delay`).
+  collection/text/ranges helpers, sequences, `Regex`, `Duration`, `Instant`
+  (including `parseOrNull`), `kotlin.coroutines` internals, and the
+  `kotlinx.coroutines` builders needed by sources (`coroutineScope`,
+  `async`/`await`, `withContext`, `launch`, `delay`).
 - **Android**: `android.net.Uri`, `android.text.Html`, `android.util.Base64`,
-  `android.content` shared preferences, `androidx.preference` stubs for source
-  preference screens.
+  `android.content` shared preferences (including string sets),
+  `androidx.preference` controls for source preference screens.
 - **okhttp3**: `Request`/`Response`/`Headers`/`HttpUrl`, calls, client builders,
   interceptor chains, form bodies, cache control, compression markers.
+- **okio**: `BufferedSource`, `BufferedSink`, `Source`, `Sink`, `Buffer`, and
+  `Okio` factories over `java.io.File`.
 - **jsoup**: tolerant HTML parser, `Document`/`Element`/`Elements`, text and
-  attribute access, and a CSS selector engine (`>`, `+`, `~`, `:has`,
-  `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more).
-- **Mihon**: `Source`, `CatalogueSource`, `HttpSource`, `SourceFactory`,
-  `SManga`, `SChapter`, `Page`, `MangasPage`, `SMangaUpdate`, filters,
-  `FilterList`, `NetworkHelper`, `RequestsKt`, `OkHttpExtensionsKt`,
-  `JsoupExtensionsKt`, `AppInfo`.
+  attribute access, a CSS selector engine (`>`, `+`, `~`, `:has`,
+  `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), and the
+  `selectText`/`selectInt`/`attrOrText`/`asJsoup` helpers.
+- **Mihon**: `Source`, `CatalogueSource`, `HttpSource`, `ParsedHttpSource`,
+  `SourceFactory`, `SManga`, `SChapter`, `Page`, `MangasPage`, `SMangaUpdate`,
+  filters and `FilterList`, `NetworkHelper`, `RequestsKt`
+  (`GET`/`POST`/`PUT`/`DELETE`), `OkHttpExtensionsKt`, `JsoupExtensionsKt`,
+  `AppInfo`.
 
 Host-compat details are reproduced rather than approximated. For example
 Mihon's `HttpSource.headers` is delegated, so extensions replace
@@ -107,6 +119,12 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - `MihonEngineEdgeCaseTests` covers literal operand sources, `String` copy
   construction, array covariance, `clone`, unmodifiable collections, Java
   string/regex splitting, and positional/unknown Jsoup selectors.
+- `MihonAPIContractTests` covers the deprecated `HttpSource` request/parse
+  defaults, `ParsedHttpSource` selector parsers, legacy `imageUrlParse`
+  resolution, filter tree rehydration, string-set preferences, `java.io.File`
+  with okio, and JSON element conversion.
+- `scripts/analyze_compat.py` audits an APK's host API references against the
+  engine registry. See "Auditing the native surface" below.
 - An opt-in extension test runs a real lib-1.6 extension through the whole
   lifecycle: popular, details, chapter dates parsed through `java.time`, and
   page URLs. Site-specific fixtures and runners live in the ignored `SiteTests/`
@@ -133,9 +151,11 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 The engine runs extensions that stay inside the surface above. Edge behaviour
 that is explicitly covered: destination/source separation for literal
 operations, array covariance and store checks, `clone`, immutable collections,
-rounded `Int`/`Long`/`Char` conversion, preference defaults and removal,
-interceptor list views, `TimeUnit` conversions, JSON encode/decode, and JSON
-element map/array access. The runtime also resolves class methods before
+rounded `Int`/`Long`/`Char` conversion, preference defaults, removal and string
+sets, filter construction defaults and selection replay (text, checkbox,
+tri-state, select, sort, grouped filters), interceptor list views, `TimeUnit`
+conversions, JSON encode/decode and JSON element conversion, and file/okio
+round-trips under a per-extension root. The runtime also resolves class methods before
 interface defaults, boxes Kotlin `Duration`/`Instant`, reads response bodies
 through okio, handles `JsonNames` aliases, treats missing fields as null for
 tolerant API decoding, formats through `String.format`, and drives suspend
@@ -143,15 +163,41 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 
 | Gap | Effect |
 |---|---|
-| `kotlinx.serialization` | Decode and encode are implemented: generated serializers, nullable/default fields, lists/sets/maps, enums, polymorphic DTOs, JSON element access, and `Json.encodeToString`. Unsupported transforms (for example custom `buildJsonObject` DSLs) still return typed errors. |
+| `kotlinx.serialization` | Decode and encode are implemented: generated serializers, nullable/default fields, lists/sets/maps, enums, polymorphic DTOs, JSON element access, `decodeFromJsonElement`/`encodeToJsonElement`, and `Json.encodeToString`. Unsupported transforms (for example custom `buildJsonObject` DSLs) still return typed errors. |
 | Cloudflare / WebView challenges | Challenge detection and one-shot retry are implemented (`Server: cloudflare`, `cf-chl`, `cf-browser-verification`, `Just a moment`; 403/429/503). `MihonEngineHost` clears the challenge with an off-screen `WKWebView`, copies `cf_clearance` into `HTTPCookieStorage`, and retries. Verified with a mock host (challenge → clear → parse); the WKWebView path itself needs device verification. `CloudflareInterceptor` remains a pass-through. |
-| Image loading inside extensions | `Page.imageUrl` and `imageRequest` are honoured; extensions that decode images themselves are not. |
-| Source preference screens | `setupPreferenceScreen` is executed and its controls are rendered by `MihonSourceSettingsView` (headers, toggles, single-choice lists, text). Multi-select entries are shown as text until a dedicated control lands. Edits persist through `SharedPreferences`, which the extension reads on its next call. |
-| Extension lib 1.4 API | Not targeted. The loader reads lib 1.6 metadata; older request/parse-style extensions are not executed. |
+| Image loading inside extensions | `Page.imageUrl`, `getImageUrl`, legacy `imageUrlParse`, and `imageRequest` headers are honoured for reader pages. Extensions that decode or transcode images themselves are not. |
+| Source preference screens | `setupPreferenceScreen` is executed and its controls are rendered by `MihonSourceSettingsView` (headers, toggles, single-choice lists, text, multi-select). Multi-select values persist as string sets in `SharedPreferences`; `setDialogTitle` is used as the text field's placeholder. |
+| Extension lib 1.4/1.5 API | Request/parse-style sources are supported through native `HttpSource` and `ParsedHttpSource` defaults, even when they predate the suspend API. Extensions that override only the RxJava `fetch*` methods still need an Rx host and are not executed. |
+| Zstd response bodies | `com.squareup.zstd.okio` is not linked; servers that require zstd transcoding fail closed with a typed error. |
 | Reflection beyond fields | `getDeclaredField` works; arbitrary method/handle reflection does not. |
 
 Unsupported APIs fail closed with a typed error. The engine never guesses at a
 method's behaviour.
+
+## Auditing the native surface
+
+`scripts/analyze_compat.py` reads every external class/method an extension APK
+references and compares it with the engine. It has two registry sources:
+
+- **Static** (default): parses the `NativeClass` registrations in `Engine/`.
+  Fast, but unaware of classes produced by helper factories and inheritance.
+- **Runtime**: uses a JSON dump of the exact registry, including superclass and
+  interface links. Produce one with the opt-in test, then pass it in:
+
+Run `MihonAPIContractTests/testDumpNativeSurfaceForAudits` with
+`MOEREADER_DUMP_ENGINE_API` set in the test process environment (for example,
+in the scheme's Test action environment), then:
+
+```bash
+python3 scripts/analyze_compat.py --registry /tmp/engine-surface.json path/to/extension.apk
+```
+
+The report groups missing classes by package and lists missing methods on
+registered classes. Interface and superclass methods count as present when a
+concrete registered implementation provides them, matching virtual dispatch.
+It is an audit input, not a compatibility claim: code paths that never execute
+do not need support. Keep APKs and generated reports out of the repository;
+they identify a specific site.
 
 ## Performance notes
 
@@ -183,6 +229,9 @@ per source operation.
   instruction budget.
 - There is no JIT, no dynamic code loading and no private API use; the engine is
   plain Swift running in the app's sandbox.
+- Relative extension file paths are rooted at
+  `Caches/MihonCompat/Files/<package>` and cannot escape it; absolute paths
+  remain limited by the iOS sandbox. Caches is excluded from backup.
 - Native methods can throw Java exceptions but cannot escape the engine's
   serial queue.
 

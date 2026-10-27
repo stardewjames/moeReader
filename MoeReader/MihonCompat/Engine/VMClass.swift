@@ -290,6 +290,21 @@ final class VMClass {
         return nil
     }
 
+    /// True when the first concrete implementation of `key` belongs to a class
+    /// other than `ownerDescriptor`. Used by native defaults that only need to
+    /// do extra work when an extension (or an intermediate host class) overrides
+    /// a helper.
+    func hasImplementation(key: String, excluding ownerDescriptor: String) -> Bool {
+        var cursor: VMClass? = self
+        while let cls = cursor {
+            if let method = cls.methods[key], !method.isStatic, !method.isAbstract {
+                return cls.descriptor != ownerDescriptor
+            }
+            cursor = cls.superclass
+        }
+        return false
+    }
+
     private func findInterfaceDefault(_ key: String) -> VMMethod? {
         var stack = interfaces
         var seen: Set<ObjectIdentifier> = []

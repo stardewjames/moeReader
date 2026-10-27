@@ -643,6 +643,11 @@ enum JavaCore {
         cls.staticMethod("parseBoolean", "(Ljava/lang/String;)Z") { runtime, args, _ in
             .boolean((runtime.stringValue(args[0]) ?? "").lowercased() == "true")
         }
+        cls.staticMethod("hashCode", "(Z)I") { _, args, _ in .int32(args[0].asBoolean ? 1231 : 1237) }
+        cls.staticMethod("compare", "(ZZ)I") { _, args, _ in
+            let left = args[0].asBoolean ? 1 : 0, right = args[1].asBoolean ? 1 : 0
+            return .int32(Int32(left - right))
+        }
         cls.method("hashCode", "()I") { _, args, _ in .int32(args[0].asBoolean2() ? 1231 : 1237) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in
             .boolean(args[1].bits != 0 && args[0].asBoolean2() == args[1].asBoolean2())

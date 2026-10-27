@@ -108,6 +108,7 @@ enum JavaUtil {
             ("contains", "(Ljava/lang/Object;)Z"),
             ("iterator", "()Ljava/util/Iterator;"),
             ("toArray", "()[Ljava/lang/Object;"),
+            ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
             ("add", "(Ljava/lang/Object;)Z"),
             ("remove", "(Ljava/lang/Object;)Z"),
             ("addAll", "(Ljava/util/Collection;)Z"),
@@ -250,6 +251,24 @@ enum JavaUtil {
         queue.method("peek", "()Ljava/lang/Object;") { _, _, _ in .null }
         let abstractCollection = NativeClass("Ljava/util/AbstractCollection;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/Collection;"])
         abstractCollection.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.collectionToString(args[0]) }
+        abstractCollection.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listItems(args[0]) ?? []
+            let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
+            for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+            return array
+        }
+        abstractCollection.method("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listItems(args[0]) ?? []
+            let capacity = runtime.arrayLength(args[1])
+            guard capacity >= items.count else {
+                let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
+                for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+                return array
+            }
+            for (index, item) in items.enumerated() { runtime.setArrayElement(args[1], index: index, value: item) }
+            if capacity > items.count { runtime.setArrayElement(args[1], index: items.count, value: .null) }
+            return args[1]
+        }
         return [cls, deque, queue, abstractCollection]
     }
 
@@ -329,7 +348,7 @@ enum JavaUtil {
             return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(items))
         }
         cls.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
-            let items = runtime.listPayload(args[0])?.items ?? []
+            let items = runtime.listItems(args[0]) ?? []
             let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
             for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
             return array

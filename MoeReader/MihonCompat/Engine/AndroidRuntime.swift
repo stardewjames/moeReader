@@ -13,9 +13,11 @@ final class VMInMemoryPreferences: VMPreferences {
     func string(forKey key: String) -> String? { values[key] as? String }
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
     func int(forKey key: String) -> Int { values[key] as? Int ?? 0 }
+    func stringSet(forKey key: String) -> Set<String>? { values[key] as? Set<String> }
     func setString(_ value: String, forKey key: String) { values[key] = value }
     func setBool(_ value: Bool, forKey key: String) { values[key] = value }
     func setInt(_ value: Int, forKey key: String) { values[key] = value }
+    func setStringSet(_ value: Set<String>, forKey key: String) { values[key] = value }
     func allKeys() -> [String] { Array(values.keys) }
     func removeValue(forKey key: String) { values.removeValue(forKey: key) }
 }
@@ -53,6 +55,7 @@ enum AndroidRuntime {
         prefs.method("getBoolean", "(Ljava/lang/String;Z)Z") { _, _, _ in .boolean(false) }
         prefs.method("getInt", "(Ljava/lang/String;I)I") { _, _, _ in .int32(0) }
         prefs.method("getLong", "(Ljava/lang/String;J)J") { _, _, _ in .int64(0) }
+        prefs.method("getStringSet", "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;") { _, args, _ in args[2] }
         prefs.method("edit", "()Landroid/content/SharedPreferences$Editor;") { _, _, _ in .null }
         result.append(prefs)
 
@@ -95,14 +98,20 @@ enum AndroidRuntime {
             if let text = payload.preferences.string(forKey: key), let value = Int64(text) { return .int64(value) }
             return .int64(Int64(payload.preferences.int(forKey: key)))
         }
-        impl.method("getStringSet", "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;") { _, args, _ in args[2] }
+        impl.method("getStringSet", "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;") { runtime, args, _ in
+            let payload: VMSharedPreferencesPayload = try runtime.payloadBox(args[0])
+            let key = runtime.stringValue(args[1]) ?? ""
+            guard let stored = payload.preferences.stringSet(forKey: key) else { return args[2] }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(stored.map { runtime.newString($0) }))
+        }
         impl.method("edit", "()Landroid/content/SharedPreferences$Editor;") { runtime, args, _ in
             let payload: VMSharedPreferencesPayload = try runtime.payloadBox(args[0])
             return runtime.makeNative("Lmihoncompat/EditorImpl;", payload: VMEditorPayload(preferences: payload.preferences))
         }
         impl.method("contains", "(Ljava/lang/String;)Z") { runtime, args, _ in
             let payload: VMSharedPreferencesPayload = try runtime.payloadBox(args[0])
-            return .boolean(payload.preferences.string(forKey: runtime.stringValue(args[1]) ?? "") != nil)
+            let key = runtime.stringValue(args[1]) ?? ""
+            return .boolean(payload.preferences.allKeys().contains(key))
         }
         impl.method("getAll", "()Ljava/util/Map;") { runtime, args, _ in
             let payload: VMSharedPreferencesPayload = try runtime.payloadBox(args[0])
@@ -132,7 +141,12 @@ enum AndroidRuntime {
             payload.values[runtime.stringValue(args[1]) ?? ""] = Int(args[2].asInt64)
             return args[0]
         }
-        editorImpl.method("putStringSet", "(Ljava/lang/String;Ljava/util/Set;)Landroid/content/SharedPreferences$Editor;") { _, args, _ in args[0] }
+        editorImpl.method("putStringSet", "(Ljava/lang/String;Ljava/util/Set;)Landroid/content/SharedPreferences$Editor;") { runtime, args, _ in
+            let payload: VMEditorPayload = try runtime.payloadBox(args[0])
+            let key = runtime.stringValue(args[1]) ?? ""
+            payload.values[key] = Set((runtime.listItems(args[2]) ?? []).compactMap { runtime.stringValue($0) })
+            return args[0]
+        }
         editorImpl.method("remove", "(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;") { runtime, args, _ in
             let payload: VMEditorPayload = try runtime.payloadBox(args[0])
             payload.removals.insert(runtime.stringValue(args[1]) ?? "")
@@ -163,6 +177,19 @@ enum AndroidRuntime {
             runtime.makeNative("Lmihoncompat/SharedPreferencesImpl;", payload: VMSharedPreferencesPayload(preferences: runtime.host?.preferences() ?? VMInMemoryPreferences()))
         }
         context.method("getPackageName", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("com.moereader.MoeReader") }
+        context.method("getCacheDir", "()Ljava/io/File;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/io/File;",
+                payload: VMFilePayload(path: FileRuntime.join(runtime.extensionFileRoot(), "cache"))
+            )
+        }
+        context.method("getFilesDir", "()Ljava/io/File;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/io/File;",
+                payload: VMFilePayload(path: FileRuntime.join(runtime.extensionFileRoot(), "files"))
+            )
+        }
+        context.method("startActivity", "(Landroid/content/Intent;)V") { _, _, _ in .zero }
         context.method("getApplicationContext", "()Landroid/content/Context;") { runtime, args, _ in args[0] }
         context.method("getAssets", "()Landroid/content/res/AssetManager;") { runtime, _, _ in
             runtime.makeNative("Landroid/content/res/AssetManager;", payload: NSNull())
@@ -203,7 +230,12 @@ enum AndroidRuntime {
             if let text = prefs.string(forKey: key), let value = Int64(text) { return .int64(value) }
             return .int64(Int64(prefs.int(forKey: key)))
         }
-        application.method("getStringSet", "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;") { _, args, _ in args[2] }
+        application.method("getStringSet", "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;") { runtime, args, _ in
+            let prefs = runtime.host?.preferences() ?? VMInMemoryPreferences()
+            let key = runtime.stringValue(args[1]) ?? ""
+            guard let stored = prefs.stringSet(forKey: key) else { return args[2] }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(stored.map { runtime.newString($0) }))
+        }
         application.method("edit", "()Landroid/content/SharedPreferences$Editor;") { runtime, _, _ in
             runtime.makeNative("Lmihoncompat/EditorImpl;", payload: VMEditorPayload(preferences: runtime.host?.preferences() ?? VMInMemoryPreferences()))
         }
@@ -219,6 +251,26 @@ enum AndroidRuntime {
 
         let wrapper = NativeClass("Landroid/content/ContextWrapper;", superclass: "Landroid/content/Context;")
         wrapper.method("<init>", "(Landroid/content/Context;)V") { _, _, _ in .zero }
+        wrapper.method("getSharedPreferences", "(Ljava/lang/String;I)Landroid/content/SharedPreferences;") { runtime, _, _ in
+            runtime.makeNative(
+                "Lmihoncompat/SharedPreferencesImpl;",
+                payload: VMSharedPreferencesPayload(preferences: runtime.host?.preferences() ?? VMInMemoryPreferences())
+            )
+        }
+        wrapper.method("getPackageName", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("com.moereader.MoeReader") }
+        wrapper.method("getCacheDir", "()Ljava/io/File;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/io/File;",
+                payload: VMFilePayload(path: FileRuntime.join(runtime.extensionFileRoot(), "cache"))
+            )
+        }
+        wrapper.method("getFilesDir", "()Ljava/io/File;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/io/File;",
+                payload: VMFilePayload(path: FileRuntime.join(runtime.extensionFileRoot(), "files"))
+            )
+        }
+        wrapper.method("startActivity", "(Landroid/content/Intent;)V") { _, _, _ in .zero }
         result.append(wrapper)
 
         let assetManager = NativeClass("Landroid/content/res/AssetManager;", superclass: "Ljava/lang/Object;")
@@ -313,6 +365,7 @@ extension VMRuntime {
             case let text as String: payload.preferences.setString(text, forKey: key)
             case let flag as Bool: payload.preferences.setBool(flag, forKey: key)
             case let number as Int: payload.preferences.setInt(number, forKey: key)
+            case let strings as Set<String>: payload.preferences.setStringSet(strings, forKey: key)
             default: break
             }
         }

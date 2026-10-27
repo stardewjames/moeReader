@@ -11,11 +11,15 @@ Liquid Glass.
 - Browses **Mihon/Tachiyomi extension repositories**: parses `index.pb`, verifies
   and installs extension APKs against the repository signing key, and exposes the
   declared sources.
-- Runs installed lib-1.6 extensions on a **custom Dalvik engine** inside
+- Runs installed lib-1.4–1.6 extensions on a **custom Dalvik engine** inside
   `MihonCompat`: an in-process interpreter plus native Android, Kotlin, OkHttp,
-  Jsoup and `eu.kanade.tachiyomi` hosts. No JVM is embedded; a source call is
-  the only time the engine does work, and its arena is recycled so idle RAM
-  stays flat.
+  okio, Jsoup and `eu.kanade.tachiyomi` hosts. Request/parse-style sources use
+  native `HttpSource`/`ParsedHttpSource` defaults. No JVM is embedded; a source
+  call is the only time the engine does work, and its arena is recycled so idle
+  RAM stays flat.
+- Browses sources with **search filters** rendered from the extension's
+  `FilterList`, and edits source preferences (text, toggles, single-choice
+  lists, multi-select values) from a settings sheet.
 - ZIP central-directory random access: archives are opened, not extracted.
 - Stored ZIP/TAR pages are decoded directly from the mapped file (zero-copy payloads).
 - Off-main ImageIO downsampling with a bounded decoded-image cache and ±2-page prefetch.
@@ -31,11 +35,12 @@ Liquid Glass.
 - Imported books are excluded from iCloud backup; covers live in Caches.
 
 **Extension scope:** `SuwayomiCompat` owns repository discovery, signed installs,
-updates and the reader UI. `MihonCompat` owns execution: it interprets the
-extension's Dalvik bytecode and supplies the platform surface. Extensions whose
-API use falls inside that surface run without any site-specific Swift code;
-`MihonCompat/README.md` lists the exact surface and the known gaps (for example
-`kotlinx.serialization` encoding, and lib-1.4 extensions). See
+updates, source filters and the reader UI. `MihonCompat` owns execution: it
+interprets the extension's Dalvik bytecode and supplies the platform surface.
+Extensions whose API use falls inside that surface run without any
+site-specific Swift code; `MihonCompat/README.md` lists the exact surface and
+the known gaps (RxJava-only fetch overrides, WebView screens, zstd response
+transcoding, and image codecs inside extensions). See
 [`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md) and
 [`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md).
 
@@ -69,6 +74,16 @@ Run the unit test suite locally on a simulator:
 `scripts/test.sh` selects an available iOS 26+ iPhone simulator and writes
 `TestResults.xcresult`. CI builds the unsigned device IPA directly; it does not
 boot a simulator or run UI tests.
+
+To audit an extension APK against the engine's native API surface:
+
+```bash
+python3 scripts/analyze_compat.py path/to/extension.apk
+```
+
+See [`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md#auditing-the-native-surface)
+for the exact-registry variant. APKs and audit reports stay out of the
+repository.
 
 Build an unsigned device IPA:
 

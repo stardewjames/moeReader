@@ -31,8 +31,12 @@ profiles, and SwiftUI screens.
   `MihonEngineRuntime`. There is no per-site native runner; extensions that need
   an unsupported library report a typed error.
 - **Browsing and reading.** The layer includes its own source browser, manga
-  detail/chapter list, remote image pipeline, and paged reader. Reading progress
-  is stored in `UserDefaults`; it does not touch the local library model.
+  detail/chapter list, remote image pipeline, and paged reader. Search filters
+  are rendered from the extension's `FilterList` and replayed onto a fresh list
+  for each search. Source preferences are edited in a sheet, including text,
+  single-choice, toggle, and multi-select controls backed by `SharedPreferences`
+  string sets. Reading progress is stored in `UserDefaults`; it does not touch
+  the local library model.
 
 ## Relationship to the engine
 
@@ -64,6 +68,7 @@ typed error when browsed; its package is never loaded as native code.
 | `MihonRemoteImageView.swift` | URLSession image loading, decode cache, prefetch |
 | `MihonCompatView.swift` | Repository/extension manager |
 | `MihonBrowseView.swift`, `MihonMangaView.swift`, `MihonReaderView.swift` | Source browser and reader |
+| `MihonFilterView.swift` | FilterList sheet for source searches |
 
 ## Adding a runtime
 
@@ -90,6 +95,11 @@ struct MyRuntime: MihonSourceRuntime {
 `MihonRuntimeRegistry.shared` is the single registration point. The installed
 extension record already carries the verified package, version, and source
 languages; a runtime uses those values rather than trusting loose metadata.
+
+Runtimes may also implement `MihonSourceFilterProviding` to expose the
+extension's filters and accept selected values for a search. The engine runtime
+implements it; the browse screen falls back to plain search when a runtime does
+not.
 
 ## Security notes
 

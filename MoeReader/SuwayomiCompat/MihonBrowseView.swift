@@ -14,6 +14,9 @@ struct MihonBrowseView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var showsSettings = false
+    @State private var showsFilters = false
+    @State private var filterTree: [MihonFilter] = []
+    @State private var filterSelections: [String: MihonFilterSelection] = [:]
 
     init(source: MihonSource, packageName: String, runtime: (any MihonSourceRuntime)? = nil) {
         self.source = source
@@ -37,6 +40,21 @@ struct MihonBrowseView: View {
         .navigationBarTitleDisplayMode(.inline)
         .tint(Palette.amber)
         .toolbar {
+            if filterProvider != nil {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        Task {
+                            await loadFilters()
+                            showsFilters = true
+                        }
+                    } label: {
+                        Image(systemName: filterSelections.isEmpty
+                              ? "line.3.horizontal.decrease.circle"
+                              : "line.3.horizontal.decrease.circle.fill")
+                    }
+                    .accessibilityLabel("Filters")
+                }
+            }
             if preferencesProvider != nil {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -52,6 +70,19 @@ struct MihonBrowseView: View {
                 MihonSourceSettingsView(source: source, runtime: preferencesProvider)
             }
         }
+        .sheet(isPresented: $showsFilters) {
+            MihonFilterSheet(
+                filters: filterTree,
+                selections: filterSelections
+            ) { selections in
+                filterSelections = selections
+                if !selections.isEmpty { mode = .search }
+            }
+        }
+    }
+
+    private var filterProvider: (any MihonSourceFilterProviding)? {
+        runtime as? any MihonSourceFilterProviding
     }
 
     private var preferencesProvider: (any MihonSourcePreferencesProviding)? {
@@ -167,7 +198,25 @@ struct MihonBrowseView: View {
     }
 
     private var reloadKey: String {
-        "\(mode.rawValue)|\(searchGeneration)|\(source.identity)"
+        "\(mode.rawValue)|\(searchGeneration)|\(source.identity)|\(filterKey)"
+    }
+
+    private var filterKey: String {
+        filterSelections
+            .map { "\($0.key)=\($0.value.value)|\($0.value.ascending)" }
+            .sorted()
+            .joined(separator: ",")
+    }
+
+    private func loadFilters() async {
+        guard let filterProvider else { return }
+        do {
+            filterTree = try await filterProvider.filters(source: source)
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func load(reset: Bool, runtime: any MihonSourceRuntime) async {
@@ -189,7 +238,16 @@ struct MihonBrowseView: View {
             case .latest:
                 result = try await runtime.latest(source: source, page: requestedPage)
             case .search:
-                result = try await runtime.search(query: query, source: source, page: requestedPage)
+                if let filterProvider {
+                    result = try await filterProvider.search(
+                        query: query,
+                        source: source,
+                        page: requestedPage,
+                        selections: filterSelections
+                    )
+                } else {
+                    result = try await runtime.search(query: query, source: source, page: requestedPage)
+                }
             }
             if reset {
                 items = result.items

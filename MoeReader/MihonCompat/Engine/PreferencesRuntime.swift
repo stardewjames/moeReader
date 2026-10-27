@@ -22,16 +22,20 @@ struct MihonEnginePreference: Identifiable, Hashable, Sendable {
     var key: String
     var title: String
     var summary: String?
+    var dialogTitle: String? = nil
     var kind: Kind
     var entries: [String]
     var entryValues: [String]
     var value: String
+    /// Selected values for `.multiSelect`; empty for other kinds.
+    var values: [String]
 }
 
 final class VMUiPreferencePayload {
     var kind: MihonEnginePreference.Kind
     var title = ""
     var summary: String?
+    var dialogTitle: String?
     var key = ""
     var entries: [String] = []
     var entryValues: [String] = []
@@ -92,8 +96,19 @@ enum PreferencesRuntime {
         }
         preference.method("setDefaultValue", "(Ljava/lang/Object;)V") { runtime, args, _ in
             let payload = try runtime.preference(args[0])
-            if let text = runtime.stringValue(args[1]) { payload.value = text }
-            else if args[1].bits != 0 { payload.value = runtime.stringValue(runtime.javaToString(args[1])) ?? "" }
+            if let strings = runtime.listItems(args[1]) {
+                let values = strings.compactMap { runtime.stringValue($0) }
+                if !values.isEmpty {
+                    payload.values = Set(values)
+                    payload.value = values.sorted().joined(separator: ",")
+                    return .zero
+                }
+            }
+            if let text = runtime.stringValue(args[1]) {
+                payload.value = text
+            } else if args[1].bits != 0 {
+                payload.value = runtime.stringValue(runtime.javaToString(args[1])) ?? ""
+            }
             return .zero
         }
         preference.method("getContext", "()Landroid/content/Context;") { runtime, _, _ in
@@ -204,9 +219,15 @@ enum PreferencesRuntime {
             try runtime.preference(args[0]).entries = runtime.stringArray(args[1])
             return .zero
         }
+        multi.method("getEntries", "()[Ljava/lang/CharSequence;") { runtime, args, _ in
+            runtime.stringArrayValue(try runtime.preference(args[0]).entries)
+        }
         multi.method("setEntryValues", "([Ljava/lang/CharSequence;)V") { runtime, args, _ in
             try runtime.preference(args[0]).entryValues = runtime.stringArray(args[1])
             return .zero
+        }
+        multi.method("getEntryValues", "()[Ljava/lang/CharSequence;") { runtime, args, _ in
+            runtime.stringArrayValue(try runtime.preference(args[0]).entryValues)
         }
         multi.method("getValues", "()Ljava/util/Set;") { runtime, args, _ in
             let payload = try runtime.preference(args[0])
@@ -232,6 +253,10 @@ enum PreferencesRuntime {
             try runtime.preference(args[0]).value = runtime.stringValue(args[1]) ?? ""
             return .zero
         }
+        edit.method("setDialogTitle", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            try runtime.preference(args[0]).dialogTitle = runtime.stringValue(args[1])
+            return .zero
+        }
         edit.method("getText", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(try runtime.preference(args[0]).value)
         }
@@ -255,6 +280,8 @@ enum PreferencesRuntime {
         switchPref.method("isChecked", "()Z") { runtime, args, _ in
             .boolean(try runtime.preference(args[0]).value == "true")
         }
+        switchPref.method("setSummaryOn", "(Ljava/lang/CharSequence;)V") { _, _, _ in .zero }
+        switchPref.method("setSummaryOff", "(Ljava/lang/CharSequence;)V") { _, _, _ in .zero }
         result.append(switchPref)
 
         let editText = NativeClass("Landroid/widget/EditText;", superclass: "Ljava/lang/Object;")

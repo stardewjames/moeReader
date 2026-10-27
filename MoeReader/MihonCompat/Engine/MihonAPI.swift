@@ -67,6 +67,18 @@ final class VMMangasPagePayload {
 }
 
 final class VMFilterPayload {
+    enum Kind: String {
+        case header
+        case separator
+        case text
+        case checkbox
+        case tristate
+        case select
+        case sort
+        case group
+    }
+
+    var kind: Kind = .header
     var name: VMValue = .null
     var state: VMValue = .null
     var values: VMValue = .null
@@ -150,6 +162,7 @@ enum MihonAPI {
         result.append(configurable)
 
         result.append(httpSourceClass())
+        result.append(parsedHttpSourceClass())
         return result
     }
 
@@ -198,6 +211,92 @@ enum MihonAPI {
             runtime.callVirtual(args[0], "getLang()Ljava/lang/String;", []) ?? runtime.newString("all")
         }
         cls.method("getSupportsLatest", "()Z") { _, _, _ in .boolean(true) }
+        cls.method("getPopularManga", "(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try MihonAPI.defaultMangaPage(
+                runtime, source: args[0],
+                requestKey: "popularMangaRequest(I)Lokhttp3/Request;",
+                requestArguments: [args[1]],
+                parseKey: "popularMangaParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;"
+            )
+        }
+        cls.method("getLatestUpdates", "(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try MihonAPI.defaultMangaPage(
+                runtime, source: args[0],
+                requestKey: "latestUpdatesRequest(I)Lokhttp3/Request;",
+                requestArguments: [args[1]],
+                parseKey: "latestUpdatesParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;"
+            )
+        }
+        cls.method("getSearchManga", "(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try MihonAPI.defaultMangaPage(
+                runtime, source: args[0],
+                requestKey: "searchMangaRequest(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;)Lokhttp3/Request;",
+                requestArguments: [args[1], args[2], args[3]],
+                parseKey: "searchMangaParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;"
+            )
+        }
+        cls.method("getMangaUpdate", "(Leu/kanade/tachiyomi/source/model/SManga;Ljava/util/List;ZZLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try MihonAPI.defaultMangaUpdate(
+                runtime,
+                source: args[0],
+                args: [args[0], args[1], args[2], args[3], args[4]]
+            )
+        }
+        cls.method("getPageList", "(Leu/kanade/tachiyomi/source/model/SChapter;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try MihonAPI.defaultList(
+                runtime, source: args[0],
+                requestKey: "pageListRequest(Leu/kanade/tachiyomi/source/model/SChapter;)Lokhttp3/Request;",
+                requestArguments: [args[1]],
+                parseKey: "pageListParse(Lokhttp3/Response;)Ljava/util/List;"
+            )
+        }
+        cls.method("popularMangaRequest", "(I)Lokhttp3/Request;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "popularMangaRequest")
+        }
+        cls.method("popularMangaParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "popularMangaParse")
+        }
+        cls.method("searchMangaRequest", "(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;)Lokhttp3/Request;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "searchMangaRequest")
+        }
+        cls.method("searchMangaParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "searchMangaParse")
+        }
+        cls.method("latestUpdatesRequest", "(I)Lokhttp3/Request;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "latestUpdatesRequest")
+        }
+        cls.method("latestUpdatesParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "latestUpdatesParse")
+        }
+        cls.method("mangaDetailsRequest", "(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;") { runtime, args, _ in
+            let manga: VMMangaPayload? = runtime.payload(args[1], as: VMMangaPayload.self)
+            return MihonAPI.getRequest(runtime, source: args[0], url: runtime.absoluteUrl(manga?.url ?? .null, source: args[0]))
+        }
+        cls.method("mangaDetailsParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/SManga;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "mangaDetailsParse")
+        }
+        cls.method("chapterListRequest", "(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;") { runtime, args, _ in
+            let manga: VMMangaPayload? = runtime.payload(args[1], as: VMMangaPayload.self)
+            return MihonAPI.getRequest(runtime, source: args[0], url: runtime.absoluteUrl(manga?.url ?? .null, source: args[0]))
+        }
+        cls.method("chapterListParse", "(Lokhttp3/Response;)Ljava/util/List;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "chapterListParse")
+        }
+        cls.method("pageListRequest", "(Leu/kanade/tachiyomi/source/model/SChapter;)Lokhttp3/Request;") { runtime, args, _ in
+            let chapter: VMChapterPayload? = runtime.payload(args[1], as: VMChapterPayload.self)
+            return MihonAPI.getRequest(runtime, source: args[0], url: runtime.absoluteUrl(chapter?.url ?? .null, source: args[0]))
+        }
+        cls.method("pageListParse", "(Lokhttp3/Response;)Ljava/util/List;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "pageListParse")
+        }
+        cls.method("imageUrlRequest", "(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;") { runtime, args, _ in
+            let page: VMPagePayload? = runtime.payload(args[1], as: VMPagePayload.self)
+            let url = runtime.stringValue(page?.url ?? .null) ?? ""
+            return MihonAPI.getRequest(runtime, source: args[0], url: url)
+        }
+        cls.method("imageUrlParse", "(Lokhttp3/Response;)Ljava/lang/String;") { _, _, _ in
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "imageUrlParse")
+        }
         cls.method("getHeaders", "()Lokhttp3/Headers;") { runtime, args, _ in
             if let receiver = args[0].object {
                 let delegate = VMObjectLayout.slot(receiver, 0).pointee
@@ -228,7 +327,7 @@ enum MihonAPI {
                 _ = try runtime.invoke(method, [
                     builder,
                     runtime.newString("User-Agent"),
-                    runtime.newString("Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1 \(name)"),
+                    runtime.newString(MihonAPI.userAgent(sourceName: name)),
                 ])
             }
             return builder
@@ -246,6 +345,17 @@ enum MihonAPI {
         cls.method("getImageUrl", "(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             let page: VMPagePayload? = runtime.payload(args[1], as: VMPagePayload.self)
             if let imageUrl = page?.imageUrl, imageUrl.bits != 0 { return imageUrl }
+            let parseKey = "imageUrlParse(Lokhttp3/Response;)Ljava/lang/String;"
+            if let cls = runtime.classOf(args[0]),
+               cls.hasImplementation(key: parseKey, excluding: "Leu/kanade/tachiyomi/source/online/HttpSource;") {
+                let request = try invoke(
+                    runtime, receiver: args[0],
+                    key: "imageUrlRequest(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;",
+                    arguments: [args[1]]
+                )
+                let response = try execute(runtime, source: args[0], request: request)
+                return try invoke(runtime, receiver: args[0], key: parseKey, arguments: [response])
+            }
             return page?.url ?? .null
         }
         cls.method("imageRequest", "(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;") { runtime, args, _ in
@@ -255,10 +365,24 @@ enum MihonAPI {
             return runtime.makeRequest(url: url, headers: headers, method: "GET", body: .null)
         }
         cls.method("getMangaUrl", "(Leu/kanade/tachiyomi/source/model/SManga;)Ljava/lang/String;") { runtime, args, _ in
+            if let request = try? MihonAPI.invoke(
+                runtime, receiver: args[0],
+                key: "mangaDetailsRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                arguments: [args[1]]
+            ), let payload: VMRequestPayload = runtime.payload(request, as: VMRequestPayload.self) {
+                return runtime.newString(payload.url)
+            }
             guard let manga: VMMangaPayload = runtime.payload(args[1], as: VMMangaPayload.self) else { return .null }
             return runtime.absoluteUrl(manga.url, source: args[0])
         }
         cls.method("getChapterUrl", "(Leu/kanade/tachiyomi/source/model/SChapter;)Ljava/lang/String;") { runtime, args, _ in
+            if let request = try? MihonAPI.invoke(
+                runtime, receiver: args[0],
+                key: "pageListRequest(Leu/kanade/tachiyomi/source/model/SChapter;)Lokhttp3/Request;",
+                arguments: [args[1]]
+            ), let payload: VMRequestPayload = runtime.payload(request, as: VMRequestPayload.self) {
+                return runtime.newString(payload.url)
+            }
             guard let chapter: VMChapterPayload = runtime.payload(args[1], as: VMChapterPayload.self) else { return .null }
             return runtime.absoluteUrl(chapter.url, source: args[0])
         }
@@ -280,6 +404,263 @@ enum MihonAPI {
         return cls
     }
 
+    // MARK: - ParsedHttpSource
+
+    private static func parsedHttpSourceClass() -> NativeClass {
+        let cls = NativeClass(
+            "Leu/kanade/tachiyomi/source/online/ParsedHttpSource;",
+            superclass: "Leu/kanade/tachiyomi/source/online/HttpSource;"
+        )
+        cls.method("popularMangaParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;") { runtime, args, _ in
+            try parsedMangaPage(
+                runtime, source: args[0], response: args[1],
+                selectorKey: "popularMangaSelector()Ljava/lang/String;",
+                fromKey: "popularMangaFromElement(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SManga;",
+                nextKey: "popularMangaNextPageSelector()Ljava/lang/String;"
+            )
+        }
+        cls.method("searchMangaParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;") { runtime, args, _ in
+            try parsedMangaPage(
+                runtime, source: args[0], response: args[1],
+                selectorKey: "searchMangaSelector()Ljava/lang/String;",
+                fromKey: "searchMangaFromElement(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SManga;",
+                nextKey: "searchMangaNextPageSelector()Ljava/lang/String;"
+            )
+        }
+        cls.method("latestUpdatesParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;") { runtime, args, _ in
+            try parsedMangaPage(
+                runtime, source: args[0], response: args[1],
+                selectorKey: "latestUpdatesSelector()Ljava/lang/String;",
+                fromKey: "latestUpdatesFromElement(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SManga;",
+                nextKey: "latestUpdatesNextPageSelector()Ljava/lang/String;"
+            )
+        }
+        cls.method("mangaDetailsParse", "(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/SManga;") { runtime, args, _ in
+            let (document, _) = try responseDocument(runtime, response: args[1])
+            return try invoke(
+                runtime, receiver: args[0],
+                key: "mangaDetailsParse(Lorg/jsoup/nodes/Document;)Leu/kanade/tachiyomi/source/model/SManga;",
+                arguments: [document]
+            )
+        }
+        cls.method("chapterListParse", "(Lokhttp3/Response;)Ljava/util/List;") { runtime, args, _ in
+            let (_, parsed) = try responseDocument(runtime, response: args[1])
+            let selector = (try? invoke(runtime, receiver: args[0], key: "chapterListSelector()Ljava/lang/String;", arguments: []))
+                .flatMap { runtime.stringValue($0) } ?? ""
+            var chapters: [VMValue] = []
+            for node in JsoupSelector.select(parsed.root, selector: selector) {
+                let element = runtime.makeNative(
+                    "Lorg/jsoup/nodes/Element;",
+                    payload: JElementPayload(node: node, document: parsed)
+                )
+                chapters.append(try invoke(
+                    runtime, receiver: args[0],
+                    key: "chapterFromElement(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SChapter;",
+                    arguments: [element]
+                ))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(chapters))
+        }
+        cls.method("pageListParse", "(Lokhttp3/Response;)Ljava/util/List;") { runtime, args, _ in
+            let (document, _) = try responseDocument(runtime, response: args[1])
+            return try invoke(
+                runtime, receiver: args[0],
+                key: "pageListParse(Lorg/jsoup/nodes/Document;)Ljava/util/List;",
+                arguments: [document]
+            )
+        }
+        cls.method("imageUrlParse", "(Lokhttp3/Response;)Ljava/lang/String;") { runtime, args, _ in
+            let (document, _) = try responseDocument(runtime, response: args[1])
+            return try invoke(
+                runtime, receiver: args[0],
+                key: "imageUrlParse(Lorg/jsoup/nodes/Document;)Ljava/lang/String;",
+                arguments: [document]
+            )
+        }
+
+        let abstractMethods: [(String, String)] = [
+            ("popularMangaSelector", "()Ljava/lang/String;"),
+            ("popularMangaFromElement", "(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SManga;"),
+            ("popularMangaNextPageSelector", "()Ljava/lang/String;"),
+            ("searchMangaSelector", "()Ljava/lang/String;"),
+            ("searchMangaFromElement", "(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SManga;"),
+            ("searchMangaNextPageSelector", "()Ljava/lang/String;"),
+            ("latestUpdatesSelector", "()Ljava/lang/String;"),
+            ("latestUpdatesFromElement", "(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SManga;"),
+            ("latestUpdatesNextPageSelector", "()Ljava/lang/String;"),
+            ("mangaDetailsParse", "(Lorg/jsoup/nodes/Document;)Leu/kanade/tachiyomi/source/model/SManga;"),
+            ("chapterListSelector", "()Ljava/lang/String;"),
+            ("chapterFromElement", "(Lorg/jsoup/nodes/Element;)Leu/kanade/tachiyomi/source/model/SChapter;"),
+            ("pageListParse", "(Lorg/jsoup/nodes/Document;)Ljava/util/List;"),
+            ("imageUrlParse", "(Lorg/jsoup/nodes/Document;)Ljava/lang/String;"),
+        ]
+        for (name, signature) in abstractMethods {
+            cls.method(name, signature) { _, _, _ in
+                throw VMJavaException("Ljava/lang/UnsupportedOperationException;", name)
+            }
+        }
+        return cls
+    }
+
+    /// Runs a request/parse pair used by the deprecated `HttpSource` API.
+    static func defaultMangaPage(
+        _ runtime: VMRuntime,
+        source: VMValue,
+        requestKey: String,
+        requestArguments: [VMValue],
+        parseKey: String
+    ) throws -> VMValue {
+        let request = try invoke(runtime, receiver: source, key: requestKey, arguments: requestArguments)
+        let response = try execute(runtime, source: source, request: request)
+        return try invoke(runtime, receiver: source, key: parseKey, arguments: [response])
+    }
+
+    static func defaultList(
+        _ runtime: VMRuntime,
+        source: VMValue,
+        requestKey: String,
+        requestArguments: [VMValue],
+        parseKey: String
+    ) throws -> VMValue {
+        let request = try invoke(runtime, receiver: source, key: requestKey, arguments: requestArguments)
+        let response = try execute(runtime, source: source, request: request)
+        return try invoke(runtime, receiver: source, key: parseKey, arguments: [response])
+    }
+
+    static func defaultMangaUpdate(_ runtime: VMRuntime, source: VMValue, args: [VMValue]) throws -> VMValue {
+        let manga = args[1]
+        let chapters = args[2]
+        let fetchDetails = args[3].asBoolean
+        let fetchChapters = args[4].asBoolean
+        var updatedManga = manga
+        var updatedChapters = chapters
+
+        if fetchDetails {
+            let request = try invoke(
+                runtime, receiver: source,
+                key: "mangaDetailsRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                arguments: [manga]
+            )
+            let response = try execute(runtime, source: source, request: request)
+            let parsed = try invoke(
+                runtime, receiver: source,
+                key: "mangaDetailsParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/SManga;",
+                arguments: [response]
+            )
+            if let payload: VMMangaPayload = runtime.payload(parsed, as: VMMangaPayload.self) {
+                payload.initialized = true
+            }
+            updatedManga = parsed
+        }
+        if fetchChapters {
+            let request = try invoke(
+                runtime, receiver: source,
+                key: "chapterListRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                arguments: [manga]
+            )
+            let response = try execute(runtime, source: source, request: request)
+            updatedChapters = try invoke(
+                runtime, receiver: source,
+                key: "chapterListParse(Lokhttp3/Response;)Ljava/util/List;",
+                arguments: [response]
+            )
+        }
+
+        let update = runtime.makeNative(
+            "Leu/kanade/tachiyomi/source/model/SMangaUpdate;",
+            payload: VMMangaUpdatePayload()
+        )
+        if let payload: VMMangaUpdatePayload = runtime.payload(update, as: VMMangaUpdatePayload.self) {
+            payload.manga = updatedManga
+            payload.chapters = updatedChapters
+        }
+        return update
+    }
+
+    static func invoke(
+        _ runtime: VMRuntime,
+        receiver: VMValue,
+        key: String,
+        arguments: [VMValue]
+    ) throws -> VMValue {
+        guard let cls = runtime.classOf(receiver), let method = cls.lookupVirtual(key: key) else {
+            throw VMJavaException("Ljava/lang/AbstractMethodError;", key)
+        }
+        return try runtime.invoke(method, [receiver] + arguments)
+    }
+
+    static func execute(_ runtime: VMRuntime, source: VMValue, request: VMValue) throws -> VMValue {
+        let client = try invoke(
+            runtime, receiver: source,
+            key: "getClient()Lokhttp3/OkHttpClient;", arguments: []
+        )
+        let response = try runtime.executeOkHttp(request: request, client: client)
+        if let payload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self),
+           !(200..<300).contains(payload.code) {
+            throw VMJavaException("Leu/kanade/tachiyomi/network/HttpException;", "HTTP error \(payload.code)")
+        }
+        return response
+    }
+
+    static func getRequest(_ runtime: VMRuntime, source: VMValue, url: String) -> VMValue {
+        let headers = (try? invoke(runtime, receiver: source, key: "getHeaders()Lokhttp3/Headers;", arguments: [])) ?? .null
+        return runtime.makeRequest(url: url, headers: headers, method: "GET", body: .null)
+    }
+
+    static func getRequest(_ runtime: VMRuntime, source: VMValue, url: VMValue) -> VMValue {
+        getRequest(runtime, source: source, url: runtime.stringValue(url) ?? "")
+    }
+
+    static func responseDocument(_ runtime: VMRuntime, response: VMValue) throws -> (VMValue, JDocumentPayload) {
+        guard let payload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self) else {
+            throw VMJavaException("Ljava/io/IOException;", "missing response body")
+        }
+        let charset = payload.contentType.flatMap { VMMediaTypePayload(text: $0).charset } ?? "UTF-8"
+        let html = runtime.decode(bytes: Array(payload.body), charset: charset)
+        let baseURI = runtime.payload(payload.request, as: VMRequestPayload.self)?.url ?? ""
+        let document = JsoupHTML.parse(html, baseUri: baseURI)
+        let value = runtime.makeNative(
+            "Lorg/jsoup/nodes/Document;",
+            payload: JElementPayload(node: document.root, document: document)
+        )
+        return (value, document)
+    }
+
+    static func parsedMangaPage(
+        _ runtime: VMRuntime,
+        source: VMValue,
+        response: VMValue,
+        selectorKey: String,
+        fromKey: String,
+        nextKey: String
+    ) throws -> VMValue {
+        let (_, document) = try responseDocument(runtime, response: response)
+        let selector = (try? invoke(runtime, receiver: source, key: selectorKey, arguments: []))
+            .flatMap { runtime.stringValue($0) } ?? ""
+        var items: [VMValue] = []
+        for node in JsoupSelector.select(document.root, selector: selector) {
+            let element = runtime.makeNative(
+                "Lorg/jsoup/nodes/Element;",
+                payload: JElementPayload(node: node, document: document)
+            )
+            items.append(try invoke(runtime, receiver: source, key: fromKey, arguments: [element]))
+        }
+        var hasNextPage = false
+        if let next = try? invoke(runtime, receiver: source, key: nextKey, arguments: []),
+           let nextSelector = runtime.stringValue(next), !nextSelector.isEmpty {
+            hasNextPage = !JsoupSelector.select(document.root, selector: nextSelector).isEmpty
+        }
+        let page = runtime.makeNative(
+            "Leu/kanade/tachiyomi/source/model/MangasPage;",
+            payload: VMMangasPagePayload()
+        )
+        if let payload: VMMangasPagePayload = runtime.payload(page, as: VMMangasPagePayload.self) {
+            payload.mangas = runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+            payload.hasNextPage = hasNextPage
+        }
+        return page
+    }
+
     // MARK: - Models
 
     private static func modelClasses() -> [NativeClass] {
@@ -296,8 +677,13 @@ enum MihonAPI {
     private static func mangaClass() -> NativeClass {
         let iface = NativeClass("Leu/kanade/tachiyomi/source/model/SManga;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         iface.staticField("Companion", "Leu/kanade/tachiyomi/source/model/SManga$Companion;")
+        let statusConstants = ["UNKNOWN", "ONGOING", "COMPLETED", "LICENSED", "PUBLISHING_FINISHED", "CANCELLED", "ON_HIATUS"]
+        for name in statusConstants { iface.staticField(name, "I") }
         iface.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Leu/kanade/tachiyomi/source/model/SManga$Companion;", payload: NSNull())
+            for (index, _) in statusConstants.enumerated() {
+                cls.staticValues[index + 1] = .int32(Int32(index))
+            }
         }
         for (name, signature) in mangaAccessors() {
             iface.method(name, signature) { _, _, _ in .null }
@@ -361,6 +747,15 @@ enum MihonAPI {
 
     private static func pageClass() -> NativeClass {
         let cls = NativeClass("Leu/kanade/tachiyomi/source/model/Page;", superclass: "Ljava/lang/Object;")
+        cls.staticField("Companion", "Leu/kanade/tachiyomi/source/model/Page$Companion;")
+        let pageConstants = ["QUEUE", "LOAD_PAGE", "DOWNLOAD_IMAGE", "READY", "ERROR"]
+        for name in pageConstants { cls.staticField(name, "I") }
+        cls.prepare = { runtime, clazz in
+            clazz.staticValues[0] = runtime.makeNative("Leu/kanade/tachiyomi/source/model/Page$Companion;", payload: NSNull())
+            for (index, _) in pageConstants.enumerated() {
+                clazz.staticValues[index + 1] = .int32(Int32(index))
+            }
+        }
         cls.method("<init>", "(I)V") { runtime, args, _ in
             let payload = VMPagePayload()
             payload.index = args[1].asInt32
@@ -425,7 +820,6 @@ enum MihonAPI {
             let url = runtime.stringValue(payload.url) ?? ""
             return runtime.newString("Page(index=\(payload.index), url=\(url))")
         }
-        cls.prepare = { _, _ in }
         return cls
     }
 
@@ -533,36 +927,65 @@ enum MihonAPI {
         }
         result.append(filter)
 
-        func subclass(_ descriptor: String, _ name: String, constructor: String) -> NativeClass {
+        func filtered(_ descriptor: String, kind: VMFilterPayload.Kind) -> NativeClass {
             let cls = NativeClass(descriptor, superclass: "Leu/kanade/tachiyomi/source/model/Filter;")
-            cls.method("<init>", constructor) { runtime, args, _ in
+            cls.method("<init>", "(Ljava/lang/String;Ljava/lang/Object;)V") { runtime, args, _ in
                 let payload = VMFilterPayload()
+                payload.kind = kind
                 payload.name = args[1]
+                payload.state = args[2]
                 runtime.setPayload(args[0], payload)
                 return .zero
             }
             return cls
         }
 
-        result.append(subclass("Leu/kanade/tachiyomi/source/model/Filter$Header;", "header", constructor: "(Ljava/lang/String;)V"))
-        let separator = subclass("Leu/kanade/tachiyomi/source/model/Filter$Separator;", "separator", constructor: "(Ljava/lang/String;)V")
+        let header = filtered("Leu/kanade/tachiyomi/source/model/Filter$Header;", kind: .header)
+        header.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .header
+            payload.name = args[1]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
+        result.append(header)
+
+        let separator = filtered("Leu/kanade/tachiyomi/source/model/Filter$Separator;", kind: .separator)
+        separator.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .separator
+            payload.name = args[1]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
         separator.method("<init>", "(Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .separator
             payload.name = args[1]
             runtime.setPayload(args[0], payload)
             return .zero
         }
         separator.method("<init>", "()V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .separator
             payload.name = runtime.newString("")
             runtime.setPayload(args[0], payload)
             return .zero
         }
         result.append(separator)
 
-        let text = subclass("Leu/kanade/tachiyomi/source/model/Filter$Text;", "text", constructor: "(Ljava/lang/String;Ljava/lang/String;)V")
+        let text = filtered("Leu/kanade/tachiyomi/source/model/Filter$Text;", kind: .text)
+        text.method("<init>", "(Ljava/lang/String;Ljava/lang/String;)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .text
+            payload.name = args[1]
+            payload.state = args[2]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
         text.method("<init>", "(Ljava/lang/String;Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .text
             payload.name = args[1]
             payload.state = args[2]
             runtime.setPayload(args[0], payload)
@@ -570,9 +993,18 @@ enum MihonAPI {
         }
         result.append(text)
 
-        let checkBox = subclass("Leu/kanade/tachiyomi/source/model/Filter$CheckBox;", "checkbox", constructor: "(Ljava/lang/String;Z)V")
+        let checkBox = filtered("Leu/kanade/tachiyomi/source/model/Filter$CheckBox;", kind: .checkbox)
+        checkBox.method("<init>", "(Ljava/lang/String;Z)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .checkbox
+            payload.name = args[1]
+            payload.state = args[2]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
         checkBox.method("<init>", "(Ljava/lang/String;ZILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .checkbox
             payload.name = args[1]
             payload.state = args[2]
             runtime.setPayload(args[0], payload)
@@ -580,9 +1012,18 @@ enum MihonAPI {
         }
         result.append(checkBox)
 
-        let triState = subclass("Leu/kanade/tachiyomi/source/model/Filter$TriState;", "tristate", constructor: "(Ljava/lang/String;I)V")
+        let triState = filtered("Leu/kanade/tachiyomi/source/model/Filter$TriState;", kind: .tristate)
+        triState.method("<init>", "(Ljava/lang/String;I)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .tristate
+            payload.name = args[1]
+            payload.state = args[2]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
         triState.method("<init>", "(Ljava/lang/String;IILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .tristate
             payload.name = args[1]
             payload.state = args[2]
             runtime.setPayload(args[0], payload)
@@ -599,9 +1040,19 @@ enum MihonAPI {
         }
         result.append(triState)
 
-        let select = subclass("Leu/kanade/tachiyomi/source/model/Filter$Select;", "select", constructor: "(Ljava/lang/String;[Ljava/lang/Object;I)V")
+        let select = filtered("Leu/kanade/tachiyomi/source/model/Filter$Select;", kind: .select)
+        select.method("<init>", "(Ljava/lang/String;[Ljava/lang/Object;I)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .select
+            payload.name = args[1]
+            payload.values = args[2]
+            payload.state = args[3]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
         select.method("<init>", "(Ljava/lang/String;[Ljava/lang/Object;IILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .select
             payload.name = args[1]
             payload.values = args[2]
             payload.state = args[3]
@@ -610,6 +1061,7 @@ enum MihonAPI {
         }
         select.method("<init>", "(Ljava/lang/String;[Ljava/lang/Object;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .select
             payload.name = args[1]
             payload.values = args[2]
             payload.state = .int32(0)
@@ -621,7 +1073,15 @@ enum MihonAPI {
         }
         result.append(select)
 
-        let group = subclass("Leu/kanade/tachiyomi/source/model/Filter$Group;", "group", constructor: "(Ljava/lang/String;Ljava/util/List;)V")
+        let group = filtered("Leu/kanade/tachiyomi/source/model/Filter$Group;", kind: .group)
+        group.method("<init>", "(Ljava/lang/String;Ljava/util/List;)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .group
+            payload.name = args[1]
+            payload.state = args[2]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
         group.method("getState", "()Ljava/util/List;") { runtime, args, _ in
             runtime.payload(args[0], as: VMFilterPayload.self)?.state ?? .null
         }
@@ -631,22 +1091,52 @@ enum MihonAPI {
         }
         result.append(group)
 
-        let sort = subclass("Leu/kanade/tachiyomi/source/model/Filter$Sort;", "sort", constructor: "(Ljava/lang/String;[Ljava/lang/String;Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;)V")
-        sort.method("<init>", "(Ljava/lang/String;[Ljava/lang/String;Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
+        let sort = filtered("Leu/kanade/tachiyomi/source/model/Filter$Sort;", kind: .sort)
+        sort.method("<init>", "(Ljava/lang/String;[Ljava/lang/String;Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;)V") { runtime, args, _ in
             let payload = VMFilterPayload()
+            payload.kind = .sort
             payload.name = args[1]
             payload.values = args[2]
             payload.sortSelection = args[3]
+            payload.state = args[3]
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
+        sort.method("<init>", "(Ljava/lang/String;[Ljava/lang/String;Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
+            let payload = VMFilterPayload()
+            payload.kind = .sort
+            payload.name = args[1]
+            payload.values = args[2]
+            payload.sortSelection = args[3]
+            payload.state = args[3]
             runtime.setPayload(args[0], payload)
             return .zero
         }
         sort.method("getValues", "()[Ljava/lang/String;") { runtime, args, _ in
             runtime.payload(args[0], as: VMFilterPayload.self)?.values ?? .null
         }
+        sort.method("getState", "()Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMFilterPayload.self)
+            if let selection = payload?.sortSelection, selection.bits != 0 { return selection }
+            return payload?.state ?? .null
+        }
+        sort.method("setState", "(Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;)V") { runtime, args, _ in
+            let payload = try runtime.payloadBox(args[0], as: VMFilterPayload.self)
+            payload.sortSelection = args[1]
+            payload.state = args[1]
+            return .zero
+        }
         result.append(sort)
 
         let selection = NativeClass("Leu/kanade/tachiyomi/source/model/Filter$Sort$Selection;", superclass: "Ljava/lang/Object;")
         selection.method("<init>", "(IZ)V") { runtime, args, _ in
+            let payload = VMSortSelectionPayload()
+            payload.index = args[1].asInt32
+            payload.ascending = args[2].asBoolean
+            runtime.setPayload(args[0], payload)
+            return .zero
+        }
+        selection.method("<init>", "(IZILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
             let payload = VMSortSelectionPayload()
             payload.index = args[1].asInt32
             payload.ascending = args[2].asBoolean
@@ -699,6 +1189,31 @@ enum MihonAPI {
             return .boolean(true)
         }
         filterList.method("hashCode", "()I") { runtime, args, _ in .int32(runtime.javaHashCode(runtime.newString(units: []))) }
+        filterList.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            return .boolean(items.contains { runtime.javaEquals($0, args[1]) })
+        }
+        filterList.method("indexOf", "(Ljava/lang/Object;)I") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            return .int32(Int32(items.firstIndex { runtime.javaEquals($0, args[1]) } ?? -1))
+        }
+        filterList.method("lastIndexOf", "(Ljava/lang/Object;)I") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            return .int32(Int32(items.lastIndex { runtime.javaEquals($0, args[1]) } ?? -1))
+        }
+        filterList.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            let from = max(0, Int(args[1].asInt32))
+            let to = min(items.count, Int(args[2].asInt32))
+            guard from <= to else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(Array(items[from..<to]), immutable: true))
+        }
+        filterList.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
+            for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+            return array
+        }
         result.append(filterList)
         return result
     }
@@ -756,6 +1271,22 @@ enum MihonAPI {
         requests.staticMethod("POST$default", "(Ljava/lang/String;Lokhttp3/Headers;Lokhttp3/RequestBody;Lokhttp3/CacheControl;ILjava/lang/Object;)Lokhttp3/Request;") { runtime, args, _ in
             runtime.makeRequest(url: runtime.stringValue(args[0]) ?? "", headers: args[1], method: "POST", body: args[2])
         }
+        requests.staticMethod("GET$default", "(Lokhttp3/HttpUrl;Lokhttp3/Headers;Lokhttp3/CacheControl;ILjava/lang/Object;)Lokhttp3/Request;") { runtime, args, _ in
+            let url = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string ?? ""
+            return runtime.makeRequest(url: url, headers: args[1], method: "GET", body: .null)
+        }
+        requests.staticMethod("PUT", "(Ljava/lang/String;Lokhttp3/Headers;Lokhttp3/RequestBody;Lokhttp3/CacheControl;)Lokhttp3/Request;") { runtime, args, _ in
+            runtime.makeRequest(url: runtime.stringValue(args[0]) ?? "", headers: args[1], method: "PUT", body: args[2])
+        }
+        requests.staticMethod("PUT$default", "(Ljava/lang/String;Lokhttp3/Headers;Lokhttp3/RequestBody;Lokhttp3/CacheControl;ILjava/lang/Object;)Lokhttp3/Request;") { runtime, args, _ in
+            runtime.makeRequest(url: runtime.stringValue(args[0]) ?? "", headers: args[1], method: "PUT", body: args[2])
+        }
+        requests.staticMethod("DELETE", "(Ljava/lang/String;Lokhttp3/Headers;Lokhttp3/RequestBody;Lokhttp3/CacheControl;)Lokhttp3/Request;") { runtime, args, _ in
+            runtime.makeRequest(url: runtime.stringValue(args[0]) ?? "", headers: args[1], method: "DELETE", body: args[2])
+        }
+        requests.staticMethod("DELETE$default", "(Ljava/lang/String;Lokhttp3/Headers;Lokhttp3/RequestBody;Lokhttp3/CacheControl;ILjava/lang/Object;)Lokhttp3/Request;") { runtime, args, _ in
+            runtime.makeRequest(url: runtime.stringValue(args[0]) ?? "", headers: args[1], method: "DELETE", body: args[2])
+        }
         result.append(requests)
 
         let okhttpExtensions = NativeClass("Leu/kanade/tachiyomi/network/OkHttpExtensionsKt;")
@@ -807,6 +1338,56 @@ enum MihonAPI {
             let document = JsoupHTML.parse(body ?? "", baseUri: baseUri)
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
         }
+        jsoupExtensions.staticMethod("asJsoup$default", "(Lokhttp3/Response;Ljava/lang/String;ILjava/lang/Object;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
+            var body: String? = runtime.stringValue(args[1])
+            var baseUri = ""
+            if body == nil, let payload = runtime.payload(args[0], as: VMResponsePayload.self) {
+                body = runtime.decode(bytes: Array(payload.body), charset: payload.contentType.flatMap { VMMediaTypePayload(text: $0).charset } ?? "UTF-8")
+                baseUri = runtime.payload(payload.request, as: VMRequestPayload.self)?.url ?? ""
+            }
+            let document = JsoupHTML.parse(body ?? "", baseUri: baseUri)
+            return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
+        }
+        jsoupExtensions.staticMethod("selectText", "(Lorg/jsoup/nodes/Element;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let element = runtime.payload(args[0], as: JElementPayload.self),
+                  let selector = runtime.stringValue(args[1]),
+                  let node = JsoupSelector.select(element.node, selector: selector).first else {
+                return args[2]
+            }
+            return runtime.newString(node.textContent())
+        }
+        jsoupExtensions.staticMethod("selectText$default", "(Lorg/jsoup/nodes/Element;Ljava/lang/String;Ljava/lang/String;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            guard let element = runtime.payload(args[0], as: JElementPayload.self),
+                  let selector = runtime.stringValue(args[1]),
+                  let node = JsoupSelector.select(element.node, selector: selector).first else {
+                return args[2]
+            }
+            return runtime.newString(node.textContent())
+        }
+        jsoupExtensions.staticMethod("selectInt", "(Lorg/jsoup/nodes/Element;Ljava/lang/String;I)I") { runtime, args, _ in
+            guard let element = runtime.payload(args[0], as: JElementPayload.self),
+                  let selector = runtime.stringValue(args[1]),
+                  let node = JsoupSelector.select(element.node, selector: selector).first,
+                  let value = Int32(node.textContent()) else {
+                return args[2]
+            }
+            return .int32(value)
+        }
+        jsoupExtensions.staticMethod("selectInt$default", "(Lorg/jsoup/nodes/Element;Ljava/lang/String;IILjava/lang/Object;)I") { runtime, args, _ in
+            guard let element = runtime.payload(args[0], as: JElementPayload.self),
+                  let selector = runtime.stringValue(args[1]),
+                  let node = JsoupSelector.select(element.node, selector: selector).first,
+                  let value = Int32(node.textContent()) else {
+                return args[2]
+            }
+            return .int32(value)
+        }
+        jsoupExtensions.staticMethod("attrOrText", "(Lorg/jsoup/nodes/Element;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let element = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let attribute = runtime.stringValue(args[1]) ?? ""
+            if attribute == "text" { return runtime.newString(element.node.textContent()) }
+            return runtime.newString(element.node.attribute(attribute) ?? "")
+        }
         result.append(jsoupExtensions)
 
         let appInfo = NativeClass("Leu/kanade/tachiyomi/AppInfo;", superclass: "Ljava/lang/Object;")
@@ -816,9 +1397,25 @@ enum MihonAPI {
         }
         appInfo.method("getVersionCode", "()I") { _, _, _ in .int32(1) }
         appInfo.method("getVersionName", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("0.1.0-mihoncompat") }
+        appInfo.method("getSupportedImageMimeTypes", "()Ljava/util/List;") { runtime, _, _ in
+            let types = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/heif", "image/avif", "image/jxl"]
+            return runtime.makeNative(
+                "Ljava/util/ArrayList;",
+                payload: VMListPayload(types.map { runtime.newString($0) })
+            )
+        }
         result.append(appInfo)
 
+        let networkHelperClass = result.first { $0.descriptor == "Leu/kanade/tachiyomi/network/NetworkHelper;" }
+        _ = networkHelperClass?.method("defaultUserAgentProvider", "()Ljava/lang/String;") { runtime, _, _ in
+            runtime.newString(MihonAPI.userAgent(sourceName: ""))
+        }
         return result
+    }
+
+    static func userAgent(sourceName: String) -> String {
+        let suffix = sourceName.isEmpty ? "" : " \(sourceName)"
+        return "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1\(suffix)"
     }
 
     // MARK: - MD5
@@ -930,10 +1527,13 @@ extension VMRuntime {
     }
 
     func withoutDomain(_ url: String) -> String {
-        if let range = url.range(of: "://") {
-            let remainder = url[range.upperBound...]
-            if let slash = remainder.firstIndex(of: "/") { return String(remainder[slash...]) }
-            return "/"
+        let escaped = url.replacingOccurrences(of: " ", with: "%20")
+        if let components = URLComponents(string: escaped), components.scheme != nil {
+            var path = components.percentEncodedPath
+            if path.isEmpty { path = "/" }
+            if let query = components.percentEncodedQuery { path += "?" + query }
+            if let fragment = components.percentEncodedFragment { path += "#" + fragment }
+            return path
         }
         return url
     }
@@ -956,8 +1556,45 @@ extension MihonAPI {
             signature: "Leu/kanade/tachiyomi/source/model/SChapter;",
             implementation: "Leu/kanade/tachiyomi/source/model/MihonSChapter;"
         ))
+        let pageCompanion = NativeClass("Leu/kanade/tachiyomi/source/model/Page$Companion;", superclass: "Ljava/lang/Object;")
+        pageCompanion.method("<init>", "()V") { _, _, _ in .zero }
+        result.append(pageCompanion)
+        result.append(suspendConstant())
         result.append(modelEnums())
+        result.append(readingMode())
         return result
+    }
+
+    /// Adapter used by `SMangaUpdate` when the extension provides suspend
+    /// accessors instead of eager values.
+    private static func suspendConstant() -> NativeClass {
+        let cls = NativeClass(
+            "Leu/kanade/tachiyomi/source/model/SuspendConstant;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/jvm/functions/Function1;"]
+        )
+        cls.method("invoke", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            (runtime.payload(args[0], as: VMConstantFunctionPayload.self)?.value) ?? .null
+        }
+        cls.method("invoke", "(Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            (runtime.payload(args[0], as: VMConstantFunctionPayload.self)?.value) ?? .null
+        }
+        cls.method("invoke", "()Ljava/lang/Object;") { runtime, args, _ in
+            (runtime.payload(args[0], as: VMConstantFunctionPayload.self)?.value) ?? .null
+        }
+        return cls
+    }
+
+    private static func readingMode() -> NativeClass {
+        let cls = NativeClass("Leu/kanade/tachiyomi/source/model/SManga$ReadingMode;", superclass: "Ljava/lang/Enum;")
+        let names = ["LEFT_TO_RIGHT", "RIGHT_TO_LEFT", "VERTICAL", "WEBTOON", "CONTINUOUS_VERTICAL"]
+        for name in names { cls.staticField(name, "Leu/kanade/tachiyomi/source/model/SManga$ReadingMode;") }
+        cls.prepare = { runtime, clazz in
+            for index in names.indices {
+                clazz.staticValues[index] = runtime.makeNative("Leu/kanade/tachiyomi/source/model/SManga$ReadingMode;", payload: NSNull())
+            }
+        }
+        return cls
     }
 
     private static func companion(_ descriptor: String, signature: String, implementation: String) -> NativeClass {

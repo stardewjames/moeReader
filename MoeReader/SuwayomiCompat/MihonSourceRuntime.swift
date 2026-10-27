@@ -89,6 +89,69 @@ struct MihonRuntimeDescriptor: Hashable, Sendable {
     var supportedPackages: Set<String>
 }
 
+struct MihonFilter: Identifiable, Hashable, Sendable {
+    enum Kind: String, Sendable {
+        case header
+        case separator
+        case text
+        case checkbox
+        case tristate
+        case select
+        case sort
+        case group
+    }
+
+    /// Positional path ("0.2.1") of the filter inside the source's filter list.
+    var id: String
+    var name: String
+    var kind: Kind
+    var entries: [String]
+    var entryValues: [String]
+    var value: String
+    var ascending: Bool
+    var children: [MihonFilter]
+
+    init(
+        id: String,
+        name: String,
+        kind: Kind,
+        entries: [String] = [],
+        entryValues: [String] = [],
+        value: String = "",
+        ascending: Bool = true,
+        children: [MihonFilter] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.entries = entries
+        self.entryValues = entryValues
+        self.value = value
+        self.ascending = ascending
+        self.children = children
+    }
+}
+
+struct MihonFilterSelection: Hashable, Sendable {
+    var value: String
+    var ascending: Bool
+
+    init(value: String, ascending: Bool = true) {
+        self.value = value
+        self.ascending = ascending
+    }
+}
+
+protocol MihonSourceFilterProviding: Sendable {
+    func filters(source: MihonSource) async throws -> [MihonFilter]
+    func search(
+        query: String,
+        source: MihonSource,
+        page: Int,
+        selections: [String: MihonFilterSelection]
+    ) async throws -> MihonMangaPage
+}
+
 protocol MihonSourceRuntime: Sendable {
     var descriptor: MihonRuntimeDescriptor { get }
     func popular(source: MihonSource, page: Int) async throws -> MihonMangaPage
