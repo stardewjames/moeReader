@@ -38,10 +38,14 @@ struct PagedReaderView: View {
                 readyDirection = model.direction
             }
             .onChange(of: model.visiblePage) {
-                scrollPosition = model.visiblePage
+                if scrollPosition != model.visiblePage {
+                    scrollPosition = model.visiblePage
+                }
             }
             .onChange(of: model.direction) {
-                scrollPosition = model.visiblePage
+                if scrollPosition != model.visiblePage {
+                    scrollPosition = model.visiblePage
+                }
             }
         }
     }
