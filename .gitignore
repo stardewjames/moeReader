@@ -5,6 +5,9 @@
 /Payload/
 *.ipa
 *.xcresult
+*.dSYM/
+*.profdata
+.swiftpm/
 xcuserdata/
 .DS_Store
 MoeReader/Info.plist
@@ -20,3 +23,9 @@ __pycache__/
 
 # Local reference checkouts and reverse-engineering artifacts.
 /.research/
+
+# CircleCI local project binding (contains project identifiers; keep private).
+/.circleci/info.yml
+
+# All CircleCI local/project files stay private.
+/.circleci/
