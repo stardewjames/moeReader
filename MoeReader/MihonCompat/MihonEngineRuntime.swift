@@ -294,8 +294,12 @@ struct MihonEngineFailure: Error, LocalizedError {
 /// Clears a Cloudflare interstitial by loading it in an off-screen WKWebView and
 /// waiting for the clearance cookie. The engine queue is not the main queue, so
 /// the wait is a semaphore; all WebKit work happens on the main actor.
-final class MihonChallengeSolver: NSObject {
+final class MihonChallengeSolver: NSObject, @unchecked Sendable {
     private var webView: WKWebView?
+
+    private final class CookieBox: @unchecked Sendable {
+        var value: HTTPCookie?
+    }
 
     func solve(url: URL) -> Bool {
         var cleared = false
@@ -322,16 +326,16 @@ final class MihonChallengeSolver: NSObject {
 
     private func clearanceCookie(for url: URL) -> HTTPCookie? {
         let semaphore = DispatchSemaphore(value: 0)
-        var cookie: HTTPCookie?
+        let box = CookieBox()
         DispatchQueue.main.async {
             guard let webView = self.webView else { semaphore.signal(); return }
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-                cookie = cookies.first { $0.name == "cf_clearance" && url.host?.hasSuffix($0.domain) == true }
+                box.value = cookies.first { $0.name == "cf_clearance" && url.host?.hasSuffix($0.domain) == true }
                 semaphore.signal()
             }
         }
         semaphore.wait()
-        return cookie
+        return box.value
     }
 
     private func copyWebCookiesToHTTPStorage() {
