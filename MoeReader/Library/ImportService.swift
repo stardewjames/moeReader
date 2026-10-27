@@ -61,8 +61,6 @@ enum ImportService {
         let bookDirectory = LibraryPaths.bookDir(documents: documents, id: id)
         let coversDirectory = LibraryPaths.coversDirectory(caches: caches)
         let coverURL = LibraryPaths.cover(caches: caches, id: id)
-        try fileManager.createDirectory(at: bookDirectory, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: coversDirectory, withIntermediateDirectories: true)
 
         var book = Book(
             id: id,
@@ -80,6 +78,8 @@ enum ImportService {
         )
 
         do {
+            try fileManager.createDirectory(at: bookDirectory, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: coversDirectory, withIntermediateDirectories: true)
             let destination = LibraryPaths.storedURL(for: book, documents: documents)
             do {
                 try fileManager.copyItem(at: url, to: destination)
