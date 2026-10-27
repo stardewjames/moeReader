@@ -749,8 +749,17 @@ enum JavaCore {
         }
         cls.staticMethod("valueOf", "(\(letter))\(descriptor)") { runtime, args, _ in
             guard let cls = runtime.findClass(descriptor) else { return .null }
+            let raw: Int64 = letter == "J" ? args[0].asInt64 : Int64(args[0].asInt32)
+            if raw >= -128, raw <= 127 {
+                if let cached = runtime.boxedPrimitiveCache[descriptor]?[raw] { return cached }
+                let pointer = runtime.allocateObject(cls)
+                VMObjectLayout.slot(pointer, 0).pointee = .int64(raw)
+                let value = VMValue.reference(pointer)
+                runtime.boxedPrimitiveCache[descriptor, default: [:]][raw] = value
+                return value
+            }
             let pointer = runtime.allocateObject(cls)
-            VMObjectLayout.slot(pointer, 0).pointee = args[0]
+            VMObjectLayout.slot(pointer, 0).pointee = .int64(raw)
             return .reference(pointer)
         }
         cls.staticMethod("valueOf", "(Ljava/lang/String;)\(descriptor)") { runtime, args, _ in
@@ -859,8 +868,17 @@ enum JavaCore {
         }
         cls.staticMethod("valueOf", "(C)Ljava/lang/Character;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Character;") else { return .null }
+            let raw = Int64(args[0].asUInt32)
+            if raw <= 127 {
+                if let cached = runtime.boxedPrimitiveCache["Ljava/lang/Character;"]?[raw] { return cached }
+                let pointer = runtime.allocateObject(cls)
+                VMObjectLayout.setAux(pointer, UInt64(raw))
+                let value = VMValue.reference(pointer)
+                runtime.boxedPrimitiveCache["Ljava/lang/Character;", default: [:]][raw] = value
+                return value
+            }
             let pointer = runtime.allocateObject(cls)
-            VMObjectLayout.setAux(pointer, UInt64(args[0].asUInt32))
+            VMObjectLayout.setAux(pointer, UInt64(raw))
             return .reference(pointer)
         }
         cls.staticMethod("isDigit", "(C)Z") { _, args, _ in
@@ -1038,7 +1056,9 @@ enum JavaCore {
             let value = args[0].asDouble
             if value.isNaN { return .int64(0) }
             let rounded = (value + 0.5).rounded(.down)
-            return .int64(Int64(min(max(rounded, Double(Int64.min)), Double(Int64.max))))
+            if rounded >= 9.223372036854775e18 { return .int64(Int64.max) }
+            if rounded <= -9.223372036854776e18 { return .int64(Int64.min) }
+            return .int64(Int64(rounded))
         }
         cls.staticMethod("floor", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.down)) }
         cls.staticMethod("ceil", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.up)) }

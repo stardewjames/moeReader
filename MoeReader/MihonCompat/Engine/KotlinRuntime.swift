@@ -168,6 +168,11 @@ enum KotlinRuntime {
         intrinsics.staticMethod("areEqual", "(Ljava/lang/Object;Ljava/lang/Object;)Z") { runtime, args, _ in
             .boolean(runtime.javaEquals(args[0], args[1]))
         }
+        intrinsics.staticMethod("checkNotNull", "(Ljava/lang/Object;)V") { _, args, _ in
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return .zero
+        }
+        intrinsics.staticMethod("checkHasClass", "(Ljava/lang/String;)V") { _, _, _ in .zero }
         intrinsics.staticMethod("stringPlus", "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             let left = runtime.stringValue(args[0]) ?? ""
             let right = runtime.stringValue(runtime.javaToString(args[1])) ?? "null"

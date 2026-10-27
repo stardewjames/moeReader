@@ -71,6 +71,7 @@ final class VMRuntime: @unchecked Sendable {
     var nativeObjects: [Any] = []
 
     private var stringConstants: [ObjectIdentifier: [Int: VMValue]] = [:]
+    var boxedPrimitiveCache: [String: [Int64: VMValue]] = [:]
     var instanceFieldOffsets: [FieldRefKey: Int] = [:]
     var staticFieldCache: [FieldRefKey: (VMClass, VMField)] = [:]
     private var classObjects: [ObjectIdentifier: VMValue] = [:]
@@ -369,6 +370,7 @@ final class VMRuntime: @unchecked Sendable {
         heap.reset()
         nativeObjects.removeAll(keepingCapacity: false)
         stringConstants.removeAll(keepingCapacity: false)
+        boxedPrimitiveCache.removeAll(keepingCapacity: false)
         classObjects.removeAll(keepingCapacity: false)
         genericDescriptorValue = nil
         jsonKindValue = nil
