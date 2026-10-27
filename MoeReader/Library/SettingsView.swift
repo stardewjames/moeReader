@@ -6,6 +6,28 @@ struct SettingsView: View {
     var body: some View {
         List {
             Section {
+                NavigationLink {
+                    MihonCompatView()
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "puzzlepiece.extension")
+                            .foregroundStyle(Palette.amber)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Mihon extensions")
+                                .foregroundStyle(.white)
+                            Text("Repositories, extension packages, and native source runtimes")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text("Sources")
+            } footer: {
+                Text("Supports Mihon-compatible extension repositories.")
+            }
+
+            Section {
                 ForEach(ReadingMode.concreteCases) { mode in
                     Button {
                         library.updateDefaultReadingMode(mode)

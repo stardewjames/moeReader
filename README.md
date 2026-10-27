@@ -1,6 +1,6 @@
 # MoeReader
 
-An offline comic reader for iPhone and iPad, built with SwiftUI and iOS 26
+A comic reader for iPhone and iPad, built with SwiftUI and iOS 26
 Liquid Glass.
 
 ![CI](https://github.com/stardewjames/moeReader/actions/workflows/ci.yml/badge.svg)
@@ -8,6 +8,14 @@ Liquid Glass.
 ## Features
 
 - Imports **CBZ**, uncompressed **CBT**, and image folders into an on-device library.
+- Browses **Mihon/Tachiyomi extension repositories**: parses `index.pb`, verifies
+  and installs extension APKs against the repository signing key, and exposes the
+  declared sources.
+- Runs installed lib-1.6 extensions on a **custom Dalvik engine** inside
+  `MihonCompat`: an in-process interpreter plus native Android, Kotlin, OkHttp,
+  Jsoup and `eu.kanade.tachiyomi` hosts. No JVM is embedded; a source call is
+  the only time the engine does work, and its arena is recycled so idle RAM
+  stays flat.
 - ZIP central-directory random access: archives are opened, not extracted.
 - Stored ZIP/TAR pages are decoded directly from the mapped file (zero-copy payloads).
 - Off-main ImageIO downsampling with a bounded decoded-image cache and ±2-page prefetch.
@@ -22,8 +30,17 @@ Liquid Glass.
 - Covers are generated on import and cached separately from the library.
 - Imported books are excluded from iCloud backup; covers live in Caches.
 
-Out of scope for this milestone: online sources, CBR, and CB7. `PageSource` is
-the extension seam for future remote sources.
+**Extension scope:** `SuwayomiCompat` owns repository discovery, signed installs,
+updates and the reader UI. `MihonCompat` owns execution: it interprets the
+extension's Dalvik bytecode and supplies the platform surface. Extensions whose
+API use falls inside that surface run without any site-specific Swift code;
+`MihonCompat/README.md` lists the exact surface and the known gaps (for example
+`kotlinx.serialization` encoding, and lib-1.4 extensions). See
+[`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md) and
+[`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md).
+
+Still out of scope: CBR, CB7, and Android framework features the engine does not
+provide (WebView, image codecs inside extensions, JNI).
 
 ## Requirements
 
@@ -91,6 +108,12 @@ They cover:
 `TestManga/` contains real-world archives used for manual performance checks and
 is ignored by git.
 
+The Mihon compatibility tests use a synthetic, self-signed APK fixture and a
+small protobuf index fixture; no third-party extension code is committed. The
+engine's core tests run against a generated `engine-probe.dex`; the end-to-end
+extension test is skipped unless `MOEREADER_ENGINE_APK` points at a real
+extension APK.
+
 ## Project layout
 
 ```text
@@ -101,6 +124,8 @@ MoeReader/
     Image/      ImageIO decoding, cache, JPEG covers
     Diagnostics Signposts
   Library/      Book model, persistence, import, covers, library UI, settings
+  SuwayomiCompat/  Mihon repositories, APK verification, native runtime profiles, UI
+  MihonCompat/  Dalvik extension engine, platform hosts, Mihon source API
   Reader/       Reader model, scroll modes, zoom, chrome
 MoeReaderTests/ Unit tests and fixtures
 MoeReaderUITests/ End-to-end import/read/mode-switch test
@@ -111,7 +136,12 @@ scripts/        Fixture generation and CI test script
 
 Open the app under Instruments with the Time Profiler and Hangs templates. The
 `open-source` and `decode-page` signposts should show archive opening away from
-the main thread and page decodes off-main. To run the manual benchmark, set
+the main thread and page decodes off-main.
+
+The extension engine runs only during a source call, on its own serial queue,
+and recycles its arena above a watermark. `MihonCompat/README.md` documents the
+execution model and the measured cost of a source operation; the engine has no
+timers, background work, or JIT. To run the manual benchmark, set
 `MOEREADER_BENCH_CBZ` to a real CBZ path in the scheme's Test action environment
 and run `testRealArchiveBenchmark`; it is skipped when the variable is absent.
 

@@ -1,0 +1,928 @@
+//
+//  Interpreter.swift
+//  MihonCompat
+//
+//  Dalvik bytecode interpreter. Hot paths stay allocation-free: registers are
+//  bump-allocated, operands are read straight from the dex buffer, and method
+//  resolution is cached on the class (or the field cache) after first use.
+//
+
+import Foundation
+
+extension VMRuntime {
+
+    @discardableResult
+    func execute(method: VMMethod, code: DexCode, arguments: UnsafePointer<VMValue>, argumentCount: Int) throws -> VMValue {
+        let registerCount = code.registersSize
+        guard registerCount > 0, registerCount <= 0xFFFF else {
+            throw VMError.corrupt("bad register count \(registerCount)")
+        }
+
+        let registers = heap.allocate(bytes: registerCount * 8, alignment: 8)
+            .assumingMemoryBound(to: VMValue.self)
+        for index in 0..<registerCount { registers[index] = .zero }
+
+        let parameterRegisters = method.parameterRegisterCount
+        let firstParameter = registerCount - parameterRegisters
+        if firstParameter >= 0, argumentCount > 0 {
+            let copyCount = min(parameterRegisters, argumentCount)
+            for index in 0..<copyCount {
+                registers[firstParameter + index] = arguments[index]
+            }
+        }
+
+        callDepth += 1
+        defer { callDepth -= 1 }
+        guard callDepth < 400 else {
+            throw VMJavaException("Ljava/lang/StackOverflowError;", "interpreter call depth exceeded")
+        }
+        let callerOwner = method.ownerDescriptor
+        let callerClass = try linkClass(callerOwner)
+        let previousFrame = currentFrame
+        currentFrame = "\(callerOwner).\(method.key)"
+        let insnUnits = code.insnUnits
+        var pc = 0
+        var result: VMValue = .zero
+        var pendingException: VMValue = .zero
+        var instructions = 0
+        var lastPC = 0
+        var lastOpcode = 0
+
+        func failure(_ descriptor: String, _ message: String? = nil) -> VMJavaException {
+            let detail = "\(method.key) at pc \(lastPC) op=0x\(String(lastOpcode, radix: 16)) regs=\(registerCount)" + (message.map { ": \($0)" } ?? "")
+            return VMJavaException(descriptor, detail)
+        }
+
+        while true {
+            do {
+                guard pc >= 0, pc < insnUnits else {
+                    throw VMError.corrupt("pc out of range in \(callerOwner).\(method.key)")
+                }
+                instructions += 1
+                if instructions & 0x3FF == 0 {
+                    try instructionTick(1024)
+                }
+                lastPC = pc
+                let unit = code.unit(pc)
+                let opcode = UInt8(unit & 0xFF)
+                lastOpcode = Int(opcode)
+                let u1 = pc + 1 < insnUnits ? code.unit(pc + 1) : 0
+                let u2 = pc + 2 < insnUnits ? code.unit(pc + 2) : 0
+
+                switch opcode {
+                // MARK: moves
+                case 0x00: // nop / payload
+                    pc += 1
+                case 0x01: // move
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = registers[b]
+                    pc += 1
+                case 0x02: // move/from16
+                    let a = Int(unit >> 8), b = Int(u1)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = registers[b]
+                    pc += 2
+                case 0x03: // move/16
+                    let a = Int(u1), b = Int(u2)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = registers[b]
+                    pc += 3
+                case 0x04, 0x05, 0x06: // move-wide variants
+                    let a: Int, b: Int
+                    if opcode == 0x04 {
+                        a = Int((unit >> 8) & 0xF); b = Int((unit >> 12) & 0xF)
+                        pc += 1
+                    } else if opcode == 0x05 {
+                        a = Int(unit >> 8); b = Int(u1)
+                        pc += 2
+                    } else {
+                        a = Int(u1); b = Int(u2)
+                        pc += 3
+                    }
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = registers[b]
+                case 0x07, 0x08, 0x09: // move-object variants
+                    let a: Int, b: Int
+                    if opcode == 0x07 {
+                        a = Int((unit >> 8) & 0xF); b = Int((unit >> 12) & 0xF)
+                        pc += 1
+                    } else if opcode == 0x08 {
+                        a = Int(unit >> 8); b = Int(u1)
+                        pc += 2
+                    } else {
+                        a = Int(u1); b = Int(u2)
+                        pc += 3
+                    }
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = registers[b]
+                case 0x0a: // move-result
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = result
+                    pc += 1
+                case 0x0b: // move-result-wide
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = result
+                    pc += 1
+                case 0x0c: // move-result-object
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = result
+                    pc += 1
+                    _ = a
+                case 0x0d: // move-exception
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = pendingException
+                    pendingException = .zero
+                    pc += 1
+
+                // MARK: returns
+                case 0x0e: // return-void
+                    return .zero
+                case 0x0f: // return
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    return registers[a]
+                case 0x10: // return-wide
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    return registers[a]
+                case 0x11: // return-object
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    return registers[a]
+
+                // MARK: constants
+                case 0x12: // const/4
+                    let a = Int((unit >> 8) & 0xF)
+                    let nibble = Int(unit >> 12) & 0xF
+                    let value = Int32(nibble & 0x8 != 0 ? nibble - 16 : nibble)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int32(value)
+                    pc += 1
+                case 0x13: // const/16
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int32(Int32(Int16(bitPattern: u1)))
+                    pc += 2
+                case 0x14: // const
+                    let a = Int(unit >> 8)
+                    let value = UInt32(u1) | (UInt32(u2) << 16)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int32(Int32(bitPattern: value))
+                    pc += 3
+                case 0x15: // const/high16
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int32(Int32(bitPattern: UInt32(u1) << 16))
+                    pc += 2
+                case 0x16: // const-wide/16
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int64(Int64(Int16(bitPattern: u1)))
+                    pc += 2
+                case 0x17: // const-wide/32
+                    let a = Int(unit >> 8)
+                    let value = Int64(Int32(bitPattern: UInt32(u1) | (UInt32(u2) << 16)))
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int64(value)
+                    pc += 3
+                case 0x18: // const-wide
+                    let a = Int(unit >> 8)
+                    let u3 = pc + 3 < insnUnits ? code.unit(pc + 3) : 0
+                    let u4 = pc + 4 < insnUnits ? code.unit(pc + 4) : 0
+                    let value = UInt64(u1) | (UInt64(u2) << 16) | (UInt64(u3) << 32) | (UInt64(u4) << 48)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int64(Int64(bitPattern: value))
+                    pc += 5
+                case 0x19: // const-wide/high16
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = .int64(Int64(bitPattern: UInt64(u1) << 48))
+                    pc += 2
+                case 0x1a: // const-string
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex for string") }
+                    registers[a] = stringConstant(dex: dex, index: Int(u1))
+                    pc += 2
+                case 0x1b: // const-string/jumbo
+                    let a = Int(unit >> 8)
+                    let index = Int(u1) | (Int(u2) << 16)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex for string") }
+                    registers[a] = stringConstant(dex: dex, index: index)
+                    pc += 3
+                case 0x1c: // const-class
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let cls = try linkClass(dex.type(at: Int(u1)))
+                    registers[a] = classObject(cls)
+                    pc += 2
+                case 0x1d, 0x1e: // monitor-enter/exit
+                    let a = Int(unit >> 8)
+                    guard a < registerCount, registers[a].bits != 0 else {
+                        throw failure("Ljava/lang/NullPointerException;", "monitor on null")
+                    }
+                    pc += 1
+
+                // MARK: objects
+                case 0x1f: // check-cast
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let cls = try linkClass(dex.type(at: Int(u1)))
+                    registers[a] = try checkCast(registers[a], to: cls)
+                    pc += 2
+                case 0x20: // instance-of
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let cls = try linkClass(dex.type(at: Int(u1)))
+                    registers[a] = .boolean(isInstance(registers[b], of: cls))
+                    pc += 2
+                case 0x21: // array-length
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let pointer = registers[b].object else { throw failure("Ljava/lang/NullPointerException;") }
+                    registers[a] = .int32(Int32(Int(VMObjectLayout.aux(pointer))))
+                    pc += 1
+                case 0x22: // new-instance
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let cls = try linkClass(dex.type(at: Int(u1)))
+                    try ensureInitialized(cls)
+                    registers[a] = .reference(allocateObject(cls))
+                    pc += 2
+                case 0x23: // new-array
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let descriptor = dex.type(at: Int(u1))
+                    guard descriptor.first == "[" else { throw failure("Ljava/lang/VerifyError;", "new-array of non-array type") }
+                    let count = Int(registers[b].asInt32)
+                    guard count >= 0, count < 1 << 26 else { throw failure("Ljava/lang/NegativeArraySizeException;") }
+                    registers[a] = .reference(allocateArray(descriptor: descriptor, count: count))
+                    pc += 2
+                case 0x24: // filled-new-array
+                    let count = Int((unit >> 12) & 0xF)
+                    let g = Int((unit >> 8) & 0xF)
+                    let c = Int((u2) & 0xF), d = Int((u2 >> 4) & 0xF)
+                    let e = Int((u2 >> 8) & 0xF), f = Int((u2 >> 12) & 0xF)
+                    let registerList = [c, d, e, f, g]
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let descriptor = dex.type(at: Int(u1))
+                    guard descriptor.first == "[" else { throw failure("Ljava/lang/VerifyError;", "filled-new-array of non-array type") }
+                    let array = allocateArray(descriptor: descriptor, count: count)
+                    for index in 0..<count {
+                        let source = registerList[index]
+                        guard source < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                        VMObjectLayout.slot(array, index).pointee = registers[source]
+                    }
+                    result = .reference(array)
+                    pc += 3
+                case 0x25: // filled-new-array/range
+                    let count = Int(unit >> 8)
+                    let first = Int(u2)
+                    guard let dex = method.ownerDex else { throw VMError.corrupt("missing dex") }
+                    let descriptor = dex.type(at: Int(u1))
+                    guard descriptor.first == "[" else { throw failure("Ljava/lang/VerifyError;", "filled-new-array of non-array type") }
+                    let array = allocateArray(descriptor: descriptor, count: count)
+                    for index in 0..<count {
+                        let source = first + index
+                        guard source < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                        VMObjectLayout.slot(array, index).pointee = registers[source]
+                    }
+                    result = .reference(array)
+                    pc += 3
+                case 0x26: // fill-array-data
+                    let a = Int(unit >> 8)
+                    guard a < registerCount, let pointer = registers[a].object else {
+                        throw failure("Ljava/lang/NullPointerException;")
+                    }
+                    let offset = Int(Int32(bitPattern: UInt32(u1) | (UInt32(u2) << 16)))
+                    let payload = pc + offset
+                    guard payload >= 0, payload + 4 < insnUnits, code.unit(payload) == 0x0300 else {
+                        throw VMError.corrupt("bad fill-array-data payload")
+                    }
+                    let width = Int(code.unit(payload + 1))
+                    guard width > 0, width <= 8 else { throw VMError.corrupt("bad fill-array-data width") }
+                    let size = Int(UInt32(code.unit(payload + 2)) | (UInt32(code.unit(payload + 3)) << 16))
+                    let count = Int(VMObjectLayout.aux(pointer))
+                    let copyCount = min(size, count)
+                    let available = (insnUnits - (payload + 4)) * 2
+                    guard size >= 0, width <= 8, copyCount * width <= available else {
+                        throw VMError.corrupt("fill-array-data payload out of bounds")
+                    }
+                    let data = UnsafeRawPointer(code.insns) + (payload + 4) * 2
+                    for index in 0..<copyCount {
+                        var value: UInt64 = 0
+                        for byte in 0..<width {
+                            value |= UInt64(data.load(fromByteOffset: index * width + byte, as: UInt8.self)) << UInt64(byte * 8)
+                        }
+                        VMObjectLayout.slot(pointer, index).pointee = VMValue(bits: value)
+                    }
+                    pc += 3
+                case 0x27: // throw
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let value = registers[a]
+                    guard value.bits != 0, let pointer = value.object else {
+                        throw failure("Ljava/lang/NullPointerException;", "throw null")
+                    }
+                    let cls = VMObjectLayout.cls(pointer)
+                    var exception = VMJavaException(cls.descriptor, nil)
+                    exception.object = value
+                    throw exception
+                case 0x28: // goto
+                    let offset = Int(Int8(bitPattern: UInt8((unit >> 8) & 0xFF)))
+                    pc += offset
+                case 0x29: // goto/16
+                    pc += Int(Int16(bitPattern: u1))
+                case 0x2a: // goto/32
+                    pc += Int(Int32(bitPattern: UInt32(u1) | (UInt32(u2) << 16)))
+                case 0x2b: // packed-switch
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let offset = Int(Int32(bitPattern: UInt32(u1) | (UInt32(u2) << 16)))
+                    let payload = pc + offset
+                    guard payload >= 0, payload + 2 < insnUnits, code.unit(payload) == 0x0100 else {
+                        throw VMError.corrupt("bad packed-switch payload")
+                    }
+                    let size = Int(code.unit(payload + 1))
+                    guard payload + 4 + size * 2 <= insnUnits else { throw VMError.corrupt("packed-switch overflow") }
+                    let firstKey = Int32(bitPattern: UInt32(code.unit(payload + 2)) | (UInt32(code.unit(payload + 3)) << 16))
+                    let key = registers[a].asInt32
+                    if key >= firstKey, key < firstKey &+ Int32(size) {
+                        let index = Int(key - firstKey)
+                        let target = Int(Int32(bitPattern: UInt32(code.unit(payload + 4 + index * 2))
+                            | (UInt32(code.unit(payload + 5 + index * 2)) << 16)))
+                        pc += target
+                    } else {
+                        pc += 3
+                    }
+                case 0x2c: // sparse-switch
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let offset = Int(Int32(bitPattern: UInt32(u1) | (UInt32(u2) << 16)))
+                    let payload = pc + offset
+                    guard payload >= 0, payload + 2 < insnUnits, code.unit(payload) == 0x0200 else {
+                        throw VMError.corrupt("bad sparse-switch payload")
+                    }
+                    let size = Int(code.unit(payload + 1))
+                    guard payload + 2 + size * 4 <= insnUnits else { throw VMError.corrupt("sparse-switch overflow") }
+                    let key = registers[a].asInt32
+                    var target: Int?
+                    for index in 0..<size {
+                        let base = payload + 2 + index * 2
+                        let candidate = Int32(bitPattern: UInt32(code.unit(base)) | (UInt32(code.unit(base + 1)) << 16))
+                        if candidate == key {
+                            let targetBase = payload + 2 + size * 2 + index * 2
+                            target = Int(Int32(bitPattern: UInt32(code.unit(targetBase))
+                                | (UInt32(code.unit(targetBase + 1)) << 16)))
+                            break
+                        }
+                    }
+                    if let target { pc += target } else { pc += 3 }
+
+                // MARK: comparisons
+                case 0x2d, 0x2e, 0x2f, 0x30, 0x31: // cmp*
+                    let a = Int(unit >> 8), b = Int(u1 & 0xFF), c = Int(u1 >> 8)
+                    guard a < registerCount, b < registerCount, c < registerCount else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    let left = registers[b], right = registers[c]
+                    let comparison: Int32
+                    switch opcode {
+                    case 0x2d: // cmpl-float
+                        let x = left.asFloat, y = right.asFloat
+                        comparison = x.isNaN || y.isNaN ? -1 : (x < y ? -1 : (x > y ? 1 : 0))
+                    case 0x2e: // cmpg-float
+                        let x = left.asFloat, y = right.asFloat
+                        comparison = x.isNaN || y.isNaN ? 1 : (x < y ? -1 : (x > y ? 1 : 0))
+                    case 0x2f: // cmpl-double
+                        let x = left.asDouble, y = right.asDouble
+                        comparison = x.isNaN || y.isNaN ? -1 : (x < y ? -1 : (x > y ? 1 : 0))
+                    case 0x30: // cmpg-double
+                        let x = left.asDouble, y = right.asDouble
+                        comparison = x.isNaN || y.isNaN ? 1 : (x < y ? -1 : (x > y ? 1 : 0))
+                    default: // cmp-long
+                        let x = left.asInt64, y = right.asInt64
+                        comparison = x < y ? -1 : (x > y ? 1 : 0)
+                    }
+                    registers[a] = .int32(comparison)
+                    pc += 2
+
+                // MARK: branches
+                case 0x32, 0x33, 0x34, 0x35, 0x36, 0x37:
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let left = registers[a], right = registers[b]
+                    let taken: Bool
+                    switch opcode {
+                    case 0x32: taken = left.bits == right.bits
+                    case 0x33: taken = left.bits != right.bits
+                    case 0x34: taken = left.asInt32 < right.asInt32
+                    case 0x35: taken = left.asInt32 >= right.asInt32
+                    case 0x36: taken = left.asInt32 > right.asInt32
+                    default: taken = left.asInt32 <= right.asInt32
+                    }
+                    pc += taken ? Int(Int16(bitPattern: u1)) : 2
+                case 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d:
+                    let a = Int(unit >> 8)
+                    guard a < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let value = registers[a].asInt32
+                    let taken: Bool
+                    switch opcode {
+                    case 0x38: taken = value == 0
+                    case 0x39: taken = value != 0
+                    case 0x3a: taken = value < 0
+                    case 0x3b: taken = value >= 0
+                    case 0x3c: taken = value > 0
+                    default: taken = value <= 0
+                    }
+                    pc += taken ? Int(Int16(bitPattern: u1)) : 2
+
+                // MARK: array access
+                case 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a:
+                    let a = Int(unit >> 8), b = Int(u1 & 0xFF), c = Int(u1 >> 8)
+                    guard a < registerCount, b < registerCount, c < registerCount else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    guard let pointer = registers[b].object else { throw failure("Ljava/lang/NullPointerException;") }
+                    let index = Int(registers[c].asInt32)
+                    let count = Int(VMObjectLayout.aux(pointer))
+                    guard index >= 0, index < count else { throw failure("Ljava/lang/ArrayIndexOutOfBoundsException;") }
+                    registers[a] = VMObjectLayout.slot(pointer, index).pointee
+                    pc += 2
+                case 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51:
+                    let a = Int(unit >> 8), b = Int(u1 & 0xFF), c = Int(u1 >> 8)
+                    guard a < registerCount, b < registerCount, c < registerCount else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    guard let pointer = registers[b].object else { throw failure("Ljava/lang/NullPointerException;") }
+                    let index = Int(registers[c].asInt32)
+                    let count = Int(VMObjectLayout.aux(pointer))
+                    guard index >= 0, index < count else { throw failure("Ljava/lang/ArrayIndexOutOfBoundsException;") }
+                    var value = registers[a]
+                    if opcode == 0x4d { // aput-object: verify reference type
+                        let arrayClass = VMObjectLayout.cls(pointer)
+                        if value.bits != 0, let component = componentClass(of: arrayClass) {
+                            guard isInstance(value, of: component) else {
+                                throw failure("Ljava/lang/ArrayStoreException;")
+                            }
+                        }
+                    }
+                    if opcode == 0x4b { value = .int32(value.asInt32) }
+                    VMObjectLayout.slot(pointer, index).pointee = value
+                    pc += 2
+
+                // MARK: instance fields
+                case 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58:
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount, let dex = method.ownerDex,
+                          let ref = dex.fieldRef(at: Int(u1)) else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    guard let pointer = registers[b].object else { throw failure("Ljava/lang/NullPointerException;") }
+                    let offset = try instanceFieldOffset(dex: dex, index: Int(u1), ref: ref)
+                    registers[a] = VMObjectLayout.slot(pointer, offset).pointee
+                    pc += 2
+                case 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f:
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount, let dex = method.ownerDex,
+                          let ref = dex.fieldRef(at: Int(u1)) else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    guard let pointer = registers[b].object else { throw failure("Ljava/lang/NullPointerException;") }
+                    let offset = try instanceFieldOffset(dex: dex, index: Int(u1), ref: ref)
+                    VMObjectLayout.slot(pointer, offset).pointee = registers[a]
+                    pc += 2
+
+                // MARK: static fields
+                case 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66:
+                    let a = Int(unit >> 8)
+                    guard a < registerCount, let dex = method.ownerDex, let ref = dex.fieldRef(at: Int(u1)) else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    let resolved = try staticField(dex: dex, index: Int(u1), ref: ref)
+                    registers[a] = resolved.0.staticValues[resolved.1.offset]
+                    pc += 2
+                case 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d:
+                    let a = Int(unit >> 8)
+                    guard a < registerCount, let dex = method.ownerDex, let ref = dex.fieldRef(at: Int(u1)) else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    let resolved = try staticField(dex: dex, index: Int(u1), ref: ref)
+                    resolved.0.staticValues[resolved.1.offset] = registers[a]
+                    pc += 2
+
+                // MARK: invokes
+                case 0x6e, 0x6f, 0x70, 0x71, 0x72:
+                    let count = Int((unit >> 12) & 0xF)
+                    let g = Int((unit >> 8) & 0xF)
+                    let c = Int(u2 & 0xF), d = Int((u2 >> 4) & 0xF)
+                    let e = Int((u2 >> 8) & 0xF), f = Int((u2 >> 12) & 0xF)
+                    let registerList = [c, d, e, f, g]
+                    guard count <= registerList.count else { throw failure("Ljava/lang/VerifyError;") }
+                    result = try invokeOpcode(
+                        opcode: opcode,
+                        methodIndex: Int(u1),
+                        registers: registers,
+                        registerList: registerList,
+                        count: count,
+                        caller: callerClass,
+                        dex: method.ownerDex
+                    )
+                    pc += 3
+                case 0x74, 0x75, 0x76, 0x77, 0x78:
+                    let count = Int(unit >> 8)
+                    let first = Int(u2)
+                    guard first + count <= registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    result = try invokeRangeOpcode(
+                        opcode: opcode,
+                        methodIndex: Int(u1),
+                        registers: registers,
+                        first: first,
+                        count: count,
+                        caller: callerClass,
+                        dex: method.ownerDex
+                    )
+                    pc += 3
+
+                // MARK: unary operations
+                case 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f:
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = unary(opcode: opcode, value: registers[b])
+                    pc += 1
+
+                // MARK: binary operations (23x)
+                case 0x90...0xaf:
+                    let a = Int(unit >> 8), b = Int(u1 & 0xFF), c = Int(u1 >> 8)
+                    guard a < registerCount, b < registerCount, c < registerCount else {
+                        throw failure("Ljava/lang/VerifyError;")
+                    }
+                    registers[a] = try binary(opcode: opcode, left: registers[b], right: registers[c])
+                    pc += 2
+                // MARK: binary operations (12x, /2addr)
+                case 0xb0...0xcf:
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    registers[a] = try binary(opcode: opcode - 0x20, left: registers[a], right: registers[b])
+                    pc += 1
+                // MARK: binary operations (lit16)
+                case 0xd0...0xd7:
+                    let a = Int((unit >> 8) & 0xF), b = Int((unit >> 12) & 0xF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let literal = VMValue.int32(Int32(Int16(bitPattern: u1)))
+                    if opcode == 0xd1 {
+                        registers[a] = try binary(opcode: 0x91, left: literal, right: registers[b])
+                    } else {
+                        registers[a] = try binary(opcode: opcode - 0x40, left: registers[b], right: literal)
+                    }
+                    pc += 2
+                case 0xd8...0xe2:
+                    let a = Int(unit >> 8), b = Int(u1 & 0xFF)
+                    guard a < registerCount, b < registerCount else { throw failure("Ljava/lang/VerifyError;") }
+                    let literal = VMValue.int32(Int32(Int8(bitPattern: UInt8(u1 >> 8))))
+                    if opcode == 0xd9 {
+                        registers[a] = try binary(opcode: 0x91, left: literal, right: registers[b])
+                    } else {
+                        registers[a] = try binary(opcode: opcode - 0x48, left: registers[b], right: literal)
+                    }
+                    pc += 2
+
+                case 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff:
+                    throw VMError.unsupported("opcode 0x\(String(opcode, radix: 16))")
+
+                default:
+                    throw VMError.unsupported("opcode 0x\(String(opcode, radix: 16))")
+                }
+            } catch let exception as VMJavaException {
+                if exception.classDescriptor.contains("VerifyError"),
+                   ProcessInfo.processInfo.environment["MIHON_VM_DEBUG"] != nil {
+                    var dump = "\(method.key) regs=\(registerCount) ins=\(code.insSize) pc=\(pc) units="
+                    for index in 0..<min(code.insnUnits, 80) { dump += String(format: "%04x ", code.unit(index)) }
+                    FileHandle.standardError.write((dump + "\n").data(using: .utf8)!)
+                }
+                var exception = exception
+                if exception.object.bits == 0 {
+                    exception.object = makeThrowable(exception.classDescriptor, message: exception.message)
+                }
+                if let handler = handlerFor(exception.object, code: code, pc: pc) {
+                    pendingException = exception.object
+                    pc = handler
+                    continue
+                }
+                if ProcessInfo.processInfo.environment["MIHON_VM_DEBUG"] != nil {
+                    let cls = exception.object.object.map { VMObjectLayout.cls($0).descriptor } ?? "-"
+                    var exceptionMessage = ""
+                    if let object = exception.object.object, let field = VMObjectLayout.cls(object).field(named: "detailMessage") {
+                        exceptionMessage = stringValue(VMObjectLayout.slot(object, field.offset).pointee) ?? ""
+                    }
+                    var dump = "uncaught \(cls) \(exceptionMessage) in \(method.key) pc=\(pc) tries=\(code.tries.count)"
+                    for block in code.tries {
+                        dump += " [\(block.startPC)+\(block.insnCount)"
+                        for handler in block.handlers { dump += " \(handler.type)@\(handler.address)" }
+                        if let catchAll = block.catchAll { dump += " all@\(catchAll)" }
+                        dump += "]"
+                    }
+                    FileHandle.standardError.write((dump + "\n").data(using: .utf8)!)
+                }
+                throw exception
+            }
+        }
+    }
+
+    // MARK: - Operand helpers
+
+    @inline(__always)
+    private func componentClass(of arrayClass: VMClass) -> VMClass? {
+        guard let component = arrayClass.arrayComponent else { return nil }
+        return findClass(component)
+    }
+
+    private func handlerFor(_ exception: VMValue, code: DexCode, pc: Int) -> Int? {
+        guard !code.tries.isEmpty, let object = exception.object else { return nil }
+        let cls = VMObjectLayout.cls(object)
+        for block in code.tries {
+            guard pc >= block.startPC, pc < block.startPC + block.insnCount else { continue }
+            for handler in block.handlers {
+                if let handlerClass = findClass(handler.type), cls.isSubclass(of: handlerClass) {
+                    return handler.address
+                }
+            }
+            if let catchAll = block.catchAll { return catchAll }
+        }
+        return nil
+    }
+
+    // MARK: - Field resolution
+
+    func instanceFieldOffset(dex: DexFile, index: Int, ref: DexFieldRef) throws -> Int {
+        let key = FieldRefKey(dex: ObjectIdentifier(dex), index: index)
+        if let cached = instanceFieldOffsets[key] { return cached }
+        let owner = try linkClass(ref.className)
+        guard let field = owner.resolveField(key: ref.name + ":" + ref.type) else {
+            throw VMJavaException("Ljava/lang/NoSuchFieldError;", "\(owner.displayName).\(ref.name)")
+        }
+        instanceFieldOffsets[key] = field.offset
+        return field.offset
+    }
+
+    func staticField(dex: DexFile, index: Int, ref: DexFieldRef) throws -> (VMClass, VMField) {
+        let key = FieldRefKey(dex: ObjectIdentifier(dex), index: index)
+        if let cached = staticFieldCache[key] { return cached }
+        let owner = try linkClass(ref.className)
+        try ensureInitialized(owner)
+        guard let field = owner.resolveStaticField(key: ref.name + ":" + ref.type) else {
+            throw VMJavaException("Ljava/lang/NoSuchFieldError;", "\(owner.displayName).\(ref.name)")
+        }
+        staticFieldCache[key] = (owner, field)
+        return (owner, field)
+    }
+
+    // MARK: - Method invocation from bytecode
+
+    func invokeOpcode(
+        opcode: UInt8,
+        methodIndex: Int,
+        registers: UnsafeMutablePointer<VMValue>,
+        registerList: [Int],
+        count: Int,
+        caller: VMClass,
+        dex: DexFile?
+    ) throws -> VMValue {
+        guard let dex, let ref = dex.methodRef(at: methodIndex) else {
+            throw VMError.corrupt("missing method ref")
+        }
+        let key = ref.name + DexDescriptor.methodSignature(ref.proto)
+        do {
+            let callee: VMMethod
+            switch opcode {
+            case 0x6e, 0x72: // virtual, interface
+                guard count >= 1, let receiver = registers[registerList[0]].object else {
+                    throw VMJavaException("Ljava/lang/NullPointerException;", "invoke on null: \(key) in \(currentFrame)")
+                }
+                let cls = VMObjectLayout.cls(receiver)
+                guard let found = cls.lookupVirtual(key: key) else {
+                    if let declared = try linkClass(ref.className).findMethodByKey(key) {
+                        if traceEnabled {
+                            FileHandle.standardError.write("VIRT-MISS receiver=\(cls.displayName) ref=\(ref.className) key=\(key)\n".data(using: .utf8)!)
+                        }
+                        throw VMJavaException("Ljava/lang/AbstractMethodError;", declared.key)
+                    }
+                    throw VMJavaException("Ljava/lang/NoSuchMethodError;", "\(cls.displayName).\(key)")
+                }
+                callee = found
+            case 0x70: // direct
+                let owner = try linkClass(ref.className)
+                guard let found = owner.findMethodByKey(key) else {
+                    throw VMJavaException("Ljava/lang/NoSuchMethodError;", "\(owner.displayName).\(key)")
+                }
+                callee = found
+            case 0x6f: // super
+                let start = caller.superclass ?? caller
+                guard let found = start.findMethodByKey(key) ?? caller.findInterfaceDefaultForSuper(key) else {
+                    throw VMJavaException("Ljava/lang/NoSuchMethodError;", key)
+                }
+                callee = found
+            default: // static
+                let owner = try linkClass(ref.className)
+                try ensureInitialized(owner)
+                guard let found = owner.lookupStatic(ref.name, DexDescriptor.methodSignature(ref.proto)) else {
+                    throw VMJavaException("Ljava/lang/NoSuchMethodError;", "\(owner.displayName).\(key)")
+                }
+                callee = found
+            }
+            let argumentCount = callee.parameterRegisterCount
+            return try withUnsafeTemporaryAllocation(of: VMValue.self, capacity: max(argumentCount, count)) { buffer in
+                let limit = min(count, argumentCount)
+                for index in 0..<limit {
+                    buffer[index] = registers[registerList[index]]
+                }
+                return try invoke(callee, arguments: buffer.baseAddress!, count: argumentCount)
+            }
+        }
+    }
+
+    func invokeRangeOpcode(
+        opcode: UInt8,
+        methodIndex: Int,
+        registers: UnsafeMutablePointer<VMValue>,
+        first: Int,
+        count: Int,
+        caller: VMClass,
+        dex: DexFile?
+    ) throws -> VMValue {
+        guard let dex, let ref = dex.methodRef(at: methodIndex) else {
+            throw VMError.corrupt("missing method ref")
+        }
+        let key = ref.name + DexDescriptor.methodSignature(ref.proto)
+        let callee: VMMethod
+        switch opcode {
+        case 0x74, 0x78:
+            guard count >= 1, let receiver = registers[first].object else {
+                throw VMJavaException("Ljava/lang/NullPointerException;", "invoke on null in \(currentFrame)")
+            }
+            let cls = VMObjectLayout.cls(receiver)
+            guard let found = cls.lookupVirtual(key: key) else {
+                throw VMJavaException("Ljava/lang/NoSuchMethodError;", "\(cls.displayName).\(key)")
+            }
+            callee = found
+        case 0x76:
+            let owner = try linkClass(ref.className)
+            guard let found = owner.findMethodByKey(key) else {
+                throw VMJavaException("Ljava/lang/NoSuchMethodError;", "\(owner.displayName).\(key)")
+            }
+            callee = found
+        case 0x75:
+            let start = caller.superclass ?? caller
+            guard let found = start.findMethodByKey(key) ?? caller.findInterfaceDefaultForSuper(key) else {
+                throw VMJavaException("Ljava/lang/NoSuchMethodError;", key)
+            }
+            callee = found
+        default:
+            let owner = try linkClass(ref.className)
+            try ensureInitialized(owner)
+            guard let found = owner.lookupStatic(ref.name, DexDescriptor.methodSignature(ref.proto)) else {
+                throw VMJavaException("Ljava/lang/NoSuchMethodError;", "\(owner.displayName).\(key)")
+            }
+            callee = found
+        }
+        let argumentCount = callee.parameterRegisterCount
+        return try withUnsafeTemporaryAllocation(of: VMValue.self, capacity: max(argumentCount, count)) { buffer in
+            let limit = min(count, argumentCount)
+            for index in 0..<limit { buffer[index] = registers[first + index] }
+            return try invoke(callee, arguments: buffer.baseAddress!, count: argumentCount)
+        }
+    }
+
+    // MARK: - Arithmetic
+
+    func unary(opcode: UInt8, value: VMValue) -> VMValue {
+        switch opcode {
+        case 0x7b: return .int32(0 &- value.asInt32)
+        case 0x7c: return .int64(0 &- value.asInt64)
+        case 0x7d: return .float(-value.asFloat)
+        case 0x7e: return .double(-value.asDouble)
+        case 0x7f: return .int32(~value.asInt32)
+        case 0x80: return .int64(~value.asInt64)
+        case 0x81: return .int64(Int64(value.asInt32))
+        case 0x82: return .float(Float(value.asInt32))
+        case 0x83: return .double(Double(value.asInt32))
+        case 0x84: return .int32(Int32(truncatingIfNeeded: value.asInt64))
+        case 0x85: return .float(Float(value.asInt64))
+        case 0x86: return .double(Double(value.asInt64))
+        case 0x87: return .int32(javaFloatToInt(value.asFloat))
+        case 0x88: return .int64(javaFloatToLong(value.asFloat))
+        case 0x89: return .double(Double(value.asFloat))
+        case 0x8a: return .int32(javaDoubleToInt(value.asDouble))
+        case 0x8b: return .int64(javaDoubleToLong(value.asDouble))
+        case 0x8c: return .float(Float(value.asDouble))
+        case 0x8d: return .int32(Int32(Int8(truncatingIfNeeded: value.asInt32)))
+        case 0x8e: return .int32(Int32(UInt16(truncatingIfNeeded: value.asInt32)))
+        case 0x8f: return .int32(Int32(Int16(truncatingIfNeeded: value.asInt32)))
+        default: return value
+        }
+    }
+
+    func javaFloatToInt(_ value: Float) -> Int32 {
+        if value.isNaN { return 0 }
+        if value >= 2147483648.0 { return .max }
+        if value <= -2147483648.0 { return .min }
+        return Int32(value)
+    }
+
+    func javaFloatToLong(_ value: Float) -> Int64 {
+        if value.isNaN { return 0 }
+        if value >= 9223372036854775808.0 { return .max }
+        if value <= -9223372036854775808.0 { return .min }
+        return Int64(value)
+    }
+
+    func javaDoubleToInt(_ value: Double) -> Int32 {
+        if value.isNaN { return 0 }
+        if value >= 2147483648.0 { return .max }
+        if value <= -2147483648.0 { return .min }
+        return Int32(value)
+    }
+
+    func javaDoubleToLong(_ value: Double) -> Int64 {
+        if value.isNaN { return 0 }
+        if value >= 9223372036854775808.0 { return .max }
+        if value <= -9223372036854775808.0 { return .min }
+        return Int64(value)
+    }
+
+    func binary(opcode: UInt8, left: VMValue, right: VMValue) throws -> VMValue {
+        switch opcode {
+        case 0x90: return .int32(left.asInt32 &+ right.asInt32)
+        case 0x91: return .int32(left.asInt32 &- right.asInt32)
+        case 0x92: return .int32(left.asInt32 &* right.asInt32)
+        case 0x93:
+            let divisor = right.asInt32
+            guard divisor != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+            guard !(left.asInt32 == .min && divisor == -1) else { return .int32(.min) }
+            return .int32(left.asInt32 / divisor)
+        case 0x94:
+            let divisor = right.asInt32
+            guard divisor != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+            guard !(left.asInt32 == .min && divisor == -1) else { return .int32(0) }
+            return .int32(left.asInt32 % divisor)
+        case 0x95: return .int32(left.asInt32 & right.asInt32)
+        case 0x96: return .int32(left.asInt32 | right.asInt32)
+        case 0x97: return .int32(left.asInt32 ^ right.asInt32)
+        case 0x98: return .int32(left.asInt32 << (right.asInt32 & 31))
+        case 0x99: return .int32(left.asInt32 >> (right.asInt32 & 31))
+        case 0x9a: return .int32(Int32(bitPattern: UInt32(bitPattern: left.asInt32) >> (right.asUInt32 & 31)))
+        case 0x9b: return .int64(left.asInt64 &+ right.asInt64)
+        case 0x9c: return .int64(left.asInt64 &- right.asInt64)
+        case 0x9d: return .int64(left.asInt64 &* right.asInt64)
+        case 0x9e:
+            let divisor = right.asInt64
+            guard divisor != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+            guard !(left.asInt64 == .min && divisor == -1) else { return .int64(.min) }
+            return .int64(left.asInt64 / divisor)
+        case 0x9f:
+            let divisor = right.asInt64
+            guard divisor != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+            guard !(left.asInt64 == .min && divisor == -1) else { return .int64(0) }
+            return .int64(left.asInt64 % divisor)
+        case 0xa0: return .int64(left.asInt64 & right.asInt64)
+        case 0xa1: return .int64(left.asInt64 | right.asInt64)
+        case 0xa2: return .int64(left.asInt64 ^ right.asInt64)
+        case 0xa3: return .int64(left.asInt64 << (right.asInt32 & 63))
+        case 0xa4: return .int64(left.asInt64 >> (right.asInt32 & 63))
+        case 0xa5: return .int64(Int64(bitPattern: UInt64(bitPattern: left.asInt64) >> (right.asUInt32 & 63)))
+        case 0xa6: return .float(left.asFloat + right.asFloat)
+        case 0xa7: return .float(left.asFloat - right.asFloat)
+        case 0xa8: return .float(left.asFloat * right.asFloat)
+        case 0xa9: return .float(left.asFloat / right.asFloat)
+        case 0xaa: return .float(left.asFloat.truncatingRemainder(dividingBy: right.asFloat))
+        case 0xab: return .double(left.asDouble + right.asDouble)
+        case 0xac: return .double(left.asDouble - right.asDouble)
+        case 0xad: return .double(left.asDouble * right.asDouble)
+        case 0xae: return .double(left.asDouble / right.asDouble)
+        case 0xaf: return .double(left.asDouble.truncatingRemainder(dividingBy: right.asDouble))
+        default: return left
+        }
+    }
+}
+
+extension VMMethod {
+    /// The dex that owns this method's code; string and member references are
+    /// resolved against it.
+    var ownerDex: DexFile? { dex }
+}
+
+struct FieldRefKey: Hashable {
+    let dex: ObjectIdentifier
+    let index: Int
+}

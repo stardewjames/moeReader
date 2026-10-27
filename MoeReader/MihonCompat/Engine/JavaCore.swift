@@ -1,0 +1,1215 @@
+//
+//  JavaCore.swift
+//  MihonCompat
+//
+//  natjava.lang. Strings are UTF-16 (Java semantics), boxed values keep their
+//  bits in the object payload, and collection state lives in Swift payloads so
+//  no VM object graph ever needs tracing.
+//
+
+import Foundation
+
+enum JavaCore {
+    static func classes() -> [NativeClass] {
+        var result: [NativeClass] = []
+        result += objectClass()
+        result += stringClass()
+        result += stringBuilderClass()
+        result += charSequenceClass()
+        result += comparableClass()
+        result += numberClass()
+        result += iterableClass()
+        result += iteratorClass()
+        result += enumClass()
+        result += booleanClass()
+        result += integerClass()
+        result += longClass()
+        result += shortClass()
+        result += byteClass()
+        result += characterClass()
+        result += floatClass()
+        result += doubleClass()
+        result += mathClass()
+        result += systemClass()
+        result += classClass()
+        result += threadClass()
+        result += exceptionClasses().flatMap { $0 }
+        return result
+    }
+
+    // MARK: - java.lang.Object
+
+    private static func objectClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Object;")
+        cls.method("<init>", "()V") { _, _, _ in .zero }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.javaToString(args[0])
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in .int32(runtime.javaIdentityHash(args[0])) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in
+            .boolean(args[0].bits == args[1].bits)
+        }
+        cls.method("getClass", "()Ljava/lang/Class;") { runtime, args, _ in
+            guard let cls = runtime.classOf(args[0]) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            return runtime.classObject(cls)
+        }
+        cls.method("clone", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let source = args[0].object else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            let cls = VMObjectLayout.cls(source)
+            if cls.isArray {
+                let count = Int(VMObjectLayout.aux(source))
+                let copy = runtime.allocateArray(descriptor: cls.descriptor, count: count)
+                for index in 0..<count {
+                    VMObjectLayout.slot(copy, index).pointee = VMObjectLayout.slot(source, index).pointee
+                }
+                return .reference(copy)
+            }
+            let copy = runtime.allocateObject(cls)
+            for index in 0..<cls.instanceFieldCount {
+                VMObjectLayout.slot(copy, index).pointee = VMObjectLayout.slot(source, index).pointee
+            }
+            return .reference(copy)
+        }
+        cls.method("notify", "()V") { _, _, _ in .zero }
+        cls.method("notifyAll", "()V") { _, _, _ in .zero }
+        cls.method("wait", "()V") { _, _, _ in .zero }
+        cls.method("wait", "(J)V") { _, _, _ in .zero }
+        cls.method("wait", "(JI)V") { _, _, _ in .zero }
+        cls.method("finalize", "()V") { _, _, _ in .zero }
+        return [cls]
+    }
+
+    // MARK: - CharSequence / Comparable / Number / Iterable
+
+    private static func charSequenceClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/CharSequence;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        cls.method("length", "()I") { _, _, _ in .int32(0) }
+        cls.method("charAt", "(I)C") { _, _, _ in .int32(0) }
+        cls.method("toString", "()Ljava/lang/String;") { _, _, _ in .null }
+        cls.method("subSequence", "(II)Ljava/lang/CharSequence;") { _, _, _ in .null }
+        return [cls]
+    }
+
+    private static func comparableClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Comparable;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        cls.method("compareTo", "(Ljava/lang/Object;)I") { _, _, _ in .int32(0) }
+        return [cls]
+    }
+
+    private static func numberClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Number;", superclass: "Ljava/lang/Object;")
+        cls.method("intValue", "()I") { _, _, _ in .int32(0) }
+        cls.method("longValue", "()J") { _, _, _ in .int64(0) }
+        cls.method("floatValue", "()F") { _, _, _ in .float(0) }
+        cls.method("doubleValue", "()D") { _, _, _ in .double(0) }
+        cls.method("byteValue", "()B") { _, _, _ in .int32(0) }
+        cls.method("shortValue", "()S") { _, _, _ in .int32(0) }
+        return [cls]
+    }
+
+    private static func iterableClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Iterable;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        cls.method("iterator", "()Ljava/util/Iterator;") { _, _, _ in .null }
+        cls.method("forEach", "(Ljava/util/function/Consumer;)V") { _, _, _ in .zero }
+        return [cls]
+    }
+
+    private static func iteratorClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/util/Iterator;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        cls.method("hasNext", "()Z") { _, _, _ in .boolean(false) }
+        cls.method("next", "()Ljava/lang/Object;") { _, _, _ in .null }
+        cls.method("remove", "()V") { _, _, _ in .zero }
+        return [cls]
+    }
+
+    // MARK: - java.lang.String
+
+    private static func stringClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/String;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Comparable;", "Ljava/io/Serializable;"])
+        cls.method("<init>", "()V") { _, _, _ in .zero }
+        cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            guard let target = args[0].object else { return .zero }
+            runtime.fillString(target, units: runtime.stringUnits(args[1]) ?? [])
+            return .zero
+        }
+        cls.method("<init>", "([C)V") { runtime, args, _ in
+            guard let target = args[0].object, let array = args[1].object else { return .zero }
+            let count = Int(VMObjectLayout.aux(array))
+            var units = [UInt16](repeating: 0, count: count)
+            for index in 0..<count {
+                units[index] = UInt16(truncatingIfNeeded: VMObjectLayout.slot(array, index).pointee.asInt32)
+            }
+            runtime.fillString(target, units: units)
+            return .zero
+        }
+        cls.method("<init>", "([CII)V") { runtime, args, _ in
+            guard let target = args[0].object, let array = args[1].object else { return .zero }
+            let offset = Int(args[2].asInt32)
+            let count = Int(args[3].asInt32)
+            let total = Int(VMObjectLayout.aux(array))
+            var units = [UInt16](repeating: 0, count: max(0, min(count, total - offset)))
+            for index in 0..<units.count {
+                units[index] = UInt16(truncatingIfNeeded: VMObjectLayout.slot(array, offset + index).pointee.asInt32)
+            }
+            runtime.fillString(target, units: units)
+            return .zero
+        }
+        cls.method("<init>", "([B)V") { runtime, args, _ in
+            guard let target = args[0].object, let array = args[1].object else { return .zero }
+            let count = Int(VMObjectLayout.aux(array))
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(count)
+            for index in 0..<count {
+                bytes.append(UInt8(truncatingIfNeeded: VMObjectLayout.slot(array, index).pointee.asInt32))
+            }
+            let text = String(decoding: bytes, as: UTF8.self)
+            runtime.fillString(target, units: Array(text.utf16))
+            return .zero
+        }
+        cls.method("<init>", "([BLjava/nio/charset/Charset;)V") { runtime, args, _ in
+            guard let target = args[0].object, let array = args[1].object else { return .zero }
+            let count = Int(VMObjectLayout.aux(array))
+            var bytes: [UInt8] = []
+            for index in 0..<count {
+                bytes.append(UInt8(truncatingIfNeeded: VMObjectLayout.slot(array, index).pointee.asInt32))
+            }
+            let charset = runtime.stringValue(args[2]) ?? "UTF-8"
+            let text = runtime.decode(bytes: bytes, charset: charset)
+            runtime.fillString(target, units: Array(text.utf16))
+            return .zero
+        }
+
+        cls.method("length", "()I") { runtime, args, _ in .int32(Int32(runtime.stringUnits(args[0])?.count ?? 0)) }
+        cls.method("isEmpty", "()Z") { runtime, args, _ in .boolean((runtime.stringUnits(args[0])?.count ?? 0) == 0) }
+        cls.method("isBlank", "()Z") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { return .boolean(true) }
+            return .boolean(!units.contains { !CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar($0) ?? " ") })
+        }
+        cls.method("toString", "()Ljava/lang/String;") { _, args, _ in args[0] }
+        cls.method("charAt", "(I)C") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < units.count else {
+                throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;", "index \(index), length \(units.count)")
+            }
+            return .int32(Int32(units[index]))
+        }
+        cls.method("codePointAt", "(I)I") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            return .int32(Int32(units[index]))
+        }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            .boolean(runtime.stringsEqual(args[0], args[1]))
+        }
+        cls.method("equalsIgnoreCase", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            guard let left = runtime.stringValue(args[0]), let right = runtime.stringValue(args[1]) else { return .boolean(false) }
+            return .boolean(left.lowercased() == right.lowercased())
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in .int32(runtime.stringHash(args[0])) }
+        cls.method("compareTo", "(Ljava/lang/String;)I") { runtime, args, _ in
+            guard let left = runtime.stringUnits(args[0]), let right = runtime.stringUnits(args[1]) else { return .int32(0) }
+            let count = min(left.count, right.count)
+            for index in 0..<count where left[index] != right[index] {
+                return .int32(Int32(left[index]) - Int32(right[index]))
+            }
+            return .int32(Int32(left.count - right.count))
+        }
+        cls.method("compareTo", "(Ljava/lang/Object;)I") { runtime, args, _ in
+            guard let left = runtime.stringValue(args[0]), let right = runtime.stringValue(args[1]) else { return .int32(0) }
+            if left == right { return .int32(0) }
+            return .int32(left < right ? -1 : 1)
+        }
+        cls.method("compareToIgnoreCase", "(Ljava/lang/String;)I") { runtime, args, _ in
+            guard let left = runtime.stringValue(args[0]), let right = runtime.stringValue(args[1]) else { return .int32(0) }
+            let l = left.lowercased(), r = right.lowercased()
+            if l == r { return .int32(0) }
+            return .int32(l < r ? -1 : 1)
+        }
+        cls.method("contains", "(Ljava/lang/CharSequence;)Z") { runtime, args, _ in
+            guard let haystack = runtime.stringValue(args[0]), let needle = runtime.stringValue(args[1]) else {
+                return .boolean(false)
+            }
+            return .boolean(haystack.contains(needle))
+        }
+        cls.method("startsWith", "(Ljava/lang/String;)Z") { runtime, args, _ in .boolean(runtime.stringValue(args[0])?.hasPrefix(runtime.stringValue(args[1]) ?? "") ?? false) }
+        cls.method("startsWith", "(Ljava/lang/String;I)Z") { runtime, args, _ in
+            guard let text = runtime.stringUnits(args[0]), let prefix = runtime.stringUnits(args[1]) else { return .boolean(false) }
+            let offset = Int(args[2].asInt32)
+            guard offset >= 0, offset + prefix.count <= text.count else { return .boolean(false) }
+            if prefix.isEmpty { return .boolean(true) }
+            for index in 0..<prefix.count where text[offset + index] != prefix[index] { return .boolean(false) }
+            return .boolean(true)
+        }
+        cls.method("endsWith", "(Ljava/lang/String;)Z") { runtime, args, _ in .boolean(runtime.stringValue(args[0])?.hasSuffix(runtime.stringValue(args[1]) ?? "") ?? false) }
+        cls.method("indexOf", "(I)I") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { return .int32(-1) }
+            let target = UInt16(truncatingIfNeeded: args[1].asInt32)
+            return .int32(Int32(units.firstIndex(of: target) ?? -1))
+        }
+        cls.method("indexOf", "(II)I") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { return .int32(-1) }
+            let target = UInt16(truncatingIfNeeded: args[1].asInt32)
+            let from = Int(args[2].asInt32)
+            guard from >= 0, from <= units.count else { return .int32(-1) }
+            for index in from..<units.count where units[index] == target { return .int32(Int32(index)) }
+            return .int32(-1)
+        }
+        cls.method("indexOf", "(Ljava/lang/String;)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: 0, last: false)) }
+        cls.method("indexOf", "(Ljava/lang/String;I)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: Int(args[2].asInt32), last: false)) }
+        cls.method("lastIndexOf", "(I)I") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { return .int32(-1) }
+            let target = UInt16(truncatingIfNeeded: args[1].asInt32)
+            return .int32(Int32(units.lastIndex(of: target) ?? -1))
+        }
+        cls.method("lastIndexOf", "(Ljava/lang/String;)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: 0, last: true)) }
+        cls.method("substring", "(I)Ljava/lang/String;") { runtime, args, _ in
+            try runtime.substring(args[0], from: Int(args[1].asInt32), to: nil, receiver: args[0])
+        }
+        cls.method("substring", "(II)Ljava/lang/String;") { runtime, args, _ in
+            try runtime.substring(args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), receiver: args[0])
+        }
+        cls.method("subSequence", "(II)Ljava/lang/CharSequence;") { runtime, args, _ in
+            try runtime.substring(args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), receiver: args[0])
+        }
+        cls.method("concat", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let left = runtime.stringValue(args[0]) ?? ""
+            let right = runtime.stringValue(args[1]) ?? ""
+            return runtime.newString(left + right)
+        }
+        cls.method("replace", "(CC)Ljava/lang/String;") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]) else { return .null }
+            let from = Character(UnicodeScalar(UInt32(truncatingIfNeeded: args[1].asInt32)) ?? " ")
+            let to = Character(UnicodeScalar(UInt32(truncatingIfNeeded: args[2].asInt32)) ?? " ")
+            return runtime.newString(text.replacingOccurrences(of: String(from), with: String(to)))
+        }
+        cls.method("replace", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]) else { return .null }
+            let from = runtime.stringValue(args[1]) ?? ""
+            let to = runtime.stringValue(args[2]) ?? ""
+            return runtime.newString(from.isEmpty ? text : text.replacingOccurrences(of: from, with: to))
+        }
+        cls.method("trim", "()Ljava/lang/String;") { runtime, args, _ in
+            var units = runtime.stringUnits(args[0]) ?? []
+            while let first = units.first, first <= 0x20 { units.removeFirst() }
+            while let last = units.last, last <= 0x20 { units.removeLast() }
+            return runtime.newString(units: units)
+        }
+        cls.method("strip", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.stringValue(args[0])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        }
+        cls.method("toLowerCase", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.stringValue(args[0])?.lowercased() ?? "")
+        }
+        cls.method("toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.stringValue(args[0])?.lowercased() ?? "")
+        }
+        cls.method("toUpperCase", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.stringValue(args[0])?.uppercased() ?? "")
+        }
+        cls.method("toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.stringValue(args[0])?.uppercased() ?? "")
+        }
+        cls.method("toCharArray", "()[C") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { return .null }
+            let array = runtime.newArray(component: "C", count: units.count)
+            if let pointer = array.object {
+                for index in 0..<units.count {
+                    VMObjectLayout.slot(pointer, index).pointee = .int32(Int32(units[index]))
+                }
+            }
+            return array
+        }
+        cls.method("getBytes", "()[B") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]) else { return .null }
+            let bytes = Array(text.utf8)
+            let array = runtime.newArray(component: "B", count: bytes.count)
+            if let pointer = array.object {
+                for (index, byte) in bytes.enumerated() {
+                    VMObjectLayout.slot(pointer, index).pointee = .int32(Int32(Int8(bitPattern: byte)))
+                }
+            }
+            return array
+        }
+        cls.method("getBytes", "(Ljava/nio/charset/Charset;)[B") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]) else { return .null }
+            let charset = runtime.stringValue(args[1]) ?? "UTF-8"
+            let bytes = runtime.encode(text, charset: charset)
+            let array = runtime.newArray(component: "B", count: bytes.count)
+            if let pointer = array.object {
+                for (index, byte) in bytes.enumerated() {
+                    VMObjectLayout.slot(pointer, index).pointee = .int32(Int32(Int8(bitPattern: byte)))
+                }
+            }
+            return array
+        }
+        cls.method("split", "(Ljava/lang/String;)[Ljava/lang/String;") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]) else { return .null }
+            let parts = runtime.javaSplit(text, pattern: runtime.stringValue(args[1]) ?? "", limit: 0)
+            let array = runtime.newArray(component: "Ljava/lang/String;", count: parts.count)
+            for (index, part) in parts.enumerated() {
+                runtime.setArrayElement(array, index: index, value: runtime.newString(part))
+            }
+            return array
+        }
+        cls.method("split", "(Ljava/lang/String;I)[Ljava/lang/String;") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]) else { return .null }
+            let parts = runtime.javaSplit(text, pattern: runtime.stringValue(args[1]) ?? "", limit: Int(args[2].asInt32))
+            let array = runtime.newArray(component: "Ljava/lang/String;", count: parts.count)
+            for (index, part) in parts.enumerated() {
+                runtime.setArrayElement(array, index: index, value: runtime.newString(part))
+            }
+            return array
+        }
+        cls.method("replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]), let pattern = runtime.stringValue(args[1]) else { return .null }
+            let replacement = runtime.stringValue(args[2]) ?? ""
+            return runtime.newString(runtime.regexReplace(text, pattern: pattern, replacement: replacement))
+        }
+        cls.method("replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]), let pattern = runtime.stringValue(args[1]) else { return .null }
+            let replacement = runtime.stringValue(args[2]) ?? ""
+            return runtime.newString(runtime.regexReplace(text, pattern: pattern, replacement: replacement, firstOnly: true))
+        }
+        cls.method("matches", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]), let pattern = runtime.stringValue(args[1]) else { return .boolean(false) }
+            return .boolean(runtime.regexMatches(text, pattern: pattern))
+        }
+        cls.method("intern", "()Ljava/lang/String;") { _, args, _ in args[0] }
+        cls.staticMethod("valueOf", "(I)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asInt32)) }
+        cls.staticMethod("valueOf", "(J)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asInt64)) }
+        cls.staticMethod("valueOf", "(F)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asFloat)) }
+        cls.staticMethod("valueOf", "(D)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asDouble)) }
+        cls.staticMethod("valueOf", "(Z)Ljava/lang/String;") { runtime, args, _ in runtime.newString(args[0].asBoolean ? "true" : "false") }
+        cls.staticMethod("valueOf", "(C)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(String(UnicodeScalar(UInt32(truncatingIfNeeded: args[0].asInt32)) ?? " "))
+        }
+        cls.staticMethod("valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            args[1].bits == 0 ? runtime.newString("null") : runtime.javaToString(args[1])
+        }
+        cls.staticMethod("format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.format(template: args[0], arguments: args[1])
+        }
+        cls.staticMethod("join", "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.join(separator: args[0], elements: args[1])
+        }
+        cls.staticMethod("copyValueOf", "([C)Ljava/lang/String;") { runtime, args, _ in
+            guard let array = args[0].object else { return .null }
+            let count = Int(VMObjectLayout.aux(array))
+            var units = [UInt16](repeating: 0, count: count)
+            for index in 0..<count { units[index] = UInt16(truncatingIfNeeded: VMObjectLayout.slot(array, index).pointee.asInt32) }
+            return runtime.newString(units: units)
+        }
+        return [cls]
+    }
+
+    // MARK: - java.lang.StringBuilder
+
+    private static func stringBuilderClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/StringBuilder;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Appendable;"])
+        cls.method("<init>", "()V") { runtime, args, _ in
+            runtime.mutatingString(args[0]).units.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        cls.method("<init>", "(I)V") { runtime, args, _ in
+            runtime.mutatingString(args[0]).units.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            let text = runtime.stringValue(args[1]) ?? ""
+            runtime.mutatingString(args[0]).units = Array(text.utf16)
+            return .zero
+        }
+        cls.method("<init>", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            let text = runtime.stringValue(args[1]) ?? ""
+            runtime.mutatingString(args[0]).units = Array(text.utf16)
+            return .zero
+        }
+        for (signature, kind) in [
+            ("(Ljava/lang/String;)Ljava/lang/StringBuilder;", "string"),
+            ("(Ljava/lang/Object;)Ljava/lang/StringBuilder;", "object"),
+            ("(I)Ljava/lang/StringBuilder;", "int"),
+            ("(J)Ljava/lang/StringBuilder;", "long"),
+            ("(F)Ljava/lang/StringBuilder;", "float"),
+            ("(D)Ljava/lang/StringBuilder;", "double"),
+            ("(Z)Ljava/lang/StringBuilder;", "bool"),
+            ("(C)Ljava/lang/StringBuilder;", "char"),
+            ("([C)Ljava/lang/StringBuilder;", "chars"),
+            ("(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;", "sequence"),
+        ] {
+            cls.method("append", signature) { runtime, args, _ in
+                runtime.appendString(args[0], kind: kind, value: args[1])
+                return args[0]
+            }
+        }
+        cls.method("insert", "(ILjava/lang/String;)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            runtime.insertString(args[0], at: Int(args[1].asInt32), text: runtime.stringValue(args[2]) ?? "")
+            return args[0]
+        }
+        cls.method("reverse", "()Ljava/lang/StringBuilder;") { runtime, args, _ in
+            runtime.mutatingString(args[0]).units.reverse()
+            return args[0]
+        }
+        cls.method("length", "()I") { runtime, args, _ in .int32(Int32(runtime.mutatingString(args[0]).units.count)) }
+        cls.method("charAt", "(I)C") { runtime, args, _ in
+            .int32(Int32(runtime.mutatingString(args[0]).units[Int(args[1].asInt32)]))
+        }
+        cls.method("setCharAt", "(IC)V") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            let units = runtime.mutatingString(args[0]).units
+            if index >= 0, index < units.count {
+                runtime.mutatingString(args[0]).units[index] = UInt16(truncatingIfNeeded: args[2].asInt32)
+            }
+            return .zero
+        }
+        cls.method("setLength", "(I)V") { runtime, args, _ in
+            let length = max(0, Int(args[1].asInt32))
+            var builder = runtime.mutatingString(args[0])
+            var units = builder.units
+            if units.count > length {
+                units.removeSubrange(length..<units.count)
+            } else {
+                units.append(contentsOf: repeatElement(0, count: length - units.count))
+            }
+            builder.units = units
+            runtime.mutatingString(args[0]).units = units
+            return .zero
+        }
+        cls.method("deleteCharAt", "(I)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            var units = runtime.mutatingString(args[0]).units
+            if index >= 0, index < units.count { units.remove(at: index) }
+            runtime.mutatingString(args[0]).units = units
+            return args[0]
+        }
+        cls.method("delete", "(II)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            let start = max(0, Int(args[1].asInt32))
+            let end = min(Int(args[2].asInt32), runtime.mutatingString(args[0]).units.count)
+            var units = runtime.mutatingString(args[0]).units
+            if start < end { units.removeSubrange(start..<end) }
+            runtime.mutatingString(args[0]).units = units
+            return args[0]
+        }
+        cls.method("indexOf", "(Ljava/lang/String;)I") { runtime, args, _ in
+            .int32(runtime.indexOf(runtime.newString(units: runtime.mutatingString(args[0]).units), needle: args[1], from: 0, last: false))
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(units: runtime.mutatingString(args[0]).units)
+        }
+        cls.method("substring", "(I)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.mutatingString(args[0]).units
+            let start = Int(args[1].asInt32)
+            guard start >= 0, start <= units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            return runtime.newString(units: Array(units[start...]))
+        }
+        cls.method("substring", "(II)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.mutatingString(args[0]).units
+            let start = Int(args[1].asInt32), end = Int(args[2].asInt32)
+            guard start >= 0, end <= units.count, start <= end else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            return runtime.newString(units: Array(units[start..<end]))
+        }
+        return [cls]
+    }
+
+    // MARK: - java.lang.Enum
+
+    private static func enumClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Enum;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Comparable;", "Ljava/io/Serializable;"])
+        cls.field("name", "Ljava/lang/String;")
+        cls.field("ordinal", "I")
+        cls.method("<init>", "(Ljava/lang/String;I)V") { _, args, _ in
+            guard let pointer = args[0].object else { return .zero }
+            VMObjectLayout.slot(pointer, 0).pointee = args[1]
+            VMObjectLayout.slot(pointer, 1).pointee = args[2]
+            return .zero
+        }
+        cls.method("name", "()Ljava/lang/String;") { _, args, _ in
+            guard let pointer = args[0].object else { return .null }
+            return VMObjectLayout.slot(pointer, 0).pointee
+        }
+        cls.method("toString", "()Ljava/lang/String;") { _, args, _ in
+            guard let pointer = args[0].object else { return .null }
+            return VMObjectLayout.slot(pointer, 0).pointee
+        }
+        cls.method("ordinal", "()I") { _, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            return VMObjectLayout.slot(pointer, 1).pointee
+        }
+        cls.method("compareTo", "(Ljava/lang/Enum;)I") { _, args, _ in
+            guard let left = args[0].object, let right = args[1].object else { return .int32(0) }
+            return .int32(VMObjectLayout.slot(left, 1).pointee.asInt32 &- VMObjectLayout.slot(right, 1).pointee.asInt32)
+        }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in .boolean(args[0].bits == args[1].bits) }
+        cls.method("hashCode", "()I") { _, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            return .int32(Int32(bitPattern: UInt32(truncatingIfNeeded: UInt(bitPattern: pointer) / 16)))
+        }
+        cls.staticMethod("valueOf", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+            }
+            try runtime.ensureInitialized(target)
+            let name = runtime.stringValue(args[1]) ?? ""
+            for field in target.staticFields where field.type == target.descriptor {
+                if field.name == name {
+                    let value = target.staticValue(field)
+                    if value.bits != 0 { return value }
+                }
+            }
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;", "No enum constant \(target.displayName).\(name)")
+        }
+        cls.method("getDeclaringClass", "()Ljava/lang/Class;") { runtime, args, _ in
+            guard let cls = runtime.classOf(args[0]) else { return .null }
+            return runtime.classObject(cls)
+        }
+        return [cls]
+    }
+
+    // MARK: - boxed primitives
+
+    private static func boxed(
+        _ descriptor: String,
+        bitsToValue: @escaping (UInt64) -> String
+    ) -> NativeClass {
+        let cls = NativeClass(descriptor, superclass: "Ljava/lang/Number;")
+        cls.field("value", "J")
+        cls.method("<init>", "(J)V") { _, args, _ in
+            if let pointer = args[0].object { VMObjectLayout.slot(pointer, 0).pointee = args[1] }
+            return .zero
+        }
+        cls.method("<init>", "(I)V") { _, args, _ in
+            if let pointer = args[0].object { VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(args[1].asInt32)) }
+            return .zero
+        }
+        cls.method("intValue", "()I") { runtime, args, _ in .int32(args[0].asBoxedInt(runtime)) }
+        cls.method("longValue", "()J") { runtime, args, _ in .int64(args[0].asBoxedLong(runtime)) }
+        cls.method("floatValue", "()F") { runtime, args, _ in .float(Float(args[0].asBoxedLong(runtime))) }
+        cls.method("doubleValue", "()D") { runtime, args, _ in .double(Double(args[0].asBoxedLong(runtime))) }
+        cls.method("byteValue", "()B") { runtime, args, _ in .int32(args[0].asBoxedInt(runtime)) }
+        cls.method("shortValue", "()S") { runtime, args, _ in .int32(args[0].asBoxedInt(runtime)) }
+        cls.method("booleanValue", "()Z") { runtime, args, _ in .boolean(args[0].asBoxedLong(runtime) != 0) }
+        cls.method("charValue", "()C") { runtime, args, _ in .int32(args[0].asBoxedInt(runtime)) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(bitsToValue(args[0].asBoxedBits(runtime)))
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in .int32(args[0].asBoxedInt(runtime)) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == descriptor else { return .boolean(false) }
+            return .boolean(args[0].asBoxedBits(runtime) == args[1].asBoxedBits(runtime))
+        }
+        return cls
+    }
+
+    private static func booleanClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Boolean;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Comparable;", "Ljava/io/Serializable;"])
+        cls.field("value", "Z")
+        cls.staticField("TRUE", "Ljava/lang/Boolean;")
+        cls.staticField("FALSE", "Ljava/lang/Boolean;")
+        cls.prepare = { runtime, cls in
+            let make: (Bool) -> VMValue = { flag in
+                let pointer = runtime.allocateObject(cls)
+                VMObjectLayout.setAux(pointer, flag ? 1 : 0)
+                return .reference(pointer)
+            }
+            cls.staticValues[0] = make(true)
+            cls.staticValues[1] = make(false)
+        }
+        cls.method("<init>", "(Z)V") { _, args, _ in
+            if let pointer = args[0].object { VMObjectLayout.setAux(pointer, args[1].asBoolean ? 1 : 0) }
+            return .zero
+        }
+        cls.method("booleanValue", "()Z") { _, args, _ in .boolean(args[0].asBoolean2()) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(args[0].asBoolean2() ? "true" : "false")
+        }
+        cls.staticMethod("valueOf", "(Z)Ljava/lang/Boolean;") { runtime, args, _ in
+            guard let cls = runtime.findClass("Ljava/lang/Boolean;") else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.setAux(pointer, args[0].asBoolean ? 1 : 0)
+            return .reference(pointer)
+        }
+        cls.staticMethod("parseBoolean", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            .boolean((runtime.stringValue(args[0]) ?? "").lowercased() == "true")
+        }
+        cls.method("hashCode", "()I") { _, args, _ in .int32(args[0].asBoolean2() ? 1231 : 1237) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in
+            .boolean(args[1].bits != 0 && args[0].asBoolean2() == args[1].asBoolean2())
+        }
+        return [cls]
+    }
+
+    private static func integerClass() -> [NativeClass] { numberBox("Ljava/lang/Integer;", "I", Int64(Int32.max), Int64(Int32.min)) }
+    private static func longClass() -> [NativeClass] { numberBox("Ljava/lang/Long;", "J", Int64.max, Int64.min) }
+    private static func shortClass() -> [NativeClass] { numberBox("Ljava/lang/Short;", "S", Int64(Int16.max), Int64(Int16.min)) }
+    private static func byteClass() -> [NativeClass] { numberBox("Ljava/lang/Byte;", "B", Int64(Int8.max), Int64(Int8.min)) }
+
+    private static func numberBox(_ descriptor: String, _ letter: String, _ maxValue: Int64, _ minValue: Int64) -> [NativeClass] {
+        let cls = NativeClass(descriptor, superclass: "Ljava/lang/Number;", interfaces: ["Ljava/lang/Comparable;"])
+        cls.field("value", "J")
+        cls.staticField("MAX_VALUE", letter)
+        cls.staticField("MIN_VALUE", letter)
+        if letter == "J" {
+            cls.staticField("TYPE", "Ljava/lang/Class;")
+        }
+        cls.prepare = { runtime, cls in
+            cls.staticValues[0] = .int64(maxValue)
+            cls.staticValues[1] = .int64(minValue)
+            if letter == "J" {
+                cls.staticValues[2] = runtime.classObject(runtime.cachedClass("J"))
+            }
+        }
+        cls.method("<init>", "(I)V") { _, args, _ in
+            if let pointer = args[0].object { VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(args[1].asInt32)) }
+            return .zero
+        }
+        cls.method("<init>", "(J)V") { _, args, _ in
+            if let pointer = args[0].object { VMObjectLayout.slot(pointer, 0).pointee = args[1] }
+            return .zero
+        }
+        cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            let text = runtime.stringValue(args[1]) ?? ""
+            if let pointer = args[0].object {
+                VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(text.trimmingCharacters(in: .whitespaces)) ?? 0)
+            }
+            return .zero
+        }
+        cls.method("intValue", "()I") { _, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            return .int32(Int32(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.asInt64))
+        }
+        cls.method("longValue", "()J") { _, args, _ in
+            guard let pointer = args[0].object else { return .int64(0) }
+            return .int64(VMObjectLayout.slot(pointer, 0).pointee.asInt64)
+        }
+        cls.method("floatValue", "()F") { _, args, _ in
+            guard let pointer = args[0].object else { return .float(0) }
+            return .float(Float(VMObjectLayout.slot(pointer, 0).pointee.asInt64))
+        }
+        cls.method("doubleValue", "()D") { _, args, _ in
+            guard let pointer = args[0].object else { return .double(0) }
+            return .double(Double(VMObjectLayout.slot(pointer, 0).pointee.asInt64))
+        }
+        cls.method("byteValue", "()B") { _, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            return .int32(Int32(Int8(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.asInt64)))
+        }
+        cls.method("shortValue", "()S") { _, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            return .int32(Int32(Int16(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.asInt64)))
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let pointer = args[0].object else { return runtime.newString("0") }
+            return runtime.newString(String(VMObjectLayout.slot(pointer, 0).pointee.asInt64))
+        }
+        cls.method("hashCode", "()I") { _, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            return .int32(Int32(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.bits ^ (VMObjectLayout.slot(pointer, 0).pointee.bits >> 32)))
+        }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == descriptor,
+                  let a = args[0].object, let b = args[1].object else { return .boolean(false) }
+            return .boolean(VMObjectLayout.slot(a, 0).pointee.bits == VMObjectLayout.slot(b, 0).pointee.bits)
+        }
+        cls.staticMethod("valueOf", "(\(letter))\(descriptor)") { runtime, args, _ in
+            guard let cls = runtime.findClass(descriptor) else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.slot(pointer, 0).pointee = args[0]
+            return .reference(pointer)
+        }
+        cls.staticMethod("valueOf", "(Ljava/lang/String;)\(descriptor)") { runtime, args, _ in
+            guard let cls = runtime.findClass(descriptor) else { return .null }
+            let text = runtime.stringValue(args[0]) ?? "0"
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(text.trimmingCharacters(in: .whitespaces)) ?? 0)
+            return .reference(pointer)
+        }
+        cls.staticMethod("parseInt", "(Ljava/lang/String;)I") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Int32(text.trimmingCharacters(in: .whitespaces)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .int32(value)
+        }
+        cls.staticMethod("parseInt", "(Ljava/lang/String;I)I") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            let radix = Int(args[1].asInt32)
+            guard let value = Int32(text, radix: radix) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .int32(value)
+        }
+        cls.staticMethod("parseLong", "(Ljava/lang/String;)J") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Int64(text.trimmingCharacters(in: .whitespaces)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .int64(value)
+        }
+        cls.staticMethod("parseLong", "(Ljava/lang/String;I)J") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let value = Int64(text, radix: Int(args[1].asInt32)) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
+            return .int64(value)
+        }
+        cls.staticMethod("parseDouble", "(Ljava/lang/String;)D") { runtime, args, _ in
+            .double(Double((runtime.stringValue(args[0]) ?? "").trimmingCharacters(in: .whitespaces)) ?? 0)
+        }
+        cls.staticMethod("parseFloat", "(Ljava/lang/String;)F") { runtime, args, _ in
+            .float(Float((runtime.stringValue(args[0]) ?? "").trimmingCharacters(in: .whitespaces)) ?? 0)
+        }
+        cls.staticMethod("toString", "(\(letter))Ljava/lang/String;") { runtime, args, _ in
+            if letter == "J" { return runtime.newString(String(args[0].asInt64)) }
+            return runtime.newString(String(args[0].asInt32))
+        }
+        cls.method("compare", "(\(letter)\(letter))I") { _, args, _ in
+            if letter == "J" {
+                let a = args[0].asInt64, b = args[1].asInt64
+                return .int32(a < b ? -1 : (a > b ? 1 : 0))
+            }
+            let a = args[0].asInt32, b = args[1].asInt32
+            return .int32(a < b ? -1 : (a > b ? 1 : 0))
+        }
+        cls.staticMethod("toHexString", "(I)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(String(UInt32(bitPattern: args[0].asInt32), radix: 16))
+        }
+        cls.staticMethod("bitCount", "(I)I") { _, args, _ in .int32(Int32(args[0].asUInt32.nonzeroBitCount)) }
+        cls.staticMethod("signum", "(I)I") { _, args, _ in .int32(args[0].asInt32.signum()) }
+        cls.method("max", "(\(letter)\(letter))\(letter)") { _, args, _ in
+            if letter == "J" { return .int64(max(args[0].asInt64, args[1].asInt64)) }
+            return .int32(max(args[0].asInt32, args[1].asInt32))
+        }
+        cls.method("min", "(\(letter)\(letter))\(letter)") { _, args, _ in
+            if letter == "J" { return .int64(min(args[0].asInt64, args[1].asInt64)) }
+            return .int32(min(args[0].asInt32, args[1].asInt32))
+        }
+        return [cls]
+    }
+
+    private static func characterClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Character;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Comparable;"])
+        cls.method("<init>", "(C)V") { _, args, _ in
+            if let pointer = args[0].object { VMObjectLayout.setAux(pointer, UInt64(args[1].asUInt32)) }
+            return .zero
+        }
+        cls.method("charValue", "()C") { _, args, _ in .int32(Int32(truncatingIfNeeded: args[0].asChar())) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(String(UnicodeScalar(UInt32(args[0].asChar())) ?? " "))
+        }
+        cls.staticMethod("valueOf", "(C)Ljava/lang/Character;") { runtime, args, _ in
+            guard let cls = runtime.findClass("Ljava/lang/Character;") else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.setAux(pointer, UInt64(args[0].asUInt32))
+            return .reference(pointer)
+        }
+        cls.staticMethod("isDigit", "(C)Z") { _, args, _ in
+            .boolean(CharacterSet.decimalDigits.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
+        }
+        cls.staticMethod("isLetter", "(C)Z") { _, args, _ in
+            .boolean(CharacterSet.letters.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
+        }
+        cls.staticMethod("isLetterOrDigit", "(C)Z") { _, args, _ in
+            let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
+            return .boolean(CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar))
+        }
+        cls.staticMethod("isWhitespace", "(C)Z") { _, args, _ in
+            .boolean(CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
+        }
+        cls.staticMethod("isUpperCase", "(C)Z") { _, args, _ in
+            let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
+            return .boolean(scalar.properties.isUppercase)
+        }
+        cls.staticMethod("isLowerCase", "(C)Z") { _, args, _ in
+            let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
+            return .boolean(scalar.properties.isLowercase)
+        }
+        cls.staticMethod("toLowerCase", "(C)C") { _, args, _ in
+            let text = String(UnicodeScalar(args[0].asUInt32) ?? " ").lowercased()
+            return .int32(Int32(text.utf16.first ?? 0))
+        }
+        cls.staticMethod("toUpperCase", "(C)C") { _, args, _ in
+            let text = String(UnicodeScalar(args[0].asUInt32) ?? " ").uppercased()
+            return .int32(Int32(text.utf16.first ?? 0))
+        }
+        cls.staticMethod("digit", "(CI)I") { _, args, _ in
+            guard let digit = Int(String(UnicodeScalar(args[0].asUInt32) ?? " "), radix: Int(args[1].asInt32)) else {
+                return .int32(-1)
+            }
+            return .int32(Int32(digit))
+        }
+        return [cls]
+    }
+
+    private static func floatClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Float;", superclass: "Ljava/lang/Number;", interfaces: ["Ljava/lang/Comparable;"])
+        cls.staticField("MAX_VALUE", "F")
+        cls.staticField("MIN_VALUE", "F")
+        cls.prepare = { _, cls in
+            cls.staticValues[0] = .float(.greatestFiniteMagnitude)
+            cls.staticValues[1] = .float(.leastNonzeroMagnitude)
+        }
+        cls.method("floatValue", "()F") { _, args, _ in .float(args[0].asFloatBox()) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asFloatBox())) }
+        cls.staticMethod("valueOf", "(F)Ljava/lang/Float;") { runtime, args, _ in
+            guard let cls = runtime.findClass("Ljava/lang/Float;") else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.setAux(pointer, UInt64(args[0].asUInt32))
+            return .reference(pointer)
+        }
+        cls.staticMethod("parseFloat", "(Ljava/lang/String;)F") { runtime, args, _ in
+            .float(Float(runtime.stringValue(args[0]) ?? "0") ?? 0)
+        }
+        return [cls]
+    }
+
+    private static func doubleClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Double;", superclass: "Ljava/lang/Number;", interfaces: ["Ljava/lang/Comparable;"])
+        cls.staticField("MAX_VALUE", "D")
+        cls.staticField("MIN_VALUE", "D")
+        cls.prepare = { _, cls in
+            cls.staticValues[0] = .double(.greatestFiniteMagnitude)
+            cls.staticValues[1] = .double(.leastNonzeroMagnitude)
+        }
+        cls.method("doubleValue", "()D") { _, args, _ in .double(args[0].asDoubleBox()) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asDoubleBox())) }
+        cls.staticMethod("valueOf", "(D)Ljava/lang/Double;") { runtime, args, _ in
+            guard let cls = runtime.findClass("Ljava/lang/Double;") else { return .null }
+            let pointer = runtime.allocateObject(cls)
+            VMObjectLayout.setAux(pointer, args[0].bits)
+            return .reference(pointer)
+        }
+        cls.staticMethod("parseDouble", "(Ljava/lang/String;)D") { runtime, args, _ in
+            .double(Double(runtime.stringValue(args[0]) ?? "0") ?? 0)
+        }
+        return [cls]
+    }
+
+    // MARK: - java.lang.Math / System
+
+    private static func mathClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Math;")
+        cls.staticMethod("max", "(II)I") { _, args, _ in .int32(max(args[0].asInt32, args[1].asInt32)) }
+        cls.staticMethod("max", "(JJ)J") { _, args, _ in .int64(max(args[0].asInt64, args[1].asInt64)) }
+        cls.staticMethod("max", "(FF)F") { _, args, _ in .float(max(args[0].asFloat, args[1].asFloat)) }
+        cls.staticMethod("max", "(DD)D") { _, args, _ in .double(max(args[0].asDouble, args[1].asDouble)) }
+        cls.staticMethod("min", "(II)I") { _, args, _ in .int32(min(args[0].asInt32, args[1].asInt32)) }
+        cls.staticMethod("min", "(JJ)J") { _, args, _ in .int64(min(args[0].asInt64, args[1].asInt64)) }
+        cls.staticMethod("min", "(FF)F") { _, args, _ in .float(min(args[0].asFloat, args[1].asFloat)) }
+        cls.staticMethod("min", "(DD)D") { _, args, _ in .double(min(args[0].asDouble, args[1].asDouble)) }
+        cls.staticMethod("abs", "(I)I") { _, args, _ in .int32(args[0].asInt32.magnitude == 0x8000_0000 ? args[0].asInt32 : Swift.abs(args[0].asInt32)) }
+        cls.staticMethod("abs", "(J)J") { _, args, _ in .int64(args[0].asInt64.magnitude == 0x8000_0000_0000_0000 ? args[0].asInt64 : Swift.abs(args[0].asInt64)) }
+        cls.staticMethod("abs", "(F)F") { _, args, _ in .float(Swift.abs(args[0].asFloat)) }
+        cls.staticMethod("abs", "(D)D") { _, args, _ in .double(Swift.abs(args[0].asDouble)) }
+        cls.staticMethod("round", "(F)I") { _, args, _ in .int32(Int32((args[0].asFloat).rounded())) }
+        cls.staticMethod("round", "(D)J") { _, args, _ in .int64(Int64((args[0].asDouble).rounded())) }
+        cls.staticMethod("floor", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.down)) }
+        cls.staticMethod("ceil", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.up)) }
+        cls.staticMethod("pow", "(DD)D") { _, args, _ in .double(pow(args[0].asDouble, args[1].asDouble)) }
+        cls.staticMethod("sqrt", "(D)D") { _, args, _ in .double(args[0].asDouble.squareRoot()) }
+        cls.staticMethod("log", "(D)D") { _, args, _ in .double(log(args[0].asDouble)) }
+        cls.staticMethod("log10", "(D)D") { _, args, _ in .double(log10(args[0].asDouble)) }
+        cls.staticMethod("exp", "(D)D") { _, args, _ in .double(exp(args[0].asDouble)) }
+        cls.staticMethod("random", "()D") { _, _, _ in .double(Double.random(in: 0..<1)) }
+        cls.staticMethod("floorDiv", "(II)I") { _, args, _ in .int32(Int32(floor(Double(args[0].asInt32) / Double(args[1].asInt32)))) }
+        cls.staticMethod("floorMod", "(II)I") { _, args, _ in
+            let b = args[1].asInt32
+            guard b != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+            var value = args[0].asInt32 % b
+            if (value != 0) && ((value < 0) != (b < 0)) { value += b }
+            return .int32(value)
+        }
+        cls.staticMethod("signum", "(D)D") { _, args, _ in
+            let value = args[0].asDouble
+            return .double(value < 0 ? -1 : (value > 0 ? 1 : 0))
+        }
+        cls.staticField("PI", "D")
+        cls.staticField("E", "D")
+        cls.prepare = { _, cls in
+            cls.staticValues[0] = .double(.pi)
+            cls.staticValues[1] = .double(M_E)
+        }
+        return [cls]
+    }
+
+    private static func systemClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/System;")
+        cls.staticField("out", "Ljava/io/PrintStream;")
+        cls.staticField("err", "Ljava/io/PrintStream;")
+        cls.staticMethod("currentTimeMillis", "()J") { _, _, _ in
+            .int64(Int64(Date().timeIntervalSince1970 * 1000))
+        }
+        cls.staticMethod("nanoTime", "()J") { _, _, _ in
+            .int64(Int64(DispatchTime.now().uptimeNanoseconds))
+        }
+        cls.staticMethod("identityHashCode", "(Ljava/lang/Object;)I") { runtime, args, _ in .int32(runtime.javaIdentityHash(args[0])) }
+        cls.staticMethod("arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V") { runtime, args, _ in
+            guard let source = args[0].object, let destination = args[2].object else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            let sourceOffset = Int(args[1].asInt32)
+            let destinationOffset = Int(args[3].asInt32)
+            let count = Int(args[4].asInt32)
+            let sourceCount = Int(VMObjectLayout.aux(source))
+            let destinationCount = Int(VMObjectLayout.aux(destination))
+            guard sourceOffset >= 0, destinationOffset >= 0, count >= 0,
+                  sourceOffset + count <= sourceCount,
+                  destinationOffset + count <= destinationCount else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;")
+            }
+            if source == destination {
+                let temporary = (0..<count).map { VMObjectLayout.slot(source, sourceOffset + $0).pointee }
+                for index in 0..<count { VMObjectLayout.slot(destination, destinationOffset + index).pointee = temporary[index] }
+            } else {
+                for index in 0..<count {
+                    VMObjectLayout.slot(destination, destinationOffset + index).pointee =
+                        VMObjectLayout.slot(source, sourceOffset + index).pointee
+                }
+            }
+            return .zero
+        }
+        cls.staticMethod("getProperty", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let key = runtime.stringValue(args[0]) ?? ""
+            let value: String
+            switch key {
+            case "line.separator": value = "\n"
+            case "file.separator": value = "/"
+            case "path.separator": value = ":"
+            case "java.version": value = "21"
+            case "user.dir": value = "/"
+            case "file.encoding": value = "UTF-8"
+            default: return .null
+            }
+            return runtime.newString(value)
+        }
+        cls.staticMethod("getProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let key = runtime.stringValue(args[0]) ?? ""
+            if key == "line.separator" { return runtime.newString("\n") }
+            return args[1]
+        }
+        cls.staticMethod("getenv", "(Ljava/lang/String;)Ljava/lang/String;") { _, _, _ in .null }
+        cls.staticMethod("exit", "(I)V") { _, _, _ in .zero }
+        cls.staticMethod("gc", "()V") { _, _, _ in .zero }
+        cls.staticMethod("setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { _, _, _ in .null }
+        cls.prepare = { runtime, cls in
+            let stream = VMPrintStream()
+            stream.runtime = runtime
+            let out = runtime.makeNative("Ljava/io/PrintStream;", payload: stream)
+            cls.staticValues[0] = out
+            cls.staticValues[1] = out
+        }
+        return [cls]
+    }
+
+    private static func classClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Class;")
+        cls.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            return runtime.newString(target.displayName)
+        }
+        cls.method("getSimpleName", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let display = target.displayName
+            return runtime.newString(display.split(separator: ".").last.map(String.init) ?? display)
+        }
+        cls.method("getCanonicalName", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            return runtime.newString(target.displayName)
+        }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            return runtime.newString("class \(target.displayName)")
+        }
+        cls.method("isInstance", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .boolean(false) }
+            return .boolean(runtime.isInstance(args[1], of: target))
+        }
+        cls.method("isAssignableFrom", "(Ljava/lang/Class;)Z") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self),
+                  let other: VMClass = runtime.payload(args[1], as: VMClass.self) else { return .boolean(false) }
+            return .boolean(other.isSubclass(of: target))
+        }
+        cls.method("isInterface", "()Z") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .boolean(false) }
+            return .boolean(target.isInterface)
+        }
+        cls.method("isArray", "()Z") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .boolean(false) }
+            return .boolean(target.isArray)
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in .int32(runtime.javaIdentityHash(args[0])) }
+        cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in .boolean(args[0].bits == args[1].bits) }
+        cls.method("getClassLoader", "()Ljava/lang/ClassLoader;") { runtime, _, _ in
+            runtime.makeNative("Ljava/lang/ClassLoader;", payload: NSNull())
+        }
+        cls.method("getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let field = target.instanceFields.last(where: { $0.name == name }) ?? target.staticFields.first(where: { $0.name == name })
+            guard let field else {
+                throw VMJavaException("Ljava/lang/NoSuchFieldException;", "\(target.displayName).\(name)")
+            }
+            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: target, field: field))
+        }
+        cls.method("getField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            guard let field = target.instanceFields.last(where: { $0.name == name }) ?? target.staticFields.first(where: { $0.name == name }) else {
+                throw VMJavaException("Ljava/lang/NoSuchFieldException;", name)
+            }
+            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: target, field: field))
+        }
+        cls.method("getDeclaredFields", "()[Ljava/lang/reflect/Field;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let fields = target.instanceFields + target.staticFields
+            let array = runtime.newArray(component: "Ljava/lang/reflect/Field;", count: fields.count)
+            for (index, field) in fields.enumerated() {
+                runtime.setArrayElement(array, index: index, value: runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: target, field: field)))
+            }
+            return array
+        }
+        cls.method("getDeclaredConstructor", "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") { _, _, _ in .null }
+        cls.method("getConstructors", "()[Ljava/lang/reflect/Constructor;") { runtime, _, _ in
+            runtime.newArray(component: "Ljava/lang/reflect/Constructor;", count: 0)
+        }
+        cls.method("getSimpleName", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            return runtime.newString(target.displayName.split(separator: ".").last.map(String.init) ?? target.displayName)
+        }
+        return [cls]
+    }
+
+    private static func threadClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/lang/Thread;")
+        cls.method("<init>", "()V") { _, _, _ in .zero }
+        cls.method("start", "()V") { _, _, _ in .zero }
+        cls.method("run", "()V") { _, _, _ in .zero }
+        cls.staticMethod("join", "()V") { _, _, _ in .zero }
+        cls.staticMethod("join", "(J)V") { _, _, _ in .zero }
+        cls.staticMethod("sleep", "(J)V") { _, _, _ in .zero }
+        cls.staticMethod("currentThread", "()Ljava/lang/Thread;") { runtime, _, _ in
+            runtime.makeNative("Ljava/lang/Thread;", payload: NSNull())
+        }
+        return [cls]
+    }
+
+    // MARK: - throwables
+
+    private static func exceptionClasses() -> [[NativeClass]] {
+        let root = NativeClass("Ljava/lang/Throwable;")
+        root.field("detailMessage", "Ljava/lang/String;")
+        root.method("<init>", "()V") { _, _, _ in .zero }
+        root.method("<init>", "(Ljava/lang/String;)V") { _, args, _ in
+            if let pointer = args[0].object {
+                VMObjectLayout.slot(pointer, 0).pointee = args[1]
+            }
+            return .zero
+        }
+        root.method("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V") { _, args, _ in
+            if let pointer = args[0].object {
+                VMObjectLayout.slot(pointer, 0).pointee = args[1]
+            }
+            return .zero
+        }
+        root.method("<init>", "(Ljava/lang/Throwable;)V") { _, _, _ in .zero }
+        root.method("getMessage", "()Ljava/lang/String;") { _, args, _ in
+            guard let pointer = args[0].object else { return .null }
+            return VMObjectLayout.slot(pointer, 0).pointee
+        }
+        root.method("getLocalizedMessage", "()Ljava/lang/String;") { _, args, _ in
+            guard let pointer = args[0].object else { return .null }
+            return VMObjectLayout.slot(pointer, 0).pointee
+        }
+        root.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let pointer = args[0].object else { return runtime.newString("null") }
+            let name = VMObjectLayout.cls(pointer).displayName
+            let message = VMObjectLayout.slot(pointer, 0).pointee
+            if let text = runtime.stringValue(message) {
+                return runtime.newString("\(name): \(text)")
+            }
+            return runtime.newString(name)
+        }
+        root.method("getStackTrace", "()[Ljava/lang/StackTraceElement;") { runtime, _, _ in
+            runtime.newArray(component: "Ljava/lang/StackTraceElement;", count: 0)
+        }
+        root.method("printStackTrace", "()V") { runtime, args, _ in
+            runtime.standardOutput?(runtime.stringValue(runtime.javaToString(args[0])) ?? "")
+            return .zero
+        }
+        root.method("fillInStackTrace", "()Ljava/lang/Throwable;") { _, args, _ in args[0] }
+        root.method("getCause", "()Ljava/lang/Throwable;") { _, _, _ in .null }
+        root.method("initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;") { _, args, _ in args[0] }
+
+        let declarations: [(String, String)] = [
+            ("Ljava/lang/Exception;", "Ljava/lang/Throwable;"),
+            ("Ljava/lang/RuntimeException;", "Ljava/lang/Exception;"),
+            ("Ljava/lang/IllegalArgumentException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/IllegalStateException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/NullPointerException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/IndexOutOfBoundsException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/ArrayIndexOutOfBoundsException;", "Ljava/lang/IndexOutOfBoundsException;"),
+            ("Ljava/lang/StringIndexOutOfBoundsException;", "Ljava/lang/IndexOutOfBoundsException;"),
+            ("Ljava/lang/ClassCastException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/NumberFormatException;", "Ljava/lang/IllegalArgumentException;"),
+            ("Ljava/lang/UnsupportedOperationException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/ArithmeticException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/ArrayStoreException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/NegativeArraySizeException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/ClassNotFoundException;", "Ljava/lang/Exception;"),
+            ("Ljava/lang/InterruptedException;", "Ljava/lang/Exception;"),
+            ("Ljava/lang/CloneNotSupportedException;", "Ljava/lang/Exception;"),
+            ("Ljava/lang/Error;", "Ljava/lang/Throwable;"),
+            ("Ljava/lang/AssertionError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/NoSuchFieldError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/NoSuchMethodError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/AbstractMethodError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/VerifyError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/IncompatibleClassChangeError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/StackOverflowError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/OutOfMemoryError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/LinkageError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/NoClassDefFoundError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/ExceptionInInitializerError;", "Ljava/lang/LinkageError;"),
+            ("Ljava/io/IOException;", "Ljava/lang/Exception;"),
+            ("Ljava/io/UncheckedIOException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/io/FileNotFoundException;", "Ljava/io/IOException;"),
+            ("Ljava/util/NoSuchElementException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/util/ConcurrentModificationException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/util/regex/PatternSyntaxException;", "Ljava/lang/IllegalArgumentException;"),
+            ("Ljava/lang/SecurityException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/ReflectiveOperationException;", "Ljava/lang/Exception;"),
+            ("Ljava/lang/NoSuchMethodException;", "Ljava/lang/ReflectiveOperationException;"),
+            ("Ljava/lang/IllegalAccessException;", "Ljava/lang/ReflectiveOperationException;"),
+            ("Ljava/lang/InstantiationException;", "Ljava/lang/ReflectiveOperationException;"),
+            ("Ljava/lang/reflect/InvocationTargetException;", "Ljava/lang/ReflectiveOperationException;"),
+            ("Ljava/util/InputMismatchException;", "Ljava/util/NoSuchElementException;"),
+            ("Ljava/nio/charset/UnsupportedCharsetException;", "Ljava/lang/IllegalArgumentException;"),
+        ]
+        var result: [[NativeClass]] = [[root]]
+        for (descriptor, parent) in declarations {
+            let cls = NativeClass(descriptor, superclass: parent)
+            cls.method("<init>", "()V") { _, _, _ in .zero }
+            cls.method("<init>", "(Ljava/lang/String;)V") { _, args, _ in
+                if let pointer = args[0].object,
+                   let field = VMObjectLayout.cls(pointer).field(named: "detailMessage") {
+                    VMObjectLayout.slot(pointer, field.offset).pointee = args[1]
+                }
+                return .zero
+            }
+            cls.method("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V") { _, args, _ in
+                if let pointer = args[0].object,
+                   let field = VMObjectLayout.cls(pointer).field(named: "detailMessage") {
+                    VMObjectLayout.slot(pointer, field.offset).pointee = args[1]
+                }
+                return .zero
+            }
+            cls.method("<init>", "(Ljava/lang/Throwable;)V") { _, _, _ in .zero }
+            result.append([cls])
+        }
+        return result
+    }
+}

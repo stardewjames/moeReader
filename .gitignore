@@ -11,3 +11,12 @@ MoeReader/Info.plist
 
 __pycache__/
 *.pyc
+
+# Site-specific extension fixtures, live-host tests, and notes.
+# These files may reference extension repositories or manga sites and must
+# never be committed. Keep site names out of tracked source and docs.
+/SiteTests/
+/site-notes.local.md
+
+# Local reference checkouts and reverse-engineering artifacts.
+/.research/
