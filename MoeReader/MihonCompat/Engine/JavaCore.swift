@@ -130,7 +130,11 @@ enum JavaCore {
 
     private static func stringClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/lang/String;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Comparable;", "Ljava/io/Serializable;"])
-        cls.method("<init>", "()V") { _, _, _ in .zero }
+        cls.method("<init>", "()V") { runtime, args, _ in
+            guard let target = args[0].object else { return .zero }
+            runtime.fillString(target, units: [])
+            return .zero
+        }
         cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
             guard let target = args[0].object else { return .zero }
             runtime.fillString(target, units: runtime.stringUnits(args[1]) ?? [])
