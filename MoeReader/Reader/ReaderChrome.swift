@@ -57,19 +57,21 @@ struct ReaderChrome: View {
 
     private var modeMenu: some View {
         Menu {
-            ForEach(ReadingMode.allCases) { mode in
-                Button {
-                    model.setReadingMode(mode)
-                    model.bumpChrome()
-                } label: {
-                    if mode == model.modeSetting {
-                        Label(mode.title, systemImage: "checkmark")
-                    } else {
-                        Text(mode.title)
+            Section("This manga") {
+                ForEach(ReadingMode.allCases) { mode in
+                    Button {
+                        model.setReadingMode(mode)
+                        model.bumpChrome()
+                    } label: {
+                        if mode == model.modeSetting {
+                            Label(modeTitle(mode), systemImage: "checkmark")
+                        } else {
+                            Text(modeTitle(mode))
+                        }
                     }
+                    .accessibilityLabel(mode.title)
+                    .accessibilityHint(mode.summary)
                 }
-                .accessibilityLabel(mode.title)
-                .accessibilityHint(mode.summary)
             }
         } label: {
             Image(systemName: "book.pages")
@@ -77,7 +79,12 @@ struct ReaderChrome: View {
                 .contentShape(Rectangle())
         }
         .accessibilityIdentifier("reader.chrome.mode")
-        .accessibilityLabel("Reading mode")
+        .accessibilityLabel("Manga reading mode")
+    }
+
+    private func modeTitle(_ mode: ReadingMode) -> String {
+        guard mode == .defaultMode else { return mode.title }
+        return "Default — \(library.defaultReadingMode.title)"
     }
 
     private var bottomBar: some View {

@@ -1,17 +1,13 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum Palette {
-    static let amber = Color(red: 0.93, green: 0.78, blue: 0.55)
-    static let background = Color(red: 0.04, green: 0.04, blue: 0.05)
-}
-
 struct LibraryView: View {
     let library: LibraryModel
 
     @State private var coverStore = CoverStore()
     @State private var openBook: Book?
     @State private var isImporterPresented = false
+    @State private var isSettingsPresented = false
     @State private var pendingDeletion: Book?
     @Namespace private var zoomNamespace
     @Environment(\.scenePhase) private var scenePhase
@@ -37,27 +33,13 @@ struct LibraryView: View {
             .toolbarTitleDisplayMode(.inlineLarge)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Section("Default reading mode") {
-                            ForEach(ReadingMode.concreteCases) { mode in
-                                Button {
-                                    library.updateDefaultReadingMode(mode)
-                                } label: {
-                                    if mode == library.defaultReadingMode {
-                                        Label(mode.title, systemImage: "checkmark")
-                                    } else {
-                                        Text(mode.title)
-                                    }
-                                }
-                                .accessibilityLabel(mode.title)
-                                .accessibilityHint(mode.summary)
-                            }
-                        }
+                    Button {
+                        isSettingsPresented = true
                     } label: {
-                        Image(systemName: "slider.horizontal.3")
+                        Image(systemName: "gearshape")
                     }
-                    .accessibilityIdentifier("library.defaultMode")
-                    .accessibilityLabel("Default reading mode")
+                    .accessibilityIdentifier("library.settings")
+                    .accessibilityLabel("Settings")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -104,6 +86,9 @@ struct LibraryView: View {
             .navigationDestination(item: $openBook) { book in
                 ReaderView(book: book, library: library)
                     .navigationTransition(.zoom(sourceID: book.id, in: zoomNamespace))
+            }
+            .navigationDestination(isPresented: $isSettingsPresented) {
+                SettingsView(library: library)
             }
             .confirmationDialog(
                 "Delete book?",

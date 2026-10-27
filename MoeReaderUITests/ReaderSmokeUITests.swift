@@ -70,12 +70,17 @@ final class ReaderSmokeUITests: XCTestCase {
         XCTAssertTrue(tile.waitForExistence(timeout: 10))
         Thread.sleep(forTimeInterval: 0.5)
 
-        let defaultMenu = app.buttons["library.defaultMode"]
-        XCTAssertTrue(defaultMenu.waitForExistence(timeout: 5))
-        defaultMenu.tap()
-        let ltr = app.buttons["Paged (left to right)"]
-        XCTAssertTrue(ltr.waitForExistence(timeout: 5))
-        ltr.tap()
+        let settingsButton = app.buttons["library.settings"]
+        XCTAssertTrue(settingsButton.waitForExistence(timeout: 5))
+        settingsButton.tap()
+
+        let settingsNavigation = app.navigationBars["Settings"]
+        XCTAssertTrue(settingsNavigation.waitForExistence(timeout: 5))
+        let ltrRow = app.buttons["settings.mode.pagedLeftToRight"]
+        XCTAssertTrue(ltrRow.waitForExistence(timeout: 5))
+        ltrRow.tap()
+        attachScreenshot(named: "08-settings-default-mode")
+        settingsNavigation.buttons.firstMatch.tap()
         Thread.sleep(forTimeInterval: 0.4)
 
         tile.tap()
@@ -83,7 +88,7 @@ final class ReaderSmokeUITests: XCTestCase {
         XCTAssertEqual(indicator.label, "1 / 3")
         app.swipeLeft()
         waitForIndicator("2 / 3", indicator)
-        attachScreenshot(named: "08-reader-default-follows-app-setting")
+        attachScreenshot(named: "09-reader-default-follows-settings")
 
         app.buttons["reader.chrome.back"].tap()
         XCTAssertTrue(tile.waitForExistence(timeout: 10))

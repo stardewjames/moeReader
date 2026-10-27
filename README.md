@@ -13,16 +13,15 @@ Liquid Glass.
 - Off-main ImageIO downsampling with a bounded decoded-image cache and ±2-page prefetch.
 - Horizontal paged reading (left-to-right or traditional right-to-left), vertical
   paged reading, and continuous long-strip modes with optional gaps.
-- A per-book reading mode; `Default` follows the configurable app-wide default.
+- A per-manga reading mode; `Default` uses the app-wide default configured in Settings.
 - Pinch, pan, and double-tap zoom. Paging is disabled while a page is zoomed.
-- Liquid Glass reader chrome with page slider, page counter, and reading-mode menu.
-- Per-book progress and reading mode persist across launches; the app-wide default
-  reading mode is configurable from the library.
+- Liquid Glass reader chrome with page slider, page counter, and per-manga mode menu.
+- Per-manga progress and reading mode persist across launches.
 - Covers are generated on import and cached separately from the library.
 - Imported books are excluded from iCloud backup; covers live in Caches.
 
-Out of scope for this milestone: online sources, CBR, CB7, and a dedicated
-settings screen. `PageSource` is the extension seam for future remote sources.
+Out of scope for this milestone: online sources, CBR, and CB7. `PageSource` is
+the extension seam for future remote sources.
 
 ## Requirements
 
@@ -99,7 +98,7 @@ MoeReader/
     Source/     PageSource, ZIP, TAR, folder, page ordering
     Image/      ImageIO decoding, cache, JPEG covers
     Diagnostics Signposts
-  Library/      Book model, persistence, import, covers, library UI
+  Library/      Book model, persistence, import, covers, library UI, settings
   Reader/       Reader model, scroll modes, zoom, chrome
 MoeReaderTests/ Unit tests and fixtures
 MoeReaderUITests/ End-to-end import/read/mode-switch test
