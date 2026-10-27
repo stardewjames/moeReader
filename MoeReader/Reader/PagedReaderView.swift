@@ -4,7 +4,7 @@ import SwiftUI
 struct PagedReaderView: View {
     @Bindable var model: ReaderModel
     let pixelSize: Int
-    @State private var isScrollReady = false
+    @State private var readyDirection: ReadingDirection?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -24,7 +24,7 @@ struct PagedReaderView: View {
             .id(model.direction)
             .background(Color.black)
             .task(id: model.direction) {
-                isScrollReady = false
+                readyDirection = nil
                 await Task.yield()
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
@@ -32,7 +32,7 @@ struct PagedReaderView: View {
                     proxy.scrollTo(model.visiblePage, anchor: .center)
                 }
                 await Task.yield()
-                isScrollReady = true
+                readyDirection = model.direction
             }
         }
     }
@@ -41,7 +41,7 @@ struct PagedReaderView: View {
         Binding(
             get: { model.visiblePage },
             set: { newValue in
-                guard isScrollReady, let newValue else { return }
+                guard readyDirection == model.direction, let newValue else { return }
                 model.visiblePage = newValue
             }
         )
