@@ -1,0 +1,11 @@
+/TestManga/
+/MoeReader.xcodeproj/
+/build/
+/DerivedData/
+*.xcresult
+xcuserdata/
+.DS_Store
+MoeReader/Info.plist
+
+__pycache__/
+*.pyc
