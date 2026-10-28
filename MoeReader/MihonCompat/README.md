@@ -231,7 +231,9 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   no site reference is committed; local notes are in the ignored
   `site-notes.local.md`.
 - The portable suite (engine sources plus the SuwayomiCompat runtime files,
-  built on Linux) passes 129 tests with no failures.
+  built on Linux) passes 151 tests with no failures. The runner takes every
+  file in `MoeReaderTests`, then drops the ones that need app sources or Apple
+  frameworks, so a new engine test is picked up without editing a list.
 - A live harness sweep of the 35 most-downloaded lib-1.6 extensions runs load,
   popular (both pages), latest, both search modes, details, chapters and pages:
   25 of the 35 end `RESULT OK` on the extension's default host, and 27 when a
@@ -259,8 +261,10 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   JavaScriptCore round trip and the typed `UnsupportedOperationException` on a
   host without it.
 - `MihonChallengeDetectionTests` covers both protection families (server
-  header, interstitial markup, clearance-cookie names, status codes) and
-  `MihonChallengeRetryTests` covers the single retry with a fresh cookie jar.
+  header, interstitial markup, clearance-cookie names, status codes),
+  `MihonChallengeRetryTests` covers the single retry with a fresh cookie jar,
+  and `MihonChallengeUserAgentTests` pins the solver/retry user-agent match
+  (any header casing, empty or absent header, first repeated value).
 - Engine unit tests cover the DEX reader, interpreter arithmetic/control
   flow/exceptions against JVM-produced expected values, the string/collection
   runtime, selector pseudos, and arena recycling.

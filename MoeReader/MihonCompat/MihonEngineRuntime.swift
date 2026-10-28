@@ -124,7 +124,37 @@ final class MihonResponseDownloader: NSObject, URLSessionDataDelegate, @unchecke
     }
 }
 
+/// The `User-Agent` the engine presents for one request.
+///
+/// A clearance issued by a browser check belongs to the identity that passed
+/// it: the protection hashes the agent (along with the address and client
+/// fingerprint) into the cookie, and a request carrying a different agent is
+/// challenged again. The off-screen browser therefore has to present the exact
+/// value the retry will send, which is the request's own header when it has
+/// one and the transport default otherwise.
+enum MihonChallengeUserAgent {
+    static let headerName = "User-Agent"
+
+    /// The first `User-Agent` header (matched case-insensitively) that carries
+    /// a value. A repeated header resolves to the first value, as header
+    /// lookup does everywhere else; an absent, empty or blank one means the
+    /// request is sent with the transport default.
+    static func forRequest(_ request: VMHTTPRequest, default defaultUserAgent: String) -> String {
+        for (name, value) in request.headers
+        where name.caseInsensitiveCompare(headerName) == .orderedSame {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return defaultUserAgent
+    }
+}
+
 final class MihonEngineHost: VMHost {
+    /// What the transport sends when a source supplies no agent of its own.
+    /// It is the same browser identity Mihon's HTTP layer hands to sources, so
+    /// an off-screen browser can present it verbatim.
+    static let defaultUserAgent = MihonAPI.userAgent(sourceName: "")
+
     private let session: URLSession
     private let downloader: MihonResponseDownloader
     private let preferencesStore: VMPreferences
@@ -161,9 +191,15 @@ final class MihonEngineHost: VMHost {
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = request.method
         urlRequest.httpBody = request.body
-        for (name, value) in request.headers where !name.isEmpty {
+        // Every request leaves the transport with exactly one `User-Agent`, the
+        // same value the challenge solver makes the off-screen browser present,
+        // so a clearance obtained there covers this request and its retry.
+        let userAgent = MihonChallengeUserAgent.forRequest(request, default: Self.defaultUserAgent)
+        for (name, value) in request.headers
+        where !name.isEmpty && name.caseInsensitiveCompare(MihonChallengeUserAgent.headerName) != .orderedSame {
             urlRequest.addValue(value, forHTTPHeaderField: name)
         }
+        urlRequest.setValue(userAgent, forHTTPHeaderField: MihonChallengeUserAgent.headerName)
 
         let task = session.dataTask(with: urlRequest)
         let box = downloader.register(task)
@@ -201,8 +237,11 @@ final class MihonEngineHost: VMHost {
     func solveChallenge(_ request: VMHTTPRequest) throws -> Bool {
         #if canImport(WebKit)
         guard let url = URL(string: request.url) else { return false }
+        // The retry carries the request's own headers, so the browser has to
+        // present the agent those headers resolve to, not the WebView default.
+        let userAgent = MihonChallengeUserAgent.forRequest(request, default: Self.defaultUserAgent)
         let solver = MihonChallengeSolver()
-        return solver.solve(url: url)
+        return solver.solve(url: url, userAgent: userAgent)
         #else
         _ = request
         return false
@@ -612,18 +651,35 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
 
     private var webView: WKWebView?
 
+    /// Cookies for the challenged host before the attempt started, per store.
+    /// Only cookies the attempt itself adds are removed, so a session obtained
+    /// earlier stays usable.
+    private struct CookieSnapshot {
+        var webKit: [HTTPCookie] = []
+        var shared: [HTTPCookie] = []
+    }
+
     private final class ValueBox<T>: @unchecked Sendable {
         var value: T?
     }
 
-    func solve(url: URL) -> Bool {
+    func solve(url: URL, userAgent: String) -> Bool {
         guard !Thread.isMainThread else { return false }
         DispatchQueue.main.sync {
             let configuration = WKWebViewConfiguration()
             configuration.websiteDataStore = .default()
             let webView = WKWebView(frame: .zero, configuration: configuration)
+            // The clearance is issued to the identity that passed the check; the
+            // retry sends this exact agent, so the browser has to present it.
+            webView.customUserAgent = userAgent
             self.webView = webView
-            webView.load(URLRequest(url: url))
+        }
+        // Snapshot before the first load: what the attempt adds is exactly the
+        // difference to this state, and a failed attempt removes only that.
+        let host = url.host?.lowercased()
+        let before = host.flatMap { snapshot(for: $0, url: url) }
+        DispatchQueue.main.sync {
+            self.webView?.load(URLRequest(url: url))
         }
 
         let deadline = Date().addingTimeInterval(Self.timeout)
@@ -646,9 +702,20 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
             }
             Thread.sleep(forTimeInterval: Self.pollInterval)
         }
-        if cleared { copyCookiesToHTTPStorage(for: url) }
+        // Stop the page before reading its store: a load still in flight would
+        // keep issuing cookies past the point the attempt gave up.
         DispatchQueue.main.sync {
             self.webView?.stopLoading()
+        }
+        if cleared {
+            copyCookiesToHTTPStorage(for: url)
+        } else if let host, let before {
+            // Without a snapshot the attempt cannot tell its own cookies from
+            // earlier ones, so it leaves the store alone rather than risk
+            // deleting a session that still works.
+            discardCookies(addedSince: before, for: url, host: host)
+        }
+        DispatchQueue.main.sync {
             self.webView = nil
         }
         return cleared
@@ -688,43 +755,81 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
 
     private func hasClearanceCookie(for url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = ValueBox<Bool>()
-        DispatchQueue.main.async {
-            guard let webView = self.webView else {
-                semaphore.signal()
-                return
-            }
-            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-                box.value = cookies.contains {
-                    Self.cookie($0, appliesTo: host) && VMChallengeDetector.isClearanceCookie($0.name)
-                }
-                semaphore.signal()
-            }
-        }
-        guard semaphore.wait(timeout: .now() + Self.replyTimeout) == .success else { return false }
-        return box.value ?? false
+        // A clearance only counts for the challenged host: a cookie another
+        // site left in the shared store says nothing about this page.
+        return webKitCookies(for: host)?.contains {
+            VMChallengeDetector.isClearanceCookie($0.name)
+        } ?? false
     }
 
     /// Copies every cookie that belongs to the loaded host, not only the
     /// clearance one: the protection's flow can leave several cookies and the
     /// retry has to look exactly like the browser that passed the check.
     private func copyCookiesToHTTPStorage(for url: URL) {
-        guard let host = url.host?.lowercased() else { return }
+        guard let host = url.host?.lowercased(), let cookies = webKitCookies(for: host) else { return }
+        for cookie in cookies { HTTPCookieStorage.shared.setCookie(cookie) }
+    }
+
+    // MARK: - Cookie store access, on the main queue
+
+    private func webKitCookies(for host: String) -> [HTTPCookie]? {
         let semaphore = DispatchSemaphore(value: 0)
+        let box = ValueBox<[HTTPCookie]>()
         DispatchQueue.main.async {
-            guard let webView = self.webView else {
+            guard let store = self.webView?.configuration.websiteDataStore.httpCookieStore else {
                 semaphore.signal()
                 return
             }
-            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-                for cookie in cookies where Self.cookie(cookie, appliesTo: host) {
-                    HTTPCookieStorage.shared.setCookie(cookie)
-                }
+            store.getAllCookies { cookies in
+                box.value = cookies.filter { Self.cookie($0, appliesTo: host) }
                 semaphore.signal()
             }
         }
-        _ = semaphore.wait(timeout: .now() + Self.replyTimeout)
+        guard semaphore.wait(timeout: .now() + Self.replyTimeout) == .success else { return nil }
+        return box.value
+    }
+
+    private func snapshot(for host: String, url: URL) -> CookieSnapshot? {
+        guard let webKit = webKitCookies(for: host) else { return nil }
+        return CookieSnapshot(
+            webKit: webKit,
+            shared: (HTTPCookieStorage.shared.cookies(for: url) ?? [])
+                .filter { Self.cookie($0, appliesTo: host) }
+        )
+    }
+
+    /// Drops what a failed attempt left behind. The browser store is shared and
+    /// persistent, so a half-issued cookie from an attempt that gave up would
+    /// otherwise be inherited by the next one; the HTTP store is where a
+    /// solved attempt writes, so anything new there has to go too.
+    private func discardCookies(addedSince snapshot: CookieSnapshot, for url: URL, host: String) {
+        let knownWebKit = Set(snapshot.webKit.map(Self.identity))
+        if let current = webKitCookies(for: host) {
+            let added = current.filter { !knownWebKit.contains(Self.identity($0)) }
+            if !added.isEmpty {
+                let semaphore = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async {
+                    guard let store = self.webView?.configuration.websiteDataStore.httpCookieStore else {
+                        semaphore.signal()
+                        return
+                    }
+                    for cookie in added { store.delete(cookie) }
+                    semaphore.signal()
+                }
+                _ = semaphore.wait(timeout: .now() + Self.replyTimeout)
+            }
+        }
+        let knownShared = Set(snapshot.shared.map(Self.identity))
+        for cookie in HTTPCookieStorage.shared.cookies(for: url) ?? []
+        where Self.cookie(cookie, appliesTo: host) && !knownShared.contains(Self.identity(cookie)) {
+            HTTPCookieStorage.shared.deleteCookie(cookie)
+        }
+    }
+
+    /// Name, scope and value identify a cookie across the two stores; two
+    /// cookies sharing all of them are the same cookie for this purpose.
+    private static func identity(_ cookie: HTTPCookie) -> String {
+        "\(cookie.name)\u{1}\(cookie.domain.lowercased())\u{1}\(cookie.path)\u{1}\(cookie.value)"
     }
 
     /// RFC 6265 domain matching: the host equals the cookie domain or is one of
