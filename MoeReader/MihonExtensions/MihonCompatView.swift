@@ -154,6 +154,7 @@ struct MihonCompatView: View {
                             packageName: entry.installed.packageName,
                             runtime: entry.runtime
                         )
+                        .id(entry.runtime.descriptor.id)
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
                             HStack {
@@ -164,7 +165,7 @@ struct MihonCompatView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Text(entry.runtime.descriptor.name + " runtime")
+                            Text(entry.runtime.descriptor.name)
                                 .font(.caption2)
                                 .foregroundStyle(Palette.amber)
                         }
@@ -210,7 +211,7 @@ struct MihonCompatView: View {
         } header: {
             Text("Available · \(model.visibleExtensions.count)")
         } footer: {
-            Text("Extensions are listed from the repositories above. Android APK code cannot run directly on iOS; sources appear under Sources when a native runtime profile is available.")
+            Text("Install and enable an extension to list its sources. Installed extensions use the runtime selected in Settings.")
         }
     }
 }
@@ -266,7 +267,7 @@ private struct MihonInstalledRow: View {
             HStack(spacing: 6) {
                 Text(installed.extensionLib.isEmpty ? "lib unknown" : "lib \(installed.extensionLib)")
                 Text("·")
-                Text(hasRuntime ? "Native runtime" : "No iOS runtime")
+                Text(hasRuntime ? "Runtime ready" : "Runtime unavailable")
                     .foregroundStyle(hasRuntime ? Palette.amber : Color.secondary)
                 if installed.contentWarning == .nsfw {
                     Text("· NSFW")
@@ -400,7 +401,7 @@ struct MihonExtensionDetailView: View {
                     }
                     .disabled(isWorking)
                     if !hasRuntime {
-                        Label("No native iOS runtime is available for this extension.", systemImage: "info.circle")
+                        Label("Enable this extension and ensure its installed package is available to use its sources.", systemImage: "info.circle")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

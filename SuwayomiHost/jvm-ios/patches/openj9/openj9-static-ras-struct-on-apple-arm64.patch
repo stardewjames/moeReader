@@ -1,0 +1,38 @@
+# Uses the static RAS struct (_j9ras_) on macOS and iOS arm64 instead of searching for memory below 4 GB.
+# Builds without compressed references look for one page under 4 GB, bottom-up, one page at a time.
+# arm64 executables reserve the whole low 4 GB as __PAGEZERO (x86-64 launchers shrink it with
+# -pagezero_size; arm64 cannot), so every one of the 262144 attempts fails and the VM falls back to
+# the static struct anyway. On an iPhone 18 Pro that cost about 165 ms of mmap/mprotect/munmap per boot.
+# The struct's content and its users (vm->j9ras, javacores, the J9VMRAS eyecatcher that dump tools
+# search for) are unchanged; z/OS and 32-bit AIX already take this path.
+#
+# Tree: openj9 (a1daf225f5cb0ccfb5d7309014701570435a94c4). Applied by apply-openj9-patches.sh.
+
+diff --git a/runtime/vm/rasdump.c b/runtime/vm/rasdump.c
+index e110c54..194d258 100644
+--- a/runtime/vm/rasdump.c
++++ b/runtime/vm/rasdump.c
+@@ -473,9 +473,9 @@ j9rasSetServiceLevel(J9JavaVM *vm, const char *runtimeVersion) {
+ #define ALLOCATE_RAS_DATA_IN_SUBALLOCATOR FALSE
+ #endif /* !defined(J9ZOS390) && !defined(J9ZTPF) */
+ 
+-#if defined(J9ZOS390) || (defined(AIXPPC) && !defined(J9VM_ENV_DATA64))
++#if defined(J9ZOS390) || (defined(AIXPPC) && !defined(J9VM_ENV_DATA64)) || (defined(OSX) && defined(AARCH64))
+ #define USE_STATIC_RAS_STRUCT
+-#endif /* defined(J9ZOS390) || (defined(AIXPPC) && !defined(J9VM_ENV_DATA64)) */
++#endif /* defined(J9ZOS390) || (defined(AIXPPC) && !defined(J9VM_ENV_DATA64)) || (defined(OSX) && defined(AARCH64)) */
+ 
+ static J9RAS*
+ allocateRASStruct(J9JavaVM *javaVM)
+@@ -490,6 +490,11 @@ allocateRASStruct(J9JavaVM *javaVM)
+ 	 * with the eyecatchers, we significantly reduce the maximum number of threads which can be created
+ 	 * (from 1000+ to 811). Always use the static variable to avoid wasting virtual memory addresses.
+ 	 *
++	 * macOS and iOS on arm64: every executable reserves the low 4 GB as __PAGEZERO, and it cannot be
++	 * made smaller as on x86-64. The bottom-up search below would try every page under 4 GB (262144
++	 * mmap/munmap attempts with 16 KB pages, about 165 ms on an iPhone) and then fall back to the
++	 * static struct anyway, so use the static struct directly.
++	 *
+ 	 * Compressed references: the RAS data is relocated to the JVM suballocator once the latter is created.
+ 	 */
+ #if !defined(USE_STATIC_RAS_STRUCT)

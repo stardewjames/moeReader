@@ -243,20 +243,37 @@ extension MihonSourceRuntime {
     }
 }
 
-struct MihonRuntimeRegistry: Sendable {
-    let runtimes: [any MihonSourceRuntime]
-
-    static let shared = MihonRuntimeRegistry(runtimes: [])
-
-    func runtime(forPackage packageName: String) -> (any MihonSourceRuntime)? {
-        runtimes.first { $0.descriptor.supportedPackages.contains(packageName) }
+/// One control of a source's preference screen (`ConfigurableSource`), as
+/// every runtime backend reports it to the settings sheet.
+struct MihonSourcePreference: Identifiable, Hashable, Sendable {
+    enum Kind: String, Sendable {
+        case header
+        case text
+        case list
+        case multiSelect
+        case toggle
     }
 
-    func runtime(for installed: MihonInstalledExtension) -> (any MihonSourceRuntime)? {
-        runtime(forPackage: installed.packageName)
-    }
+    var id: String { key.isEmpty ? title : key }
+    var key: String
+    var title: String
+    var summary: String?
+    var dialogTitle: String? = nil
+    var kind: Kind
+    var entries: [String]
+    var entryValues: [String]
+    var value: String
+    /// Selected values for `.multiSelect`; empty for other kinds.
+    var values: [String]
+}
 
-    var descriptors: [MihonRuntimeDescriptor] {
-        runtimes.map(\.descriptor)
-    }
+protocol MihonSourcePreferencesProviding: Sendable {
+    func preferences(source: MihonSource) async throws -> [MihonSourcePreference]
+    func setPreference(
+        key: String,
+        value: String,
+        values: [String],
+        kind: MihonSourcePreference.Kind,
+        source: MihonSource
+    ) async throws
 }

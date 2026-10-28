@@ -1,10 +1,10 @@
 //
 //  MihonSourceSettingsView.swift
-//  MihonCompat
+//  MihonExtensions
 //
 //  Generic source preference form. The extension builds the controls through
-//  setupPreferenceScreen; edits are written to the engine's shared preferences,
-//  which the extension reads on its next call. Toggles, lists, and submitted
+//  setupPreferenceScreen; edits are written to the selected runtime's preference
+//  storage, which the extension reads on its next call. Toggles, lists, and submitted
 //  text fields apply immediately; multi-select sets and unsubmitted text edits
 //  commit once when the form closes.
 //
@@ -16,7 +16,7 @@ struct MihonSourceSettingsView: View {
     let runtime: any MihonSourcePreferencesProviding
 
     @Environment(\.dismiss) private var dismiss
-    @State private var preferences: [MihonEnginePreference] = []
+    @State private var preferences: [MihonSourcePreference] = []
     @State private var values: [String: String] = [:]
     @State private var selections: [String: Set<String>] = [:]
     @State private var persistedValues: [String: String] = [:]
@@ -67,7 +67,7 @@ struct MihonSourceSettingsView: View {
     }
 
     @ViewBuilder
-    private func row(for preference: MihonEnginePreference) -> some View {
+    private func row(for preference: MihonSourcePreference) -> some View {
         switch preference.kind {
         case .header:
             Text(preference.title)
@@ -124,11 +124,11 @@ struct MihonSourceSettingsView: View {
         }
     }
 
-    private func selected(for preference: MihonEnginePreference) -> Set<String> {
+    private func selected(for preference: MihonSourcePreference) -> Set<String> {
         selections[preference.key] ?? Set(preference.values)
     }
 
-    private func selectedSummary(_ preference: MihonEnginePreference) -> String {
+    private func selectedSummary(_ preference: MihonSourcePreference) -> String {
         let selected = selected(for: preference)
         let labels = preference.entryValues.enumerated().compactMap { index, value in
             selected.contains(value)
@@ -138,7 +138,7 @@ struct MihonSourceSettingsView: View {
         return labels.joined(separator: ", ")
     }
 
-    private func setSelected(_ selected: Set<String>, for preference: MihonEnginePreference) {
+    private func setSelected(_ selected: Set<String>, for preference: MihonSourcePreference) {
         // Multi-select edits stay local until dismissal: a selection that is
         // changed and then reverted before Done must not reach the engine.
         selections[preference.key] = selected
@@ -164,13 +164,13 @@ struct MihonSourceSettingsView: View {
         }
     }
 
-    private func update(_ preference: MihonEnginePreference, value: String) {
+    private func update(_ preference: MihonSourcePreference, value: String) {
         values[preference.key] = value
         guard preference.kind != .multiSelect else { return }
         persist(preference, value: value)
     }
 
-    private func persist(_ preference: MihonEnginePreference, value: String) {
+    private func persist(_ preference: MihonSourcePreference, value: String) {
         // Record the value optimistically so a later saveAll() (Done followed
         // by onDisappear) does not send the same edit twice.
         persistedValues[preference.key] = value
@@ -190,7 +190,7 @@ struct MihonSourceSettingsView: View {
     }
 
     private func saveAll() {
-        var edits: [(preference: MihonEnginePreference, value: String, selected: [String])] = []
+        var edits: [(preference: MihonSourcePreference, value: String, selected: [String])] = []
         for preference in preferences where !preference.key.isEmpty {
             if preference.kind == .multiSelect {
                 let current = selections[preference.key] ?? Set(preference.values)

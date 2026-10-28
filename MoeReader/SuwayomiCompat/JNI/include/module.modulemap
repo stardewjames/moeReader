@@ -1,0 +1,4 @@
+module SuwayomiJNI {
+    header "suwayomi_jni.h"
+    export *
+}

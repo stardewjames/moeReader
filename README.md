@@ -20,6 +20,9 @@ Liquid Glass.
   every source call runs under a wall-clock budget. No JVM is embedded; a
   source call is the only time the engine does work, and its arena is recycled
   so idle RAM stays flat.
+- Or runs them on the **Suwayomi runtime**: Suwayomi's Android compatibility
+  layer and the real extension libraries on an embedded, interpreter-only
+  OpenJ9 JVM, selectable in Settings → Extension runtime.
 - Browses sources with **search filters** rendered from the extension's
   `FilterList`, and edits source preferences (text, toggles, single-choice
   lists, multi-select values) from a settings sheet.
@@ -37,16 +40,32 @@ Liquid Glass.
 - Covers are generated on import and cached separately from the library.
 - Imported books are excluded from iCloud backup; covers live in Caches.
 
-**Extension scope:** `SuwayomiCompat` owns repository discovery, signed installs,
-updates, source filters and the reader UI. `MihonCompat` owns execution: it
-interprets the extension's Dalvik bytecode and supplies the platform surface.
-Extensions whose API use falls inside that surface run without any
-site-specific Swift code; `MihonCompat/README.md` lists the exact surface and
-the known gaps (RxJava-only fetch overrides, entropy-coded zstd response
-bodies, merged duplicate response headers, and library surface that needs Apple
-frameworks). See
-[`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md) and
-[`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md).
+**Extension scope:** `MihonExtensions` owns repository discovery, signed installs,
+updates, source filters and the reader UI. Execution belongs to a **runtime
+backend**, chosen in Settings → Extension runtime:
+
+- **Swift engine** (`MihonCompat`, default) interprets the extension's Dalvik
+  bytecode and supplies the platform surface natively. Extensions whose API use
+  falls inside that surface run without any site-specific Swift code;
+  `MihonCompat/README.md` lists the exact surface and the known gaps
+  (RxJava-only fetch overrides, entropy-coded zstd response bodies, merged
+  duplicate response headers, and library surface that needs Apple frameworks).
+- **Suwayomi runtime** (`SuwayomiCompat` + `SuwayomiHost`) runs a cut-down
+  Suwayomi-Server — its Android compatibility layer and the real OkHttp, Jsoup,
+  RxJava and Kotlin libraries — on an interpreter-only OpenJ9 JVM linked into
+  the app. It starts on the first source call, adds no background polling,
+  sends every request through the app's `URLSession`, and lets the app download
+  plain page images without the JVM. It is available in builds that bundle the
+  runtime (CI does).
+
+Repositories and installs are shared; switching drops the previous backend's
+source caches (the JVM remains loaded until app exit). Backends are isolated
+behind `App/MihonRuntimeBackends.swift`; the removal guide also lists packaging
+and build entries to delete. See
+[`MoeReader/MihonExtensions/README.md`](MoeReader/MihonExtensions/README.md),
+[`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md),
+[`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md) and
+[`SuwayomiHost/README.md`](SuwayomiHost/README.md).
 
 Still out of scope: CBR, CB7, and Android framework pieces the engine does not
 provide (constructor reflection, JNI).
@@ -99,6 +118,19 @@ This produces `MoeReader.ipa` in the repository root, built for
 `generic/platform=iOS` without code signing. Successful CI runs upload the same
 file as the `MoeReader-unsigned-ipa` artifact.
 
+To include the Suwayomi runtime, build it once on a Mac before generating the
+project (the app builds without it; Settings then lists the backend as
+unavailable):
+
+```bash
+git submodule update --init                # SuwayomiHost/vendor/suwayomi
+cd SuwayomiHost/jvm-ios && ./fetch-openj9.sh && ./build-openj9-macos.sh \
+  && ./build-openj9-ios.sh iphoneos && ./package.sh
+```
+
+CI does the same and caches the VM; see
+[`SuwayomiHost/README.md`](SuwayomiHost/README.md#the-ios-jvm-jvm-ios).
+
 ### Install with Sideloadly
 
 1. Download the `MoeReader-unsigned-ipa` artifact from the latest green CI run
@@ -140,16 +172,18 @@ no external compiler, DEX fixture, or JVM is used.
 
 ```text
 MoeReader/
-  App/          App entry point
+  App/          App entry point, runtime backend list
   Core/
     Source/     PageSource, ZIP, TAR, folder, page ordering
     Image/      ImageIO decoding, cache, JPEG covers
     Diagnostics Signposts
   Library/      Book model, persistence, import, covers, library UI, settings
-  SuwayomiCompat/  Mihon repositories, APK verification, native runtime profiles, UI
-  MihonCompat/  Dalvik extension engine, platform hosts, Mihon source API
+  MihonExtensions/  Mihon repositories, APK verification, backend seam, browse/reader UI
+  MihonCompat/  Swift engine backend: Dalvik interpreter, platform hosts, Mihon source API
+  SuwayomiCompat/   Suwayomi backend, app side: JVM lifecycle, JNI shim, transport
   Reader/       Reader model, scroll modes, zoom, chrome
 MoeReaderTests/ Unit tests and fixtures
+SuwayomiHost/   Suwayomi backend, JVM side: host jar (Gradle), Suwayomi-Server submodule, OpenJ9 for iOS
 scripts/        Fixture generation and local test script
 ```
 
@@ -166,6 +200,15 @@ timers, background work, or JIT. To run the manual benchmark, set
 `MOEREADER_BENCH_CBZ` to a real CBZ path in the scheme's Test action environment
 and run `testRealArchiveBenchmark`; it is skipped when the variable is absent.
 
+The Suwayomi runtime follows the same rule on a JVM: it starts on the first
+source call, its two worker threads park between calls, and idle extension
+loaders are evicted above a three-extension limit. In-flight calls may exceed
+that limit. No battery measurements have been taken on a device.
+`MoeReader/SuwayomiCompat/README.md` lists the CPU, radio and memory tradeoffs.
+
 ## License
 
-BSD 2-Clause. See [LICENSE](LICENSE).
+BSD 2-Clause. See [LICENSE](LICENSE). `SuwayomiHost/` builds on MPL-2.0 code
+(Suwayomi-Server, the Oneechan runtime's `jvm-ios` scripts) and bundles
+OpenJ9/OMR (Apache-2.0) and the OpenJDK class library (GPL-2.0 with the
+Classpath Exception); see `SuwayomiHost/README.md`.

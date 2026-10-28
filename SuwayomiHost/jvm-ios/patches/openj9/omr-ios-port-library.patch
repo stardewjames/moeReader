@@ -1,0 +1,153 @@
+# Builds OMR's macOS port and thread libraries for iOS (device and simulator, TARGET_OS_IPHONE).
+# - port/osx/omrosdump.c: system (core) dumps need fork() and another task's Mach port/memory
+#   (mach_vm.h is unsupported on iOS); omrdump_create reports them as unsupported instead.
+# - port/unix/omrsysinfo.c: libproc is not in the iOS SDK; the open-file count, process list and
+#   process name queries take their existing "not supported" paths.
+# - include_core/thread_api.h: pthread_jit_write_protect_np() is unavailable on iOS, where nothing
+#   is ever mapped executable (no MAP_JIT); omrthread_jit_write_protect_{enable,disable} are no-ops.
+# - port/unix/omrcpu.c: omrcpu_flush_icache uses Apple's sys_icache_invalidate(); the iOS device
+#   libSystem has no __clear_cache for __builtin___clear_cache (only the JIT flushes code anyway).
+#
+# Tree: omr (ebd02d9129dc06fa67a6f885f99a3926aa869154). Applied by apply-openj9-patches.sh.
+
+diff --git a/include_core/thread_api.h b/include_core/thread_api.h
+index 8517da3..5e30fc2 100644
+--- a/include_core/thread_api.h
++++ b/include_core/thread_api.h
+@@ -40,7 +40,11 @@
+ #include "omrcomp.h"
+ 
+ #if defined(OSX) && defined(AARCH64)
++#include <TargetConditionals.h>
++#if !TARGET_OS_IPHONE
++#define OMR_JIT_WRITE_PROTECT_NP
+ #include <pthread.h> /* for pthread_jit_write_protect_np() */
++#endif /* !TARGET_OS_IPHONE */
+ #endif /* defined(OSX) && defined(AARCH64) */
+ 
+ #ifdef __cplusplus
+@@ -1473,10 +1477,10 @@ struct J9ThreadLibrary;
+  *
+  * Currently only meaningful on macOS using Aarch64 processors.
+  */
+-#if defined(OSX) && defined(AARCH64)
++#if defined(OMR_JIT_WRITE_PROTECT_NP)
+ #define omrthread_jit_write_protect_disable() pthread_jit_write_protect_np(0)
+ #define omrthread_jit_write_protect_enable()  pthread_jit_write_protect_np(1)
+-#else /* defined(OSX) && defined(AARCH64) */
++#else /* defined(OMR_JIT_WRITE_PROTECT_NP): iOS has no MAP_JIT memory to toggle */
+ #define omrthread_jit_write_protect_disable() /* nop */
+ #define omrthread_jit_write_protect_enable()  /* nop */
+ #endif /* defined(OSX) && defined(AARCH64) */
+diff --git a/port/osx/omrosdump.c b/port/osx/omrosdump.c
+index cf90527..0e0d90c 100644
+--- a/port/osx/omrosdump.c
++++ b/port/osx/omrosdump.c
+@@ -26,6 +26,34 @@
+  * @brief User space system dump for OSX
+  */
+ 
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++/* iOS has no fork() and no access to another task's port or memory (mach_vm), so the
++ * child-process core dump below cannot work: system dumps are reported as unsupported. */
++#include <stdio.h>
++#include "omrport.h"
++#include "omrportpriv.h"
++
++uintptr_t
++omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpType, void *userData)
++{
++	if (NULL != filename) {
++		snprintf(filename, EsMaxPath, "system dumps are not supported on iOS");
++	}
++	return 1;
++}
++
++int32_t
++omrdump_startup(struct OMRPortLibrary *portLibrary)
++{
++	return 0;
++}
++
++void
++omrdump_shutdown(struct OMRPortLibrary *portLibrary)
++{
++}
++#else /* TARGET_OS_IPHONE */
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <mach/mach.h>
+@@ -711,3 +739,4 @@ void
+ omrdump_shutdown(struct OMRPortLibrary *portLibrary)
+ {
+ }
++#endif /* TARGET_OS_IPHONE */
+diff --git a/port/unix/omrcpu.c b/port/unix/omrcpu.c
+index e5472da..38c8e11 100644
+--- a/port/unix/omrcpu.c
++++ b/port/unix/omrcpu.c
+@@ -34,6 +34,9 @@
+ #include <string.h>
+ #endif
+ #include "omrport.h"
++#if defined(OSX) && (defined(AARCH64) || defined(ARM))
++#include <libkern/OSCacheControl.h>
++#endif
+ #include "omrutil.h"
+ #if defined(RS6000) || defined (LINUXPPC) || defined (PPC)
+ #include "omrportpriv.h"
+@@ -126,7 +129,10 @@ omrcpu_flush_icache(struct OMRPortLibrary *portLibrary, void *memoryPointer, uin
+ 	__asm__("isync");
+ 
+ #elif defined(AARCH64) || defined(ARM) /* defined(LINUXPPC) || defined(PPC) || defined(RS6000) */
+-#if defined(__GNUC__)
++#if defined(OSX)
++	/* Apple's API; the iOS device libSystem has no __clear_cache for the builtin to call. */
++	sys_icache_invalidate(memoryPointer, (size_t)byteAmount);
++#elif defined(__GNUC__)
+ 	// GCC built-in function
+ 	__builtin___clear_cache(memoryPointer, (void *)((unsigned char *)memoryPointer + byteAmount));
+ #else /* defined(__GNUC__) */
+diff --git a/port/unix/omrsysinfo.c b/port/unix/omrsysinfo.c
+index 61bcb24..9a38afb 100644
+--- a/port/unix/omrsysinfo.c
++++ b/port/unix/omrsysinfo.c
+@@ -36,7 +36,10 @@
+ #endif
+ #elif defined(OSX)
+ #define _XOPEN_SOURCE
++#include <TargetConditionals.h>
++#if !TARGET_OS_IPHONE /* not in the iOS SDK (and nothing here uses it) */
+ #include <libproc.h>
++#endif /* !TARGET_OS_IPHONE */
+ #include <mach/mach.h>
+ #include <mach/processor_info.h>
+ #include <mach/mach_host.h>
+@@ -5864,7 +5867,7 @@ omrsysinfo_get_open_file_count(struct OMRPortLibrary *portLibrary, uint64_t *cou
+ 			}
+ 			closedir(dir); /* Done reading the /proc file-system. */
+ 		}
+-#elif defined(OSX)
++#elif defined(OSX) && !TARGET_OS_IPHONE /* no libproc in the iOS SDK */
+ 		pid_t pid = getpid();
+ 		/* First call with null to get the size of the buffer required */
+ 		int32_t bufferSize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, 0, 0);
+@@ -7872,7 +7875,7 @@ alloc_failed:
+ 	portLibrary->mem_free_memory(portLibrary, command);
+ 	closedir(dir);
+ 	return callbackResult;
+-#elif defined(OSX) /* defined(J9ZOS390) || defined(LINUX) */
++#elif defined(OSX) && !TARGET_OS_IPHONE /* no libproc in the iOS SDK */ /* defined(J9ZOS390) || defined(LINUX) */
+ 	uintptr_t callbackResult = 0;
+ 	pid_t *pidBuffer = NULL;
+ 	int actualBytes = 0;
+@@ -7969,7 +7972,7 @@ omrsysinfo_get_process_name(struct OMRPortLibrary *portLibrary, uintptr_t pid)
+ 			return exename;
+ 		}
+ 	}
+-#elif defined(OSX) /* defined(LINUX) && !defined(OMRZTPF) */
++#elif defined(OSX) && !TARGET_OS_IPHONE /* no libproc in the iOS SDK */ /* defined(LINUX) && !defined(OMRZTPF) */
+ 	char exebuf[PROC_PIDPATHINFO_MAXSIZE];
+ 	int pidpathrc = proc_pidpath((int)pid, exebuf, sizeof(exebuf));
+ 	if (pidpathrc > 0) {

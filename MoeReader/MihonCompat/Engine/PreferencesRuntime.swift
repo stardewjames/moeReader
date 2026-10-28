@@ -9,28 +9,6 @@
 
 import Foundation
 
-struct MihonEnginePreference: Identifiable, Hashable, Sendable {
-    enum Kind: String, Sendable {
-        case header
-        case text
-        case list
-        case multiSelect
-        case toggle
-    }
-
-    var id: String { key.isEmpty ? title : key }
-    var key: String
-    var title: String
-    var summary: String?
-    var dialogTitle: String? = nil
-    var kind: Kind
-    var entries: [String]
-    var entryValues: [String]
-    var value: String
-    /// Selected values for `.multiSelect`; empty for other kinds.
-    var values: [String]
-}
-
 /// State a headless `TextView`/`EditText` keeps while a preference dialog lives.
 final class VMTextViewPayload {
     var text: VMValue = .null
@@ -38,7 +16,7 @@ final class VMTextViewPayload {
 }
 
 final class VMUiPreferencePayload {
-    var kind: MihonEnginePreference.Kind
+    var kind: MihonSourcePreference.Kind
     var title = ""
     var summary: String?
     var dialogTitle: String?
@@ -50,7 +28,7 @@ final class VMUiPreferencePayload {
     var children: [VMValue] = []
     var enabled = true
     var visible = true
-    init(kind: MihonEnginePreference.Kind) { self.kind = kind }
+    init(kind: MihonSourcePreference.Kind) { self.kind = kind }
 }
 
 final class VMUiPreferenceScreenPayload {

@@ -1,151 +1,157 @@
 # SuwayomiCompat
 
-An isolated compatibility layer for Mihon/Tachiyomi extension repositories.
+The Suwayomi runtime backend: installed extensions run on a cut-down
+[Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server) (its Android
+compatibility layer and Tachiyomi source API, with the real OkHttp, Jsoup,
+RxJava, kotlinx.serialization and Kotlin coroutines) inside a JVM embedded in
+the app. It is the alternative to the Swift engine in
+[`../MihonCompat`](../MihonCompat/README.md); the user switches between them in
+Settings → Extension runtime. Repositories, installs, the browse and reader
+screens are shared ([`../MihonExtensions`](../MihonExtensions/README.md)).
 
-Everything in this directory is self-contained. The only hook into the rest of
-the app is the `MihonCompatView` destination in `SettingsView`; the layer owns
-its own networking, persistence, APK inspection, source models, runtime
-profiles, and SwiftUI screens.
+This folder is the app side (Swift and a C JNI shim). The host jar and the iOS
+JVM build live in [`../../SuwayomiHost`](../../SuwayomiHost/README.md).
 
-## What it does
+## Design: performance and battery first
 
-- **Repository indexes.** Parses Mihon `index.pb` (gzip-compressed protobuf) and
-  legacy `index.min.json` indexes, including split indexes that publish an
-  `extensionListUrl` (protobuf field 102). Unknown fields are skipped.
-- **Repository management.** Add, refresh (ETag/If-Modified-Since), remove, and
-  cache repositories. No repository is added by default; the user supplies the
-  index URL.
-- **Extension installation.** Downloads the indexed APK and requires:
-  - the manifest package and version code to match the index entry;
-  - a valid APK Signature Scheme v2/v3/v3.1 signature;
-  - the signer certificate SHA-256 to match the repository's published
-    `signingKey`.
-  Installed packages are content-addressed by SHA-256 under
-  `Application Support/MihonCompat/Extensions/` and persisted with the source
-  catalog. Downgrades and same-version different-content installs are rejected.
-- **Source catalog.** Enabled extensions expose the sources declared by the
-  repository index, filtered by language and NSFW preference.
-- **Source runtimes.** Source calls go through `MihonSourceRuntime`. Every
-  installed lib-1.6 extension is executed by the engine in
-  [`../MihonCompat`](../MihonCompat/README.md), registered through
-  `MihonEngineRuntime`. There is no per-site native runner; extensions that need
-  an unsupported library report a typed error.
-- **Browsing and reading.** The layer includes its own source browser, manga
-  detail/chapter list, remote image pipeline, and paged reader. Search filters
-  are rendered from the extension's `FilterList` and replayed onto a fresh list
-  for each search, persisted per source, and re-applied after view recreation.
-  Source preferences are edited in a sheet, including text, single-choice,
-  toggle, and multi-select controls backed by `SharedPreferences` string sets;
-  only changed keys are written. Covers use the source's request headers over
-  the shared cookie jar; reader pages are fetched through the engine's
-  `getImage`/`imageRequest` path on the source's own client, so the
-  extension's interceptors apply. Reading progress is stored in `UserDefaults`;
-  it does not touch the local library model.
+Every choice below trades something away to keep the phone's CPU, radio and
+memory idle when the reader is not asking for anything.
 
-## Relationship to the engine
+- **No server, no event loop.** Upstream Suwayomi is an HTTP/GraphQL server
+  with a database, downloader and updater. The host has none of it: one JNI
+  entry point, `Bridge.call(op, bytes)`, runs a source operation to completion
+  on the calling thread and returns. The host adds no polling or periodic jobs;
+  the JVM and extensions may still run their own background work.
+- **Started on first use, never at launch.** `SuwayomiJVM` creates the JVM the
+  first time a source call needs it. Choosing the backend, rendering the source
+  list and uninstalling extensions never start it.
+- **Two parked worker threads.** Calls run on at most two dedicated threads,
+  attached to the JVM once and parked on a condition variable between jobs (no
+  GCD thread churn, no re-attach per call). Two lets a page fetch overlap a
+  listing without letting extension code compete for more cores.
+- **The app owns the network.** OkHttp's chain is kept (extension interceptors,
+  redirects with per-hop cookies, cookie jar, gzip), but the final hop is the
+  app's `URLSession`: the system TLS stack, HTTP/2 and connection reuse instead
+  of sockets and TLS interpreted inside the JVM. Bodies cross JNI as raw bytes.
+- **Plain page images skip the JVM.** When a source's client adds nothing to an
+  image request (only the host's own interceptors: no rate limiter, no
+  descrambler, no network interceptor), the host returns the request and the
+  app downloads the bytes itself, in parallel, with the shared cookie storage.
+  Anything the source could change still goes through its own client; a failed
+  direct download retries through the host.
+- **Positional binary wire format.** Requests and replies are length-prefixed
+  fields in a fixed order (`SuwayomiWire.swift`, `Wire.kt`): no JSON parser or
+  reflection runs in the interpreter for a call.
+- **Convert once, load uncompressed.** dex2jar runs once per APK content; the
+  converted jar is cached under Application Support (excluded from backups)
+  and written with stored entries, so later sessions skip both conversion and
+  class-file inflation.
+- **Bounded resident state.** The host evicts idle extension loaders above a
+  three-extension limit (busy calls may exceed it). Per-source caches hold
+  512 listed manga, 2048 chapters and 4 page lists. Switching backends or a
+  memory warning drops idle loaders immediately and busy ones after their
+  calls finish; converted jars are retained to avoid reconversion.
+- **Small interpreter-friendly boot.** The HOCON/config4k configuration layer
+  (kotlin-reflect at every start), XML preference files, a background
+  preference-saver thread, the logging interceptor, the OkHttp disk cache,
+  GraalJS and desktop Chromium are not in the host. `apply()`d preferences are
+  written once after the call that changed them.
+- **Interpreter-only VM tuned for footprint.** On iOS the VM is Eclipse OpenJ9
+  without JIT (iOS forbids executable memory), with a pre-sized generational
+  heap and two GC threads; see `SuwayomiHost/jvm-options/openj9.options`.
 
-This layer does **not** embed a JVM. Execution lives in `MihonCompat`, which
-interprets the extension's Dalvik bytecode directly and provides native
-implementations of the Android, Kotlin, OkHttp, Jsoup and Mihon APIs. The
-`MihonSourceRuntime` protocol below is the seam: `MihonEngineRuntime` implements
-it for any installed extension.
+The JVM cannot be destroyed and recreated inside one process, so once started
+it stays resident (idle, its heap trimmed) until the app exits.
 
-Installs, updates and signing-key checks cover the whole repository regardless
-of whether the engine can execute a given extension. An extension whose API use
-is outside the engine surface still installs and lists its sources but reports a
-typed error when browsed; its package is never loaded as native code.
+## What Android would provide, the app provides
+
+| Upcall | Served by |
+|---|---|
+| HTTP (`Native.fetch`) | `SuwayomiTransport`: an ephemeral `URLSession` that follows no redirects and handles no cookies (OkHttp does both), strips `Content-Encoding`/`Content-Length` of the decoded body, and splits Foundation's folded `Set-Cookie` header back into one header per cookie |
+| Cookies | `HTTPCookieStorage.shared`, the same storage the Swift engine, cover loading and the challenge solver use; the host's `PersistentCookieStore` and `android.webkit.CookieManager` read and write it |
+| Browser checks | The host's `CloudflareInterceptor` recognises the interstitial and asks the app; `MihonChallengeSolver` (from `MihonCompat`) clears it in an off-screen `WKWebView` with the user agent the retry sends |
+| `app.cash.quickjs.QuickJs` | One `JSContext` per instance (`SuwayomiScripts`) |
+| Logging | `print` in Debug builds or with `SUWAYOMI_LOG` set |
 
 ## Layout
 
 | Path | Responsibility |
 |---|---|
-| `MihonModels.swift` | Repository, extension, source, installed-extension models |
-| `MihonIndexDecoder.swift` | Protobuf/JSON index decoding, relative URL resolution |
-| `MihonGzip.swift`, `MihonInflate.swift` | Dependency-free gzip/DEFLATE |
-| `MihonRepositoryService.swift` | Index fetch, conditional refresh, APK download |
-| `MihonZIPArchive.swift` | Strict ZIP/ZIP64 reader for APKs |
-| `MihonBinaryXML.swift` | Android binary XML and manifest parser |
-| `MihonAPKSignature.swift` | APK v2/v3/v3.1 block parsing, digest, signature checks |
-| `MihonAPKVerifier.swift` | Package/version/signature admission |
-| `MihonCompatStore.swift` | Actor-owned persistence and install lifecycle |
-| `MihonSourceRuntime.swift` | Runtime protocol, registry, shared source models |
-| `MihonRemoteImageView.swift` | Page bytes from the engine client, cover fetch over URLSession, decode cache, prefetch |
-| `MihonCompatView.swift` | Repository/extension manager |
-| `MihonBrowseView.swift`, `MihonMangaView.swift`, `MihonReaderView.swift` | Source browser and reader |
-| `MihonFilterView.swift` | FilterList sheet for source searches |
+| `SuwayomiBackend.swift` | `MihonRuntimeBackend` registration, per-package runtimes, memory-warning trim, jar purge on uninstall |
+| `SuwayomiRuntime.swift` | `MihonSourceRuntime` + filters + preferences for one extension; manifest class names; direct image fetch |
+| `SuwayomiJVM.swift` | Runtime layout, lazy JVM start, VM options, worker threads, call envelope, C callbacks |
+| `SuwayomiServices.swift` | Upcalls: transport, cookies, challenge solving, JavaScriptCore |
+| `SuwayomiWire.swift` | The wire format |
+| `JNI/suwayomi_jni.c`, `JNI/include/` | C shim: `JNI_CreateJavaVM` lookup, `Bridge.call`, `Native.fetch`/`Native.call` registration (module `SuwayomiJNI`) |
+| `JNI/jdk/` | `jni.h`/`jni_md.h` from OpenJDK 21 (GPL-2.0 with the Classpath Exception) |
+| `Suwayomi.xcconfig` | Include path of the shim module; optional link flags of the bundled VM |
 
-## Adding a runtime
+## The bundled runtime
 
-Implement `MihonSourceRuntime` and register it in
-`MihonRuntimeRegistry(runtimes:)`:
+`SuwayomiRuntimeLayout` expects, in the app bundle:
 
-```swift
-struct MyRuntime: MihonSourceRuntime {
-    let descriptor = MihonRuntimeDescriptor(
-        id: "my-profile",
-        name: "My source",
-        supportedPackages: ["eu.kanade.tachiyomi.extension.en.example"]
-    )
-
-    func popular(source: MihonSource, page: Int) async throws -> MihonMangaPage { ... }
-    func latest(source: MihonSource, page: Int) async throws -> MihonMangaPage { ... }
-    func search(query: String, source: MihonSource, page: Int) async throws -> MihonMangaPage { ... }
-    func manga(id: String, source: MihonSource) async throws -> MihonManga { ... }
-    func chapters(manga: MihonManga, source: MihonSource) async throws -> [MihonChapter] { ... }
-    func pages(chapter: MihonChapter, manga: MihonManga, source: MihonSource) async throws -> [MihonPage] { ... }
-}
+```text
+SuwayomiRuntime/
+  host/suwayomi-host.jar   SuwayomiHost/host
+  jvm.options              the VM's options (OpenJ9's on iOS)
+  jre/                     java.home of the statically linked VM
+  licenses/                OpenJ9, OMR, OpenJDK, libffi, zlib notices
 ```
 
-`MihonRuntimeRegistry.shared` is the single registration point. The installed
-extension record already carries the verified package, version, and source
-languages; a runtime uses those values rather than trusting loose metadata.
+`SuwayomiHost/jvm-ios/package.sh` writes it under
+`SuwayomiHost/build/runtime/ios/` together with `jvm.xcconfig`, which
+`Suwayomi.xcconfig` includes when present. Without it the app builds as usual
+and Settings shows the backend as unavailable in that build. CI builds and
+caches it (`.github/workflows/ci.yml`).
 
-Page numbers follow the Mihon source API: the browse screen requests page 1
-first and increments from there. Sources commonly derive offsets as
-`(page - 1) * limit`, so page 0 produces invalid requests.
+For desktop and Linux hosts, `SUWAYOMI_RUNTIME_DIR` points at a directory with
+the same layout (`./gradlew :host:desktopRuntime`) and `SUWAYOMI_LIBJVM` at a
+HotSpot `libjvm`.
 
-Runtimes may also implement `MihonSourceFilterProviding` to expose the
-extension's filters and accept selected values for a search. The engine runtime
-implements it; the browse screen falls back to plain search when a runtime does
-not.
+## Verified
 
-## Security notes
+- `SuwayomiHost/harness/run-linux.sh` builds this folder's Swift and C sources
+  in Swift 6 mode with the shared layer and runs one extension end to end on a
+  desktop HotSpot: load, popular (two pages), latest, filters, search,
+  preferences, details, chapters, pages, one page image and two concurrent
+  page fetches, every request through the JNI upcall and `URLSession`. A JSON
+  API extension passed every step (first load 5.4 s including conversion,
+  1.1 s with the cached jar; listings 0.07-0.8 s). Of ten popular extensions
+  run this way, seven passed every step; the other three stopped at browser
+  checks, which a host without WebKit cannot clear.
+- `SuwayomiHost/harness/test-linux.sh` runs `SuwayomiCompatTests` and
+  `MihonRuntimeSelectionTests` (wire layout shared with the Kotlin tests,
+  transport headers, cookie records, VM option files, backend switching).
+- A throwaway local-server smoke confirmed unfollowed redirects, both cookies
+  as separate headers, gzip decoding even when the extension advertises zstd,
+  and early cancellation at the transport and direct-image streaming limits.
+- Not verified here: the iOS build itself (no Xcode on the development host),
+  the OpenJ9 VM on a device, WebKit challenge solving and JavaScriptCore
+  through this backend.
+- No device battery or energy measurements have been taken. These are
+  architecture constraints, not a measured energy improvement over Swift.
 
-- Repository indexes are fetched over HTTPS. A repository with an empty
-  `signingKey` can be added but extension installation is blocked. Split index
-  URLs are re-checked for HTTPS, and index/APK/download bodies are size-capped
-  before decoding or installing.
-- Remote image requests share the app cookie jar so clearance/session cookies
-  obtained by the engine or challenge solver apply to covers and pages.
-- Runtime pools are keyed by package and installed APK hash, so an extension
-  update never reuses the removed package’s engine; busy runtimes are never
-  evicted mid-call, and deferred unloads run after the queue drains.
-- Repository and installed-state mutations roll back on persistence failure;
-  content-addressed APKs are removed only when no remaining install references
-  them.
-- Engine HTTP responses, repository indexes, APKs and images are size-capped;
-  extension file access is confined to its per-package Caches directory.
-- The signing key is pinned from the index. A key change on refresh is rejected
-  until the repository is removed and re-added.
-- APK admission checks the package name, version code, v2/v3 signer certificate
-  hash, signature over signed data, and APK content digest before writing the
-  package.
-- Installed package files are content-addressed and re-verified during install.
-  The layer does not re-verify the stored file on every launch because it never
-  executes it.
-- The layer intentionally does not support v1-only APKs or DSA/SHA-512 signature
-  algorithms; those installations fail closed with a typed error.
+## Known gaps
 
-## Tests
+- `android.webkit.WebView` is not provided (no browser engine inside the JVM);
+  an extension that drives one fails with a typed
+  `UnsupportedOperationException`. Browser checks are handled without it.
+- `android.graphics` is AndroidCompat's AWT implementation; the iOS runtime
+  has no AWT natives, so extensions that descramble images with `Bitmap` fail
+  in this backend. The Swift engine draws those on CoreGraphics.
+- `QuickJs.set` (binding Java objects into scripts) is not available.
+- Source preferences are stored by the host per Android preference file and
+  are not shared with the Swift engine's.
+- Settings → Encrypted DNS applies to the Swift engine's transport; this
+  backend's requests use the system resolver through `URLSession`.
 
-Portable tests live in `MoeReaderTests/`:
+## Removing this backend
 
-- `MihonIndexDecoderTests` — gzip/raw protobuf, JSON, relative URLs, split
-  indexes, conditional fetch.
-- `MihonAPKTests` — manifest parsing, ZIP hardening, SHA-256, gzip, v2/v3
-  content digests, signing-key binding.
-- `MihonCompatStoreTests` — repository persistence, install/update/uninstall
-  (the cryptographic install test runs where `Security` is available).
-
-Fixtures include a synthetic APK signed with a generated test key; it contains
-no third-party code.
+Delete `MoeReader/SuwayomiCompat/` and `SuwayomiHost/` (and the
+`SuwayomiHost/vendor/suwayomi` submodule entry in `.gitmodules`), the
+`SuwayomiBackend.shared` line in `App/MihonRuntimeBackends.swift`, the
+`SuwayomiRuntime` source, `configFiles` and the test target's
+`SWIFT_INCLUDE_PATHS` in `project.yml`, the Suwayomi steps and `submodules`
+option in `.github/workflows/ci.yml`, the `SuwayomiHost` entries in
+`.gitignore`, and `MoeReaderTests/SuwayomiCompatTests.swift`. Nothing else
+references it; a stored `suwayomi` choice falls back to the Swift engine.

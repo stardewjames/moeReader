@@ -24,13 +24,13 @@ final class MihonCompatModel {
     var languageFilter: String
 
     let store: MihonCompatStore
-    let registry: MihonRuntimeRegistry
+    let selection: MihonRuntimeSelection
     init(
         store: MihonCompatStore = MihonCompatStore(),
-        registry: MihonRuntimeRegistry = .shared
+        selection: MihonRuntimeSelection = .shared
     ) {
         self.store = store
-        self.registry = registry
+        self.selection = selection
         let preferred = Locale.current.language.languageCode?.identifier ?? "en"
         self.languageFilter = String(preferred.prefix(2))
     }
@@ -110,7 +110,7 @@ final class MihonCompatModel {
     func uninstall(_ installedExtension: MihonInstalledExtension) async {
         do {
             try await store.uninstall(packageName: installedExtension.packageName)
-            MihonEnginePool.shared.evict(packageName: installedExtension.packageName)
+            selection.evict(packageName: installedExtension.packageName)
             await reload()
         } catch {
             errorMessage = error.localizedDescription
@@ -192,15 +192,13 @@ final class MihonCompatModel {
         }
     }
 
+    /// Runtime of the active backend. Switching backends in Settings changes
+    /// `selection.activeID`, which this read is observed through.
     func runtime(for installedExtension: MihonInstalledExtension) -> (any MihonSourceRuntime)? {
-        if let builtIn = registry.runtime(for: installedExtension) { return builtIn }
         guard installedExtension.isEnabled else { return nil }
         let apkURL = store.apkURL(for: installedExtension)
         guard FileManager.default.fileExists(atPath: apkURL.path) else { return nil }
-        return MihonEnginePool.shared.runtime(
-            packageName: installedExtension.packageName,
-            apkURL: apkURL
-        )
+        return selection.runtime(for: installedExtension, apkURL: apkURL)
     }
 
     func languageName(_ code: String) -> String {

@@ -1,0 +1,20 @@
+# Lets OMR_COMPILER=OFF build an interpreter-only OpenJ9 (no runtime/compiler, no libj9jit).
+# iOS forbids writable+executable memory, so the iOS builds never build or link the JIT; with
+# J9VM_MODULE_CODERT_VM/J9VM_MODULE_J9JIT_VM off this is the configuration RISC-V used before its JIT.
+#
+# Tree: openj9 (a1daf225f5cb0ccfb5d7309014701570435a94c4). Applied by apply-openj9-patches.sh.
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 911ecb9..3db300b 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -585,7 +585,8 @@ endif()
+ if(J9VM_MODULE_THREAD)
+ 	add_subdirectory(thread)
+ endif()
+-if(J9VM_INTERP_NATIVE_SUPPORT AND NOT OMR_ARCH_RISCV)
++# OMR_COMPILER=OFF builds an interpreter-only VM without the JIT (iOS: no executable memory).
++if(J9VM_INTERP_NATIVE_SUPPORT AND OMR_COMPILER AND NOT OMR_ARCH_RISCV)
+ 	add_subdirectory(compiler)
+ endif()
+ if(J9VM_MODULE_UTIL)

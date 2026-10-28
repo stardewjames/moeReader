@@ -60,6 +60,7 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/NativeLibrary.swift` | Registration point: collects every runtime's `NativeClass` list into the VM's native registry |
 | `Engine/MihonEngine.swift` | APK → dex → factory → sources; typed source calls |
 | `MihonEngineRuntime.swift` | `MihonSourceRuntime` adapter, serial queue, runtime pool |
+| `MihonCompatBackend.swift` | Registers the engine as the `swift` runtime backend (`MihonExtensions/MihonRuntimeBackend.swift`) |
 
 ## Execution model
 
@@ -230,7 +231,7 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   Site-specific fixtures and runners live in the ignored `SiteTests/` folder so
   no site reference is committed; local notes are in the ignored
   `site-notes.local.md`.
-- The portable suite (engine sources plus the SuwayomiCompat runtime files,
+- The portable suite (engine sources plus the MihonExtensions runtime files,
   built on Linux) passes 151 tests with no failures. The runner takes every
   file in `MoeReaderTests`, then drops the ones that need app sources or Apple
   frameworks, so a new engine test is picked up without editing a list.

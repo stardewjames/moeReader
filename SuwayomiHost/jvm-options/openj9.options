@@ -1,0 +1,33 @@
+# Eclipse OpenJ9 options for the Suwayomi runtime on iOS. jvm-ios/package.sh
+# bundles this file as SuwayomiRuntime/jvm.options; SuwayomiJVM.jvmOptions
+# appends it to the class path, java.home, tmpdir, user.home and encoding, and
+# fills in ${dataDir}, ${cacheDir}, ${tmpDir} and ${javaHome}.
+# Heap and GC values follow the Oneechan runtime's -Xverbosegclog measurements
+# of the same VM build; see SuwayomiHost/README.md.
+
+# Interpreter only: iOS forbids writable+executable memory, and no JIT is linked.
+-Xint
+-Xnojit
+-Xnoaot
+# dex2jar output is not verifiable bytecode (extensions are R8-optimised for ART).
+-Xverify:none
+# Generational concurrent GC. A 32 MB tenured start (committed, touched only
+# as it fills) and an 8-16 MB nursery avoid the early global collections the
+# 8 MB default heap runs while it grows.
+-Xgcpolicy:gencon
+-Xms40m
+-Xmx384m
+-Xmns8m
+-Xmnx16m
+# Two GC threads instead of one per core: about 30% less GC CPU time for the
+# same collections.
+-Xgcthreads2
+# No shared classes cache, no attach API (both need SysV IPC and /tmp).
+-Xshareclasses:none
+-Dcom.ibm.tools.attach.enable=no
+# javacores only, in Caches; no core or heap dumps.
+-Xdump:directory=${cacheDir}
+-Xdump:system:none
+-Xdump:heap:none
+# No trace engine: it costs CPU on every tracepoint.
+-Xtrace:none

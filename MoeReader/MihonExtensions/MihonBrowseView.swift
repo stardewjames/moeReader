@@ -3,7 +3,7 @@ import SwiftUI
 struct MihonBrowseView: View {
     let source: MihonSource
     let packageName: String
-    private let runtime: (any MihonSourceRuntime)?
+    private let runtime: any MihonSourceRuntime
     private let filterStore: MihonFilterSelectionStore
 
     @State private var mode: FeedMode = .popular
@@ -22,29 +22,19 @@ struct MihonBrowseView: View {
     /// Mihon API defaults until the source reports its own flags.
     @State private var capabilities = MihonSourceCapabilities()
 
-    init(source: MihonSource, packageName: String, runtime: (any MihonSourceRuntime)? = nil) {
+    init(source: MihonSource, packageName: String, runtime: any MihonSourceRuntime) {
         let store = MihonFilterSelectionStore()
         let savedSelections = store.selections(forSourceIdentity: source.identity)
         self.source = source
         self.packageName = packageName
-        self.runtime = runtime ?? MihonRuntimeRegistry.shared.runtime(forPackage: packageName)
+        self.runtime = runtime
         self.filterStore = store
         _filterSelections = State(initialValue: savedSelections)
         _mode = State(initialValue: savedSelections.isEmpty ? .popular : .search)
     }
 
     var body: some View {
-        Group {
-            if let runtime {
-                content(runtime: runtime)
-            } else {
-                ContentUnavailableView(
-                    "No runtime",
-                    systemImage: "puzzlepiece.extension",
-                    description: Text("This extension has no native iOS source runtime.")
-                )
-            }
-        }
+        content(runtime: runtime)
         .navigationTitle(source.name)
         .navigationBarTitleDisplayMode(.inline)
         .tint(Palette.amber)

@@ -6,10 +6,44 @@ concurrency:
 jobs:
   build:
     runs-on: macos-26
+    # A cold OpenJ9 build for iOS takes most of this; cached runs take minutes.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
+        with:
+          # SuwayomiHost/vendor/suwayomi (Suwayomi-Server, pinned).
+          submodules: true
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      # Commits from Windows checkouts may not carry the executable bit.
+      - run: chmod +x SuwayomiHost/gradlew SuwayomiHost/jvm-ios/*.sh SuwayomiHost/jvm-ios/*.py SuwayomiHost/jvm-ios/tools/*
       - run: brew install xcodegen
       - run: xcodebuild -version
+      - name: Suwayomi host tests
+        working-directory: SuwayomiHost
+        run: ./gradlew --console=plain :host:test
+      # The VM part of the Suwayomi runtime only changes with jvm-ios/ and the
+      # OpenJ9 options; the host jar is rebuilt on every run.
+      - name: Restore the Suwayomi runtime
+        id: jvm
+        uses: actions/cache@v5
+        with:
+          path: SuwayomiHost/build/runtime/ios
+          key: suwayomi-openj9-ios-${{ hashFiles('SuwayomiHost/jvm-ios/**', 'SuwayomiHost/jvm-options/openj9.options') }}
+      - name: Build OpenJ9 for iOS
+        if: steps.jvm.outputs.cache-hit != 'true'
+        working-directory: SuwayomiHost/jvm-ios
+        run: |
+          brew install autoconf cmake
+          ./fetch-openj9.sh
+          ./build-openj9-macos.sh
+          ./build-openj9-ios.sh iphoneos
+          ./package.sh
+      - name: Refresh the host jar
+        if: steps.jvm.outputs.cache-hit == 'true'
+        run: HOST_ONLY=1 SuwayomiHost/jvm-ios/package.sh
       - run: ./scripts/build_ipa.sh
       - uses: actions/upload-artifact@v7
         with:

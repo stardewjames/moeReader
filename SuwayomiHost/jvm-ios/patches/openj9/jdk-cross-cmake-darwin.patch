@@ -1,0 +1,22 @@
+# Cross builds to Apple targets: name the CMake system "Darwin", not "Macosx".
+# toolchain.cmake derives CMAKE_SYSTEM_NAME from OPENJDK_TARGET_OS when cross compiling; OMR detects
+# macOS (OMR_OS_OSX) only from "Darwin". The iOS builds are cross builds with OPENJDK_TARGET_OS=macosx.
+#
+# Tree: openj9-jdk21 (2e01e904eaf92c2c2f045763872432cc2053e8cf). Applied by apply-openj9-patches.sh.
+
+diff --git a/closed/autoconf/toolchain.cmake.in b/closed/autoconf/toolchain.cmake.in
+index 3a9b54e6e..e48263bb3 100644
+--- a/closed/autoconf/toolchain.cmake.in
++++ b/closed/autoconf/toolchain.cmake.in
+@@ -28,6 +28,11 @@ if("@COMPILE_TYPE@" STREQUAL "cross" OR  "@OPENJDK_TARGET_OS@" STREQUAL "windows
+ 	string(TOUPPER "${first_char}" first_char)
+ 	string(SUBSTRING "${temp_system_name}" 1 -1 CMAKE_SYSTEM_NAME)
+ 	set(CMAKE_SYSTEM_NAME "${first_char}${CMAKE_SYSTEM_NAME}")
++	# CMake (and OMR's platform detection) call macOS "Darwin"; cross builds to Apple targets
++	# (an iOS SDK as the sysroot) would otherwise get an unknown "Macosx" system.
++	if(CMAKE_SYSTEM_NAME STREQUAL "Macosx")
++		set(CMAKE_SYSTEM_NAME "Darwin")
++	endif()
+ endif()
+ 
+ set(CMAKE_SYSTEM_PROCESSOR "@OPENJDK_TARGET_CPU@")

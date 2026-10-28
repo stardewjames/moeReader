@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     let library: LibraryModel
+    @State private var runtimeSelection = MihonRuntimeSelection.shared
 
     var body: some View {
         List {
@@ -25,6 +26,28 @@ struct SettingsView: View {
                 Text("Sources")
             } footer: {
                 Text("Supports Mihon-compatible extension repositories.")
+            }
+
+            Section {
+                ForEach(runtimeSelection.backends, id: \.id) { backend in
+                    Button {
+                        runtimeSelection.select(backend.id)
+                    } label: {
+                        SettingsOptionRow(
+                            title: backend.title,
+                            summary: backend.unavailableReason ?? backend.summary,
+                            isSelected: backend.id == runtimeSelection.activeID
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(backend.unavailableReason != nil)
+                    .accessibilityIdentifier("settings.runtime.\(backend.id)")
+                    .accessibilityLabel(backend.title)
+                }
+            } header: {
+                Text("Extension runtime")
+            } footer: {
+                Text("Repositories and installed extensions are shared; source preferences are separate. Switching drops the previous runtime’s source caches. Once started, the Suwayomi JVM stays loaded until the app exits.")
             }
 
             Section {

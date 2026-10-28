@@ -1,0 +1,116 @@
+# Lets OpenJ9 run when its shared libraries are linked into the executable (iOS).
+# - j9vm/jvm.c (Apple only): when libjvm's code is part of an MH_EXECUTE image there is no library
+#   directory to derive java.home from. The embedder passes -Djava.home=<runtime image>; the VM
+#   directory becomes <java.home>/lib/default as in a JDK image, and the entry points libjvm looks
+#   up (J9_CreateJavaVM, omrthread_*, j9port_*) are taken from the executable (RTLD_DEFAULT).
+#   Without -Djava.home it stops with a clear message instead of guessing.
+# - port/CMakeLists.txt: exports omrsl_register_static_libraries from j9prt (see the OMR patch).
+#
+# Tree: openj9 (a1daf225f5cb0ccfb5d7309014701570435a94c4). Applied by apply-openj9-patches.sh.
+
+diff --git a/runtime/j9vm/jvm.c b/runtime/j9vm/jvm.c
+index d9a3399..d53f55a 100644
+--- a/runtime/j9vm/jvm.c
++++ b/runtime/j9vm/jvm.c
+@@ -141,6 +141,17 @@ struct arg_list
+ #if defined(OSX)
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++
++/* OpenJ9 linked statically into the executable (iOS apps cannot load dylibs of their own outside
++ * frameworks): there is no library directory to derive java.home from, so the embedder must pass
++ * -Djava.home=<runtime image>; the VM directory is then <java.home>/lib/default as in a JDK, and the
++ * VM's other "shared libraries" are found by the port library's static table (omrsl.c) or, for
++ * the entry points looked up here, in the executable itself. */
++static BOOLEAN vmLinkedIntoExecutable = FALSE;
++static char *staticJavaHome = NULL;
++#define STATIC_JAVA_HOME_OPTION "-Djava.home="
+ #endif /* defined(OSX) */
+ 
+ #if defined(WIN32)
+@@ -1024,6 +1035,20 @@ getj9bin()
+ 		abort();
+ 	}
+ 
++#if defined(OSX)
++	/* Not _dyld_get_image_header(0): inserted libraries (DYLD_INSERT_LIBRARIES, as XCTest uses)
++	 * can come before the executable in dyld's image list. */
++	if ((NULL != libraryInfo.dli_fbase) && (MH_EXECUTE == ((const struct mach_header *)libraryInfo.dli_fbase)->filetype)) {
++		vmLinkedIntoExecutable = TRUE;
++		if (NULL == staticJavaHome) {
++			fprintf(stderr, "ERROR: OpenJ9 is linked into the executable: pass " STATIC_JAVA_HOME_OPTION "<runtime image>\n");
++			abort();
++		}
++		result = jvmBufferCat(NULL, staticJavaHome);
++		result = jvmBufferCat(result, "/lib/default");
++		return result;
++	}
++#endif /* defined(OSX) */
+ 	result = jvmBufferCat(NULL, libraryInfo.dli_fname);
+ 	/* remove libjvm.so */
+ 	truncatePath(jvmBufferData(result));
+@@ -1242,6 +1267,12 @@ preloadLibraries(void)
+ 	} else {
+ 		jvmInSubdir = FALSE;
+ 	}
++#if defined(OSX)
++	if (vmLinkedIntoExecutable) {
++		/* <java.home>/lib/default, as if libj9vm29 were there */
++		jvmInSubdir = TRUE;
++	}
++#endif /* defined(OSX) */
+ 
+ 	DBG_MSG(("jvmInSubdir: %d\n", jvmInSubdir));
+ 
+@@ -1997,6 +2028,20 @@ JNI_CreateJavaVM_impl(JavaVM **pvm, void **penv, void *vm_args, BOOLEAN isJITSer
+ 	origLibpath = getenv("LIBPATH");
+ #endif /* defined(AIXPPC) || (defined(J9ZOS390) && (JAVA_SPEC_VERSION >= 21)) */
+ 
++#if defined(OSX)
++	/* For a VM linked into the executable (see getj9bin()). */
++	if (NULL != vm_args) {
++		JavaVMInitArgs *initArgs = (JavaVMInitArgs *)vm_args;
++		jint i = 0;
++		for (i = 0; i < initArgs->nOptions; i++) {
++			const char *option = initArgs->options[i].optionString;
++			if ((NULL != option) && (0 == strncmp(option, STATIC_JAVA_HOME_OPTION, LITERAL_STRLEN(STATIC_JAVA_HOME_OPTION)))) {
++				free(staticJavaHome);
++				staticJavaHome = strdup(option + LITERAL_STRLEN(STATIC_JAVA_HOME_OPTION));
++			}
++		}
++	}
++#endif /* defined(OSX) */
+ 	/* no tracing for this function, since it's unlikely to be used once the VM is running and the trace engine is initialized */
+ 	preloadLibraries();
+ 
+@@ -2729,6 +2774,13 @@ preloadLibrary(char *dllName, BOOLEAN inJVMDir)
+ #ifdef AIXPPC
+ 	loadAndInit(jvmBufferData(buffer), L_RTLD_LOCAL, NULL);
+ #endif
++#if defined(OSX)
++	if (vmLinkedIntoExecutable) {
++		/* The library is part of the executable: look its entry points up there. */
++		free(buffer);
++		return RTLD_DEFAULT;
++	}
++#endif /* defined(OSX) */
+ 	handle = (void *)dlopen(jvmBufferData(buffer), RTLD_NOW);
+ #ifdef AIXPPC
+ 	if (handle == NULL) {
+diff --git a/runtime/port/CMakeLists.txt b/runtime/port/CMakeLists.txt
+index ec0afd3..6e9396f 100644
+--- a/runtime/port/CMakeLists.txt
++++ b/runtime/port/CMakeLists.txt
+@@ -227,6 +227,10 @@ omr_add_exports(j9prt
+ 	j9port_isCompatible
+ 	j9port_startup_library
+ )
++if(OMR_OS_OSX)
++	# omrsl.c: the table of shared libraries linked statically into an (iOS) executable.
++	omr_add_exports(j9prt omrsl_register_static_libraries)
++endif()
+ 
+ # Note: we need to pass EARLY_SOURCE_EVAL because the ddr logic chokes on
+ # $<TARGET_OBJECTS:omrport_obj> on older versions of cmake

@@ -1,0 +1,14 @@
+# VM options for a desktop HotSpot (development hosts and the Linux harness).
+# The app prepends the class path, java.io.tmpdir, user.home and encoding.
+
+# One collector thread, no GC ergonomics threads.
+-XX:+UseSerialGC
+-Xms32m
+-Xmx384m
+# dex2jar output is not verifiable bytecode (extensions are R8-optimised for ART).
+-XX:+UnlockDiagnosticVMOptions
+-XX:-BytecodeVerificationRemote
+# Client compiler only: short-lived calls, less compiler CPU and memory.
+-XX:TieredStopAtLevel=1
+-XX:-UsePerfData
+-Xshare:auto

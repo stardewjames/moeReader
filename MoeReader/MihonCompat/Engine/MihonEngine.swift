@@ -553,7 +553,7 @@ final class MihonEngine: @unchecked Sendable {
 
     // MARK: - Preferences
 
-    func sourcePreferences(sourceIndex: Int) throws -> [MihonEnginePreference] {
+    func sourcePreferences(sourceIndex: Int) throws -> [MihonSourcePreference] {
         runtime.beginOperation(#function)
         defer {
             runtime.endOperation()
@@ -573,7 +573,7 @@ final class MihonEngine: @unchecked Sendable {
             return []
         }
         let stored = runtime.host?.preferences()
-        var result: [MihonEnginePreference] = []
+        var result: [MihonSourcePreference] = []
         func collect(_ children: [VMValue], depth: Int = 0) {
             guard depth < 32 else { return }
             for child in children {
@@ -591,7 +591,7 @@ final class MihonEngine: @unchecked Sendable {
     private func sourcePreference(
         _ pref: VMUiPreferencePayload,
         stored: VMPreferences?
-    ) -> MihonEnginePreference? {
+    ) -> MihonSourcePreference? {
         guard !pref.title.isEmpty || !pref.key.isEmpty else { return nil }
         var value = pref.value
         var values = pref.values.sorted()
@@ -608,7 +608,7 @@ final class MihonEngine: @unchecked Sendable {
                 }
             }
         }
-        return MihonEnginePreference(
+        return MihonSourcePreference(
             key: pref.key,
             title: pref.title,
             summary: pref.summary,
@@ -626,7 +626,7 @@ final class MihonEngine: @unchecked Sendable {
         key: String,
         value: String,
         values: [String] = [],
-        kind: MihonEnginePreference.Kind = .text
+        kind: MihonSourcePreference.Kind = .text
     ) throws {
         _ = try source(at: sourceIndex)
         guard !key.isEmpty, let preferences = runtime.host?.preferences() else { return }

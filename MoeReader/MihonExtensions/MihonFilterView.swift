@@ -1,6 +1,6 @@
 //
 //  MihonFilterView.swift
-//  SuwayomiCompat
+//  MihonExtensions
 //
 //  Source filter sheet. The engine returns the extension's FilterList as a
 //  positional tree; edits are keyed by path and replayed onto a fresh list for

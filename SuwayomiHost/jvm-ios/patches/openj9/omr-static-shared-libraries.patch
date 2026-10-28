@@ -1,0 +1,179 @@
+# Lets an embedder link OMR/OpenJ9's shared libraries statically into one executable (iOS).
+# - port/unix/omrsl.c (Apple only): omrsl_register_static_libraries() registers a table of
+#   { library, name, address }. Opening a registered library (by name or path, decorated or not)
+#   returns a descriptor into the table, lookups return the recorded address and close is a no-op;
+#   everything else still goes to dlopen/dlsym. jvm-ios/prelink-openj9-ios.py generates the table.
+# - cmake/modules/platform/toolcfg/gnu.cmake + osx_exports.exp.in: on Apple targets each shared
+#   library's intended export list (EXPORTED_SYMBOLS) is still written to <target>.exports (it is not
+#   passed to the dylib link, as before). The prelink step keeps only those symbols global.
+#
+# Tree: omr (ebd02d9129dc06fa67a6f885f99a3926aa869154). Applied by apply-openj9-patches.sh.
+
+diff --git a/cmake/modules/platform/toolcfg/gnu.cmake b/cmake/modules/platform/toolcfg/gnu.cmake
+index 0be7268..ea9bce8 100644
+--- a/cmake/modules/platform/toolcfg/gnu.cmake
++++ b/cmake/modules/platform/toolcfg/gnu.cmake
+@@ -200,6 +200,13 @@ function(_omr_toolchain_process_exports TARGET_NAME)
+ 
+ 	# This does not work on OSX.
+ 	if(OMR_OS_OSX)
++		# The dylib still exports every global, but the intended export list is written out
++		# (<target>.exports, Apple ld format): static links that combine all the shared libraries
++		# into one image prelink each library with it, so their private symbols cannot clash.
++		omr_process_template(
++			"${omr_SOURCE_DIR}/cmake/modules/platform/toolcfg/osx_exports.exp.in"
++			"$<TARGET_PROPERTY:${TARGET_NAME},BINARY_DIR>/${TARGET_NAME}.exports"
++		)
+ 		return()
+ 	endif()
+ 
+diff --git a/port/unix/omrsl.c b/port/unix/omrsl.c
+index b7d65c8..f76ccf1 100644
+--- a/port/unix/omrsl.c
++++ b/port/unix/omrsl.c
+@@ -100,6 +100,73 @@ static void convertWithIConv(struct OMRPortLibrary *portLibrary, char *error, ch
+ 
+ static void getDLError(struct OMRPortLibrary *portLibrary, char *errBuf, uintptr_t bufLen);
+ 
++#if defined(OSX)
++/*
++ * Shared libraries linked statically into the executable. iOS apps cannot load dylibs of their
++ * own outside frameworks, so an embedder may link the VM's shared libraries (each prelinked into one
++ * object, its exports renamed where they clash) into the app and register, before the VM starts,
++ * a table of { library, name, address } entries ending with { NULL, NULL, NULL }. Opening one of
++ * those libraries (by name or path, decorated or not) then returns a descriptor into the table and
++ * looking a name up in it returns the recorded address; nothing is dlopen()ed.
++ */
++typedef struct OMRStaticLibrarySymbol {
++	const char *library;
++	const char *name;
++	void *address;
++} OMRStaticLibrarySymbol;
++
++static const OMRStaticLibrarySymbol *staticLibrarySymbols = NULL;
++static uintptr_t staticLibrarySymbolCount = 0;
++
++void
++omrsl_register_static_libraries(const void *symbols)
++{
++	const OMRStaticLibrarySymbol *table = (const OMRStaticLibrarySymbol *)symbols;
++	uintptr_t count = 0;
++	while ((NULL != table) && (NULL != table[count].library)) {
++		count += 1;
++	}
++	staticLibrarySymbols = table;
++	staticLibrarySymbolCount = count;
++}
++
++static BOOLEAN
++isStaticLibraryDescriptor(uintptr_t descriptor)
++{
++	return (0 != staticLibrarySymbolCount)
++		&& (descriptor >= (uintptr_t)staticLibrarySymbols)
++		&& (descriptor < (uintptr_t)(staticLibrarySymbols + staticLibrarySymbolCount));
++}
++
++/* The table entry of the first symbol of the library named (as for dlopen) by name, or NULL. */
++static const OMRStaticLibrarySymbol *
++findStaticLibrary(const char *name, BOOLEAN decorate)
++{
++	const char *base = strrchr(name, '/');
++	size_t length = 0;
++	uintptr_t i = 0;
++	base = (NULL == base) ? name : (base + 1);
++	length = strlen(base);
++	if (!decorate) {
++		size_t suffixLength = strlen(PLATFORM_DLL_EXTENSION);
++		if ((length > suffixLength) && (0 == strcmp(base + length - suffixLength, PLATFORM_DLL_EXTENSION))) {
++			length -= suffixLength;
++		}
++		if ((length > 3) && (0 == strncmp(base, "lib", 3))) {
++			base += 3;
++			length -= 3;
++		}
++	}
++	for (i = 0; i < staticLibrarySymbolCount; i++) {
++		const char *library = staticLibrarySymbols[i].library;
++		if ((strlen(library) == length) && (0 == strncmp(library, base, length))) {
++			return &staticLibrarySymbols[i];
++		}
++	}
++	return NULL;
++}
++#endif /* defined(OSX) */
++
+ 
+ /**
+  * Close a shared library.
+@@ -116,6 +183,12 @@ omrsl_close_shared_library(struct OMRPortLibrary *portLibrary, uintptr_t descrip
+ 
+ 	Trc_PRT_sl_close_shared_library_Entry(descriptor);
+ 
++#if defined(OSX)
++	if (isStaticLibraryDescriptor(descriptor)) {
++		Trc_PRT_sl_close_shared_library_Exit(0);
++		return 0;
++	}
++#endif /* defined(OSX) */
+ 	if (0 != descriptor) {
+ 		result = (uintptr_t)dlclose((void *)descriptor);
+ 		if (0 != result) {
+@@ -145,6 +218,16 @@ omrsl_open_shared_library(struct OMRPortLibrary *portLibrary, char *name, uintpt
+ 
+ 	Trc_PRT_sl_open_shared_library_Entry(name, flags);
+ 
++#if defined(OSX)
++	if (!openExec && (0 != staticLibrarySymbolCount)) {
++		const OMRStaticLibrarySymbol *library = findStaticLibrary(name, decorate);
++		if (NULL != library) {
++			*descriptor = (uintptr_t)library;
++			Trc_PRT_sl_open_shared_library_Exit1(*descriptor);
++			return 0;
++		}
++	}
++#endif /* defined(OSX) */
+ 	/* No need to name mangle if a handle to the executable is requested for. */
+ 	if (!openExec && decorate) {
+ 		char *p = strrchr(name, '/');
+@@ -266,6 +349,22 @@ omrsl_lookup_name(struct OMRPortLibrary *portLibrary, uintptr_t descriptor, char
+ 	void *address;
+ 
+ 	Trc_PRT_sl_lookup_name_Entry(descriptor, name, argSignature);
++#if defined(OSX)
++	if (isStaticLibraryDescriptor(descriptor)) {
++		const char *library = ((const OMRStaticLibrarySymbol *)descriptor)->library;
++		const OMRStaticLibrarySymbol *entry = (const OMRStaticLibrarySymbol *)descriptor;
++		const OMRStaticLibrarySymbol *end = staticLibrarySymbols + staticLibrarySymbolCount;
++		for (; entry < end; entry++) {
++			if ((0 == strcmp(entry->library, library)) && (0 == strcmp(entry->name, name))) {
++				*func = (uintptr_t)entry->address;
++				Trc_PRT_sl_lookup_name_Exit1(*func);
++				return 0;
++			}
++		}
++		Trc_PRT_sl_lookup_name_Exit2(name, argSignature, descriptor, 1);
++		return 1;
++	}
++#endif /* defined(OSX) */
+ 	address = dlsym((void *)descriptor, name);
+ 	if (NULL == address) {
+ 		Trc_PRT_sl_lookup_name_Exit2(name, argSignature, descriptor, 1);
+diff --git a/cmake/modules/platform/toolcfg/osx_exports.exp.in b/cmake/modules/platform/toolcfg/osx_exports.exp.in
+new file mode 100644
+index 0000000..a53bb6c
+--- /dev/null
++++ b/cmake/modules/platform/toolcfg/osx_exports.exp.in
+@@ -0,0 +1,13 @@
++# Copyright IBM Corp. and others 2026
++#
++# This program and the accompanying materials are made available under
++# the terms of the Eclipse Public License 2.0 which accompanies this
++# distribution and is available at https://www.eclipse.org/legal/epl-2.0/
++# or the Apache License, Version 2.0 which accompanies this distribution and
++# is available at https://www.apache.org/licenses/LICENSE-2.0.
++#
++# SPDX-License-Identifier: EPL-2.0 OR Apache-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0 OR GPL-2.0-only WITH OpenJDK-assembly-exception-1.0
++#
++# Apple ld export list (-exported_symbols_list format): one _symbol per line.
++_$<JOIN:$<TARGET_PROPERTY:@TARGET_NAME@,EXPORTED_SYMBOLS>,
++_>

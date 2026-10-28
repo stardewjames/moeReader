@@ -344,20 +344,20 @@ final class MihonEnginePool: @unchecked Sendable {
             order.removeAll { $0 == key }
         }
     }
+
+    /// Releases every idle engine; busy ones unload once their call drains.
+    func evictAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        for runtime in runtimes.values {
+            runtime.unload()
+        }
+        runtimes.removeAll()
+        order.removeAll()
+    }
 }
 
 // MARK: - Runtime
-
-protocol MihonSourcePreferencesProviding: Sendable {
-    func preferences(source: MihonSource) async throws -> [MihonEnginePreference]
-    func setPreference(
-        key: String,
-        value: String,
-        values: [String],
-        kind: MihonEnginePreference.Kind,
-        source: MihonSource
-    ) async throws
-}
 
 final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProviding, MihonSourceFilterProviding, @unchecked Sendable {
     let descriptor: MihonRuntimeDescriptor
@@ -539,7 +539,7 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
         }
     }
 
-    func preferences(source: MihonSource) async throws -> [MihonEnginePreference] {
+    func preferences(source: MihonSource) async throws -> [MihonSourcePreference] {
         try await perform(source: source) { engine, index in
             try engine.sourcePreferences(sourceIndex: index)
         }
@@ -549,7 +549,7 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
         key: String,
         value: String,
         values: [String],
-        kind: MihonEnginePreference.Kind,
+        kind: MihonSourcePreference.Kind,
         source: MihonSource
     ) async throws {
         try await perform(source: source) { engine, index in

@@ -1,0 +1,13 @@
+The scripts, tools and patches in this directory come from the Oneechan runtime
+(https://github.com/leros1337/oneechan, jvm-ios/), licensed under the Mozilla
+Public License 2.0 (LICENSE-MPL-2.0). The patches under patches/openj9 modify
+Eclipse OpenJ9 and OMR (Apache-2.0) and the OpenJDK 21 class library (GPL-2.0
+with the Classpath Exception) and are licensed like the files they modify.
+
+Changes for MoeReader:
+- build-openj9-ios.sh, build-openj9-macos.sh: vendor name and build user.
+- package.sh: rewritten for MoeReader's runtime layout (SuwayomiRuntime/,
+  per-SDK copies of the prelinked archive, jvm.xcconfig variables) and a
+  HOST_ONLY refresh mode.
+- The simulator smoke tests and the Oneechan option file are not included;
+  ../jvm-options/openj9.options replaces the latter.
