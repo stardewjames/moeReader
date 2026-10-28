@@ -2312,6 +2312,7 @@ enum JavaCore {
             ("Ljava/nio/charset/CharacterCodingException;", "Ljava/io/IOException;"),
             ("Ljava/util/zip/DataFormatException;", "Ljava/lang/Exception;"),
             ("Ljava/util/zip/ZipException;", "Ljava/io/IOException;"),
+            ("Ljava/net/UnknownHostException;", "Ljava/io/IOException;"),
         ]
         var result: [[NativeClass]] = [[root]]
         for (descriptor, parent) in declarations {

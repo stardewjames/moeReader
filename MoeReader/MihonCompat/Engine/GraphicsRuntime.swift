@@ -2960,6 +2960,9 @@ enum GraphicsRuntime {
 
     private static func pdfBytes(_ runtime: VMRuntime, _ value: VMValue) -> Data? {
         if let data = runtime.payload(value, as: Data.self) { return data }
+        if let descriptor = runtime.payload(value, as: VMParcelFileDescriptorPayload.self) {
+            return descriptor.contents()
+        }
         if let file = runtime.payload(value, as: VMFilePayload.self) {
             return FileManager.default.contents(atPath: file.path)
         }

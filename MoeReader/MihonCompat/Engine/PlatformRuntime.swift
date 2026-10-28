@@ -11,10 +11,64 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 final class VMUriPayload {
     var value: String
     init(_ value: String) { self.value = value }
+}
+
+/// `java.net.InetAddress`: the name the address was resolved from (empty for a
+/// numeric literal, as in the JDK) and its raw network-order bytes. Names go
+/// through the platform resolver, so an unknown name fails with
+/// `UnknownHostException` instead of yielding a made-up address.
+final class VMInetAddressPayload {
+    let host: String
+    let bytes: [UInt8]
+
+    init(host: String, bytes: [UInt8]) {
+        self.host = host
+        self.bytes = bytes
+    }
+}
+
+/// One span installed on a `SpannableString`: the span object with the range
+/// and flags the extension set. Nothing is drawn, so the record is only the
+/// bookkeeping `getSpans`/`getSpanStart`/`removeSpan` answer from.
+final class VMTextSpanRecord {
+    let object: VMValue
+    var start: Int
+    var end: Int
+    var flags: Int32
+
+    init(object: VMValue, start: Int, end: Int, flags: Int32) {
+        self.object = object
+        self.start = start
+        self.end = end
+        self.flags = flags
+    }
+}
+
+/// `android.text.SpannableString` storage: the UTF-16 text plus the spans the
+/// extension attached. `Linkify` rewrites spans here too, so a `getSpans`
+/// query after `addLinks` sees the `URLSpan`s the platform would have added.
+final class VMSpannablePayload {
+    let units: [UInt16]
+    var spans: [VMTextSpanRecord] = []
+
+    init(units: [UInt16]) { self.units = units }
+
+    var text: String { String(decoding: units, as: UTF16.self) }
+}
+
+/// `android.text.style.URLSpan`: only the target the span carries is kept.
+final class VMURLSpanPayload {
+    let url: String
+    init(_ url: String) { self.url = url }
 }
 
 final class VMBundlePayload {
@@ -32,6 +86,97 @@ final class VMIntentPayload {
     var data: VMValue = .null
     var type: String?
     var flags: Int32 = 0
+}
+
+/// `android.os.ParcelFileDescriptor` mode bits. The values are Android's, so an
+/// extension that passes a literal mode keeps the platform's validation.
+enum VMParcelFileDescriptorMode {
+    static let readOnly: Int32 = 0x10000000
+    static let writeOnly: Int32 = 0x20000000
+    static let readWrite: Int32 = 0x30000000
+    static let create: Int32 = 0x08000000
+    static let truncate: Int32 = 0x04000000
+    static let append: Int32 = 0x02000000
+    static let worldReadable: Int32 = 0x00000001
+    static let worldWriteable: Int32 = 0x00000002
+    static let accessMask: Int32 = 0x30000000
+    static let allowedMask: Int32 = 0x3E000003
+}
+
+/// `android.os.ParcelFileDescriptor`: a file opened for an extension. There is
+/// no binder to receive a descriptor from another process, so it is always
+/// backed by a path inside the extension sandbox. A POSIX host also opens the
+/// file for real, which gives `getFileDescriptor`/`detachFd` their genuine
+/// descriptor; the bytes are read from the path for `PdfRenderer`.
+final class VMParcelFileDescriptorPayload {
+    let path: String
+    /// Raw POSIX descriptor, or `-1` on hosts without one.
+    let descriptor: Int32
+    private(set) var closed = false
+    private var ownsDescriptor: Bool
+
+    init(path: String, descriptor: Int32) {
+        self.path = path
+        self.descriptor = descriptor
+        self.ownsDescriptor = descriptor >= 0
+    }
+
+    deinit {
+        close()
+    }
+
+    var isOpen: Bool { !closed }
+
+    /// Bytes of the backing file, or `nil` once the descriptor is closed.
+    func contents() -> Data? {
+        guard !closed else { return nil }
+        return FileManager.default.contents(atPath: path)
+    }
+
+    /// `Os.fstat(fd).st_size`; `-1` when the file cannot be stat'ed.
+    func statSize() -> Int64 {
+        guard !closed else { return -1 }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attributes?[.size] as? NSNumber)?.int64Value ?? -1
+    }
+
+    func close() {
+        guard !closed else { return }
+        if ownsDescriptor {
+            #if canImport(Darwin)
+            _ = Darwin.close(descriptor)
+            #elseif canImport(Glibc)
+            _ = Glibc.close(descriptor)
+            #endif
+            ownsDescriptor = false
+        }
+        closed = true
+    }
+
+    /// Hands ownership of the descriptor to the caller, as Android's
+    /// `detachFd` does. The platform object itself becomes unusable.
+    func detach() -> Int32 {
+        guard !closed else { return -1 }
+        ownsDescriptor = false
+        closed = true
+        return descriptor
+    }
+}
+
+/// `java.io.FileDescriptor`: an opaque view of the descriptor a
+/// `ParcelFileDescriptor` owns. It mirrors the platform object's lifetime, so
+/// `valid` turns false as soon as the owning descriptor is closed.
+final class VMFileDescriptorPayload {
+    weak var owner: VMParcelFileDescriptorPayload?
+
+    init(owner: VMParcelFileDescriptorPayload) {
+        self.owner = owner
+    }
+
+    var valid: Bool {
+        guard let owner else { return false }
+        return !owner.closed
+    }
 }
 
 final class VMComponentNamePayload {
@@ -474,6 +619,7 @@ enum PlatformRuntime {
         result += androidClasses()
         result += icuTextClasses()
         result += androidTextUtilities()
+        result += androidTextSpanClasses()
         result += regexClasses()
         result += preferenceExtras()
         result += presentationClasses()
@@ -809,6 +955,21 @@ enum PlatformRuntime {
 
     private static func netClasses() -> [NativeClass] {
         var result: [NativeClass] = []
+
+        /// `URL`/`URI` store their text in the `value` field, which is what
+        /// `toString` and every accessor read.
+        func storedText(_ runtime: VMRuntime, _ value: VMValue) -> String? {
+            guard let pointer = value.object, let field = VMObjectLayout.cls(pointer).field(named: "value") else { return nil }
+            return runtime.stringValue(VMObjectLayout.slot(pointer, field.offset).pointee)
+        }
+        func makeURI(_ runtime: VMRuntime, _ text: String) -> VMValue {
+            let cls = runtime.cachedClass("Ljava/net/URI;")
+            let pointer = runtime.allocateObject(cls)
+            if let field = cls.field(named: "value") {
+                VMObjectLayout.slot(pointer, field.offset).pointee = runtime.newString(text)
+            }
+            return .reference(pointer)
+        }
         let encoder = NativeClass("Ljava/net/URLEncoder;")
         encoder.staticMethod("encode", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
@@ -866,9 +1027,240 @@ enum PlatformRuntime {
                       let url = URL(string: text), let scheme = url.scheme else { return .null }
                 return runtime.newString(scheme)
             }
+            if descriptor == "Ljava/net/URI;" {
+                cls.method("relativize", "(Ljava/net/URI;)Ljava/net/URI;") { runtime, args, _ in
+                    guard let base = storedText(runtime, args[0]) else { return .null }
+                    guard let other = storedText(runtime, args[1]) else {
+                        throw VMJavaException("Ljava/lang/NullPointerException;")
+                    }
+                    guard let relative = relativeURI(base: base, other: other) else { return args[1] }
+                    return makeURI(runtime, relative)
+                }
+                cls.method("toASCIIString", "()Ljava/lang/String;") { runtime, args, _ in
+                    runtime.newString(asciiURIString(storedText(runtime, args[0]) ?? ""))
+                }
+            }
             result.append(cls)
         }
+
+        // `java.net.InetAddress`: names resolve through the platform resolver
+        // (getaddrinfo), so consumers see the same addresses and the same
+        // failure the JDK reports.
+        let inetAddress = NativeClass("Ljava/net/InetAddress;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Serializable;"])
+        inetAddress.staticMethod("getByName", "(Ljava/lang/String;)Ljava/net/InetAddress;") { runtime, args, _ in
+            let resolved = resolveInetAddresses(runtime.stringValue(args[0]) ?? "")
+            guard let first = resolved.first else {
+                throw VMJavaException("Ljava/net/UnknownHostException;", runtime.stringValue(args[0]) ?? "")
+            }
+            return runtime.makeNative("Ljava/net/InetAddress;", payload: first)
+        }
+        inetAddress.staticMethod("getAllByName", "(Ljava/lang/String;)[Ljava/net/InetAddress;") { runtime, args, _ in
+            let resolved = resolveInetAddresses(runtime.stringValue(args[0]) ?? "")
+            guard !resolved.isEmpty else {
+                throw VMJavaException("Ljava/net/UnknownHostException;", runtime.stringValue(args[0]) ?? "")
+            }
+            let array = runtime.newArray(component: "Ljava/net/InetAddress;", count: resolved.count)
+            for (index, address) in resolved.enumerated() {
+                runtime.setArrayElement(array, index: index, value: runtime.makeNative("Ljava/net/InetAddress;", payload: address))
+            }
+            return array
+        }
+        inetAddress.staticMethod("getLocalHost", "()Ljava/net/InetAddress;") { runtime, _, _ in
+            let name = ProcessInfo.processInfo.hostName
+            guard let addresses = inetAddresses(named: name), let first = addresses.first else {
+                throw VMJavaException("Ljava/net/UnknownHostException;", name)
+            }
+            return runtime.makeNative("Ljava/net/InetAddress;", payload: first)
+        }
+        inetAddress.method("getHostAddress", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let address = runtime.payload(args[0], as: VMInetAddressPayload.self) else { return .null }
+            return runtime.newString(addressText(address.bytes))
+        }
+        inetAddress.method("getHostName", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let address = runtime.payload(args[0], as: VMInetAddressPayload.self) else { return .null }
+            // A literal address has no name, so the JDK answers the literal.
+            return runtime.newString(address.host.isEmpty ? addressText(address.bytes) : address.host)
+        }
+        inetAddress.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let left = runtime.payload(args[0], as: VMInetAddressPayload.self),
+                  let right = runtime.payload(args[1], as: VMInetAddressPayload.self) else { return .boolean(false) }
+            return .boolean(left.bytes == right.bytes)
+        }
+        inetAddress.method("hashCode", "()I") { runtime, args, _ in
+            guard let address = runtime.payload(args[0], as: VMInetAddressPayload.self) else { return .int32(0) }
+            var hash: Int32 = 0
+            for byte in address.bytes { hash = (hash << 8) | Int32(byte) }
+            return .int32(hash)
+        }
+        inetAddress.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let address = runtime.payload(args[0], as: VMInetAddressPayload.self) else { return .null }
+            return runtime.newString("\(address.host)/\(addressText(address.bytes))")
+        }
+        result.append(inetAddress)
         return result
+    }
+
+    /// `java.net.URI.relativize`: the JDK only strips the base when the other
+    /// URI shares scheme and authority and its path extends the base path; in
+    /// every other case the argument is returned untouched.
+    private static func relativeURI(base: String, other: String) -> String? {
+        let baseURI = parseURI(base)
+        let otherURI = parseURI(other)
+        if baseURI.opaque || otherURI.opaque { return nil }
+        if baseURI.scheme?.lowercased() != otherURI.scheme?.lowercased() { return nil }
+        if baseURI.authority != otherURI.authority { return nil }
+        let prefix = baseURI.path.hasSuffix("/") ? baseURI.path : baseURI.path + "/"
+        var relative: String
+        if otherURI.path == baseURI.path {
+            relative = ""
+        } else if otherURI.path.hasPrefix(prefix) {
+            relative = String(otherURI.path.dropFirst(prefix.count))
+        } else {
+            return nil
+        }
+        if let query = otherURI.query { relative += "?" + query }
+        if let fragment = otherURI.fragment { relative += "#" + fragment }
+        return relative
+    }
+
+    private struct VMParsedURI {
+        var scheme: String?
+        var authority: String?
+        var path: String
+        var query: String?
+        var fragment: String?
+        var opaque: Bool
+    }
+
+    private static func parseURI(_ value: String) -> VMParsedURI {
+        var rest = Substring(value)
+        var fragment: String?
+        if let hash = rest.firstIndex(of: "#") {
+            fragment = String(rest[rest.index(after: hash)...])
+            rest = rest[..<hash]
+        }
+        var query: String?
+        if let mark = rest.firstIndex(of: "?") {
+            query = String(rest[rest.index(after: mark)...])
+            rest = rest[..<mark]
+        }
+        var scheme: String?
+        if let colon = rest.firstIndex(of: ":"), colon > rest.startIndex {
+            let candidate = rest[..<colon]
+            let valid = candidate.first?.isLetter == true && candidate.allSatisfy {
+                $0.isLetter || $0.isNumber || "+-.".contains($0)
+            }
+            if valid {
+                scheme = String(candidate)
+                rest = rest[rest.index(after: colon)...]
+            }
+        }
+        let schemeSpecific = rest
+        var authority: String?
+        var path = String(rest)
+        if rest.hasPrefix("//") {
+            let tail = rest.dropFirst(2)
+            let end = tail.firstIndex(of: "/") ?? tail.endIndex
+            authority = String(tail[..<end])
+            path = String(tail[end...])
+        }
+        let opaque = scheme != nil && !schemeSpecific.hasPrefix("/")
+        return VMParsedURI(scheme: scheme, authority: authority, path: path, query: query, fragment: fragment, opaque: opaque)
+    }
+
+    /// `java.net.URI.toASCIIString`: only non-ASCII characters and spaces are
+    /// percent-encoded; escapes already in the value stay untouched.
+    private static func asciiURIString(_ value: String) -> String {
+        var output = ""
+        output.reserveCapacity(value.utf8.count)
+        for scalar in value.unicodeScalars {
+            if scalar.value == 0x20 {
+                output += "%20"
+            } else if scalar.value < 0x80 {
+                output.unicodeScalars.append(scalar)
+            } else {
+                for byte in String(scalar).utf8 {
+                    output += String(format: "%%%02X", byte)
+                }
+            }
+        }
+        return output
+    }
+
+    /// Empty name resolves to the loopback address, as `InetAddress` does.
+    private static func resolveInetAddresses(_ host: String) -> [VMInetAddressPayload] {
+        if host.isEmpty { return [VMInetAddressPayload(host: "localhost", bytes: [127, 0, 0, 1])] }
+        return inetAddresses(named: host) ?? []
+    }
+
+    /// Numeric literals parse without touching the resolver; anything else goes
+    /// through `getaddrinfo`, and an empty result is the JDK's failure case.
+    private static func inetAddresses(named host: String) -> [VMInetAddressPayload]? {
+        if let bytes = literalAddress(host) {
+            return [VMInetAddressPayload(host: "", bytes: bytes)]
+        }
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = 0
+        hints.ai_protocol = 0
+        var list: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &list) == 0, let first = list else { return nil }
+        defer { freeaddrinfo(first) }
+        var addresses: [VMInetAddressPayload] = []
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let info = cursor {
+            if let socket = info.pointee.ai_addr {
+                switch Int32(socket.pointee.sa_family) {
+                case AF_INET:
+                    let storage = UnsafeRawPointer(socket).assumingMemoryBound(to: sockaddr_in.self)
+                    var raw = storage.pointee.sin_addr
+                    let bytes = withUnsafeBytes(of: &raw) { Array($0.prefix(4)) }
+                    if !addresses.contains(where: { $0.bytes == bytes }) {
+                        addresses.append(VMInetAddressPayload(host: host, bytes: bytes))
+                    }
+                case AF_INET6:
+                    let storage = UnsafeRawPointer(socket).assumingMemoryBound(to: sockaddr_in6.self)
+                    var raw = storage.pointee.sin6_addr
+                    let bytes = withUnsafeBytes(of: &raw) { Array($0.prefix(16)) }
+                    if !addresses.contains(where: { $0.bytes == bytes }) {
+                        addresses.append(VMInetAddressPayload(host: host, bytes: bytes))
+                    }
+                default:
+                    break
+                }
+            }
+            cursor = info.pointee.ai_next
+        }
+        return addresses.isEmpty ? nil : addresses
+    }
+
+    private static func literalAddress(_ text: String) -> [UInt8]? {
+        var v4 = in_addr()
+        if inet_pton(AF_INET, text, &v4) == 1 {
+            return withUnsafeBytes(of: &v4) { Array($0.prefix(4)) }
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, text, &v6) == 1 {
+            return withUnsafeBytes(of: &v6) { Array($0.prefix(16)) }
+        }
+        return nil
+    }
+
+    /// JDK text form: dotted quad for IPv4, eight uncompressed hex groups for
+    /// IPv6.
+    private static func addressText(_ bytes: [UInt8]) -> String {
+        if bytes.count == 4 {
+            return bytes.map(String.init).joined(separator: ".")
+        }
+        guard bytes.count == 16 else { return "" }
+        var groups: [String] = []
+        var index = 0
+        while index < 16 {
+            let group = (UInt16(bytes[index]) << 8) | UInt16(bytes[index + 1])
+            groups.append(String(group, radix: 16))
+            index += 2
+        }
+        return groups.joined(separator: ":")
     }
 
     private static func androidClasses() -> [NativeClass] {
@@ -1294,7 +1686,171 @@ enum PlatformRuntime {
             PlatformRuntime.intentPayload(runtime, args[0])?.type.map(runtime.newString) ?? .null
         }
         result.append(intent)
+        result += parcelFileDescriptorClasses()
         return result
+    }
+
+    // MARK: - android.os.ParcelFileDescriptor
+
+    private static func parcelFileDescriptorClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let fileDescriptor = NativeClass("Ljava/io/FileDescriptor;", superclass: "Ljava/lang/Object;")
+        fileDescriptor.method("valid", "()Z") { runtime, args, _ in
+            guard let descriptor = runtime.payload(args[0], as: VMFileDescriptorPayload.self) else {
+                return .boolean(false)
+            }
+            return .boolean(descriptor.valid)
+        }
+        result.append(fileDescriptor)
+
+        let descriptor = NativeClass("Landroid/os/ParcelFileDescriptor;", superclass: "Ljava/lang/Object;")
+        let modeNames = [
+            "MODE_READ_ONLY", "MODE_WRITE_ONLY", "MODE_READ_WRITE", "MODE_CREATE",
+            "MODE_TRUNCATE", "MODE_APPEND", "MODE_WORLD_READABLE", "MODE_WORLD_WRITEABLE"
+        ]
+        for name in modeNames { descriptor.staticField(name, "I") }
+        let modeValues: [Int32] = [
+            VMParcelFileDescriptorMode.readOnly,
+            VMParcelFileDescriptorMode.writeOnly,
+            VMParcelFileDescriptorMode.readWrite,
+            VMParcelFileDescriptorMode.create,
+            VMParcelFileDescriptorMode.truncate,
+            VMParcelFileDescriptorMode.append,
+            VMParcelFileDescriptorMode.worldReadable,
+            VMParcelFileDescriptorMode.worldWriteable
+        ]
+        descriptor.prepare = { _, cls in
+            for (index, value) in modeValues.enumerated() { cls.staticValues[index] = .int32(value) }
+        }
+        for signature in [
+            "(Ljava/io/File;I)Landroid/os/ParcelFileDescriptor;",
+            "(Ljava/io/File;ILandroid/os/Handler;)Landroid/os/ParcelFileDescriptor;"
+        ] {
+            descriptor.staticMethod("open", signature) { runtime, args, _ in
+                try openParcelFileDescriptor(runtime, args[0], args[1].asInt32)
+            }
+        }
+        descriptor.staticMethod("fromFd", "(I)Landroid/os/ParcelFileDescriptor;") { _, _, _ in
+            // A raw descriptor cannot name a file in the extension sandbox, so
+            // there is nothing safe to hand back. Android reports the same
+            // exception for a descriptor it cannot use.
+            throw VMJavaException("Ljava/io/IOException;", "Bad file descriptor")
+        }
+        descriptor.method("getFileDescriptor", "()Ljava/io/FileDescriptor;") { runtime, args, _ in
+            let payload = try openParcelPayload(runtime, args[0])
+            return runtime.makeNative(
+                "Ljava/io/FileDescriptor;",
+                payload: VMFileDescriptorPayload(owner: payload)
+            )
+        }
+        descriptor.method("getFd", "()I") { runtime, args, _ in
+            let payload = try openParcelPayload(runtime, args[0])
+            return .int32(payload.descriptor)
+        }
+        descriptor.method("detachFd", "()I") { runtime, args, _ in
+            let payload = try openParcelPayload(runtime, args[0])
+            return .int32(payload.detach())
+        }
+        descriptor.method("getStatSize", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMParcelFileDescriptorPayload.self)?.statSize() ?? -1)
+        }
+        descriptor.method("close", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMParcelFileDescriptorPayload.self)?.close()
+            return .zero
+        }
+        descriptor.method("finalize", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMParcelFileDescriptorPayload.self)?.close()
+            return .zero
+        }
+        result.append(descriptor)
+        return result
+    }
+
+    private static func openParcelPayload(
+        _ runtime: VMRuntime,
+        _ value: VMValue
+    ) throws -> VMParcelFileDescriptorPayload {
+        guard let payload = runtime.payload(value, as: VMParcelFileDescriptorPayload.self) else {
+            throw VMJavaException("Ljava/io/IOException;", "Bad file descriptor")
+        }
+        guard payload.isOpen else {
+            throw VMJavaException("Ljava/io/IOException;", "Bad file descriptor")
+        }
+        return payload
+    }
+
+    /// `ParcelFileDescriptor.open(File, mode)`: Android's mode validation, then
+    /// the file resolved against the extension sandbox and opened with the host.
+    private static func openParcelFileDescriptor(
+        _ runtime: VMRuntime,
+        _ file: VMValue,
+        _ mode: Int32
+    ) throws -> VMValue {
+        guard file.bits != 0 else {
+            throw VMJavaException("Ljava/lang/NullPointerException;", "file == null")
+        }
+        let access = mode & VMParcelFileDescriptorMode.accessMask
+        guard mode & ~VMParcelFileDescriptorMode.allowedMask == 0,
+              access == VMParcelFileDescriptorMode.readOnly
+                || access == VMParcelFileDescriptorMode.writeOnly
+                || access == VMParcelFileDescriptorMode.readWrite else {
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Bad mode: \(mode)")
+        }
+        let path = FileRuntime.absolutePath(runtime, FileRuntime.filePath(runtime, file))
+        guard !path.isEmpty,
+              FileManager.default.fileExists(atPath: path, isDirectory: nil) || mode & VMParcelFileDescriptorMode.create != 0
+        else {
+            throw VMJavaException("Ljava/io/FileNotFoundException;", path)
+        }
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+            throw VMJavaException("Ljava/io/FileNotFoundException;", path + " (Is a directory)")
+        }
+        let raw = try openSandboxDescriptor(path: path, mode: mode)
+        let native = VMParcelFileDescriptorPayload(path: path, descriptor: raw)
+        return runtime.makeNative("Landroid/os/ParcelFileDescriptor;", payload: native)
+    }
+
+    /// Opens the sandbox file with the requested access. Returns `-1` when the
+    /// host has no POSIX descriptors; the payload still serves the file.
+    private static func openSandboxDescriptor(path: String, mode: Int32) throws -> Int32 {
+        let access = mode & VMParcelFileDescriptorMode.accessMask
+        let truncate = access != VMParcelFileDescriptorMode.readOnly
+            && mode & VMParcelFileDescriptorMode.truncate != 0
+        let append = mode & VMParcelFileDescriptorMode.append != 0
+        let create = mode & VMParcelFileDescriptorMode.create != 0
+        #if canImport(Darwin) || canImport(Glibc)
+        var flags: Int32
+        switch access {
+        case VMParcelFileDescriptorMode.readOnly: flags = O_RDONLY
+        case VMParcelFileDescriptorMode.writeOnly: flags = O_WRONLY
+        default: flags = O_RDWR
+        }
+        if create { flags |= O_CREAT }
+        if truncate { flags |= O_TRUNC }
+        if append { flags |= O_APPEND }
+        #if canImport(Darwin)
+        let descriptor = Darwin.open(path, flags, mode_t(0o666))
+        #else
+        let descriptor = Glibc.open(path, flags, mode_t(0o666))
+        #endif
+        guard descriptor >= 0 else {
+            throw VMJavaException("Ljava/io/FileNotFoundException;", path)
+        }
+        return descriptor
+        #else
+        let manager = FileManager.default
+        if create && !manager.fileExists(atPath: path),
+           !manager.createFile(atPath: path, contents: Data()) {
+            throw VMJavaException("Ljava/io/FileNotFoundException;", path)
+        }
+        if truncate, let handle = FileHandle(forWritingAtPath: path) {
+            handle.truncateFile(atOffset: 0)
+            handle.closeFile()
+        }
+        return -1
+        #endif
     }
 
     private static func intentPayload(_ runtime: VMRuntime, _ value: VMValue) -> VMIntentPayload? {
@@ -2174,6 +2730,427 @@ enum PlatformRuntime {
             cls.staticValues[0] = VMRegex.pattern(runtime, VMRegex.emailAddress) ?? .null
         }
         result.append(patterns)
+        return result
+    }
+
+    /// `android.text.SpannableString` and the `Spanned`/`Spannable` protocols,
+    /// the two inert movement/transformation singletons, `android.text.style`
+    /// spans, and `Linkify`. Nothing renders: text and spans are recorded so
+    /// every getter answers what the extension installed.
+    private static func androidTextSpanClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        func spannable(_ runtime: VMRuntime, _ value: VMValue) -> VMSpannablePayload? {
+            runtime.payload(value, as: VMSpannablePayload.self)
+        }
+        func requireSpannable(_ runtime: VMRuntime, _ value: VMValue) throws -> VMSpannablePayload {
+            guard let payload = spannable(runtime, value) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            return payload
+        }
+        func charSequence(_ runtime: VMRuntime, _ value: VMValue) -> String? {
+            if let payload = spannable(runtime, value) { return payload.text }
+            return runtime.stringValue(value)
+        }
+        func index(_ value: VMValue) -> Int { Int(value.asInt32) }
+        func record(_ payload: VMSpannablePayload, _ object: VMValue) -> VMTextSpanRecord? {
+            payload.spans.first { $0.object.bits == object.bits }
+        }
+
+        /// Write side shared by `Spannable` and `SpannableString`.
+        func installWriters(_ cls: NativeClass) {
+            cls.method("setSpan", "(Ljava/lang/Object;IIII)V") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                let start = index(args[2])
+                let end = index(args[3])
+                guard start >= 0, end >= 0, start <= end, end <= payload.units.count else {
+                    throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "start \(start), end \(end), length \(payload.units.count)")
+                }
+                // Android replaces the range of a span set a second time.
+                payload.spans.removeAll { $0.object.bits == args[1].bits }
+                payload.spans.append(VMTextSpanRecord(object: args[1], start: start, end: end, flags: args[4].asInt32))
+                return .zero
+            }
+            cls.method("removeSpan", "(Ljava/lang/Object;)V") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                payload.spans.removeAll { $0.object.bits == args[1].bits }
+                return .zero
+            }
+        }
+
+        /// Read side shared by `Spanned` and `SpannableString`.
+        func installReaders(_ cls: NativeClass) {
+            cls.method("length", "()I") { runtime, args, _ in
+                .int32(Int32(try requireSpannable(runtime, args[0]).units.count))
+            }
+            cls.method("charAt", "(I)C") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                let at = index(args[1])
+                guard at >= 0, at < payload.units.count else {
+                    throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;", "index \(at), length \(payload.units.count)")
+                }
+                return .int32(Int32(payload.units[at]))
+            }
+            cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+                runtime.newString(try requireSpannable(runtime, args[0]).text)
+            }
+            cls.method("subSequence", "(II)Ljava/lang/CharSequence;") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                let start = index(args[1])
+                let end = index(args[2])
+                guard start >= 0, start <= end, end <= payload.units.count else {
+                    throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "start \(start), end \(end), length \(payload.units.count)")
+                }
+                let copy = VMSpannablePayload(units: Array(payload.units[start..<end]))
+                // Android clips spans to the slice and drops those outside it.
+                copy.spans = payload.spans.compactMap { span in
+                    guard span.end > start, span.start < end else { return nil }
+                    return VMTextSpanRecord(
+                        object: span.object,
+                        start: max(span.start, start) - start,
+                        end: min(span.end, end) - start,
+                        flags: span.flags
+                    )
+                }
+                return runtime.makeNative("Landroid/text/SpannableString;", payload: copy)
+            }
+            cls.method("getSpans", "(IILjava/lang/Class;)[Ljava/lang/Object;") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                let start = index(args[1])
+                let end = index(args[2])
+                let filter = runtime.payload(args[3], as: VMClass.self)
+                let matches = payload.spans.filter { span in
+                    let intersects = start == end
+                        ? span.start <= start && start <= span.end
+                        : span.start < end && start < span.end
+                    guard intersects else { return false }
+                    guard let filter else { return true }
+                    return runtime.isInstance(span.object, of: filter)
+                }
+                let array = runtime.newArray(component: "Ljava/lang/Object;", count: matches.count)
+                for (offset, span) in matches.enumerated() {
+                    runtime.setArrayElement(array, index: offset, value: span.object)
+                }
+                return array
+            }
+            cls.method("getSpanStart", "(Ljava/lang/Object;)I") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                return .int32(Int32(record(payload, args[1])?.start ?? -1))
+            }
+            cls.method("getSpanEnd", "(Ljava/lang/Object;)I") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                return .int32(Int32(record(payload, args[1])?.end ?? -1))
+            }
+            cls.method("getSpanFlags", "(Ljava/lang/Object;)I") { runtime, args, _ in
+                let payload = try requireSpannable(runtime, args[0])
+                return .int32(record(payload, args[1])?.flags ?? 0)
+            }
+        }
+
+        let spanned = NativeClass(
+            "Landroid/text/Spanned;",
+            superclass: nil,
+            interfaces: ["Ljava/lang/CharSequence;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        let spanFlags: [(String, Int32)] = [
+            ("SPAN_INCLUSIVE_EXCLUSIVE", 17),
+            ("SPAN_INCLUSIVE_INCLUSIVE", 18),
+            ("SPAN_EXCLUSIVE_INCLUSIVE", 34),
+            ("SPAN_EXCLUSIVE_EXCLUSIVE", 33),
+            ("SPAN_PARAGRAPH", 51),
+        ]
+        for (name, _) in spanFlags { spanned.staticField(name, "I") }
+        spanned.prepare = { _, cls in
+            for (offset, entry) in spanFlags.enumerated() { cls.staticValues[offset] = .int32(entry.1) }
+        }
+        installReaders(spanned)
+        result.append(spanned)
+
+        let spannableInterface = NativeClass(
+            "Landroid/text/Spannable;",
+            superclass: nil,
+            interfaces: ["Landroid/text/Spanned;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        installReaders(spannableInterface)
+        installWriters(spannableInterface)
+        result.append(spannableInterface)
+
+        let spannableString = NativeClass(
+            "Landroid/text/SpannableString;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Landroid/text/Spannable;", "Ljava/lang/CharSequence;"]
+        )
+        spannableString.method("<init>", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            let source = args[1]
+            if let existing = spannable(runtime, source) {
+                let copy = VMSpannablePayload(units: existing.units)
+                copy.spans = existing.spans.map {
+                    VMTextSpanRecord(object: $0.object, start: $0.start, end: $0.end, flags: $0.flags)
+                }
+                runtime.setPayload(args[0], copy)
+            } else {
+                guard let text = charSequence(runtime, source) else {
+                    throw VMJavaException("Ljava/lang/NullPointerException;")
+                }
+                runtime.setPayload(args[0], VMSpannablePayload(units: Array(text.utf16)))
+            }
+            return .zero
+        }
+        installReaders(spannableString)
+        installWriters(spannableString)
+        result.append(spannableString)
+
+        // `android.text.style.URLSpan` (the span `Linkify` installs) and its
+        // `ClickableSpan` parent, which only carry the target.
+        let clickable = NativeClass(
+            "Landroid/text/style/ClickableSpan;",
+            superclass: "Ljava/lang/Object;",
+            access: DexAccess.isPublic | DexAccess.isAbstract
+        )
+        clickable.method("onClick", "(Landroid/view/View;)V") { _, _, _ in .zero }
+        result.append(clickable)
+        let urlSpan = NativeClass("Landroid/text/style/URLSpan;", superclass: "Landroid/text/style/ClickableSpan;")
+        urlSpan.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMURLSpanPayload(runtime.stringValue(args[1]) ?? ""))
+            return .zero
+        }
+        urlSpan.method("getURL", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMURLSpanPayload.self) else { return .null }
+            return runtime.newString(payload.url)
+        }
+        urlSpan.method("updateDrawState", "(Landroid/text/TextPaint;)V") { _, _, _ in .zero }
+        urlSpan.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: VMURLSpanPayload.self)?.url ?? "")
+        }
+        result.append(urlSpan)
+
+        // Both singletons are inert: no window, no cursor, no keyboard. The
+        // instance is shared so identity checks behave like the platform's.
+        let password = NativeClass(
+            "Landroid/text/method/PasswordTransformationMethod;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Landroid/text/method/TransformationMethod;"]
+        )
+        password.staticField("sInstance", "Landroid/text/method/PasswordTransformationMethod;")
+        password.prepare = { _, cls in
+            cls.staticValues[0] = .null
+        }
+        password.method("getTransformation", "(Ljava/lang/CharSequence;Landroid/view/View;)Ljava/lang/CharSequence;") { _, args, _ in args[1] }
+        password.staticMethod("getInstance", "()Landroid/text/method/PasswordTransformationMethod;") { runtime, _, _ in
+            let cls = runtime.cachedClass("Landroid/text/method/PasswordTransformationMethod;")
+            if let cached = cls.staticValues.first, cached.bits != 0 { return cached }
+            let value = runtime.makeNative(cls, payload: NSNull())
+            if !cls.staticValues.isEmpty { cls.staticValues[0] = value }
+            return value
+        }
+        result.append(password)
+
+        let movement = NativeClass(
+            "Landroid/text/method/LinkMovementMethod;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Landroid/text/method/MovementMethod;"]
+        )
+        movement.staticField("sInstance", "Landroid/text/method/LinkMovementMethod;")
+        movement.prepare = { _, cls in
+            cls.staticValues[0] = .null
+        }
+        movement.method("canSelectArbitrarily", "()Z") { _, _, _ in .boolean(false) }
+        movement.method("initialize", "(Landroid/widget/TextView;Landroid/text/Spannable;)V") { _, _, _ in .zero }
+        movement.method(
+            "onTouchEvent",
+            "(Landroid/widget/TextView;Landroid/text/Spannable;Landroid/view/MotionEvent;)Z"
+        ) { _, _, _ in .boolean(false) }
+        movement.staticMethod("getInstance", "()Landroid/text/method/MovementMethod;") { runtime, _, _ in
+            let cls = runtime.cachedClass("Landroid/text/method/LinkMovementMethod;")
+            if let cached = cls.staticValues.first, cached.bits != 0 { return cached }
+            let value = runtime.makeNative(cls, payload: NSNull())
+            if !cls.staticValues.isEmpty { cls.staticValues[0] = value }
+            return value
+        }
+        result.append(movement)
+
+        result.append(linkifyClass())
+        return result
+    }
+
+    /// `android.text.util.Linkify`: detects URLs, e-mail addresses and phone
+    /// numbers and records `URLSpan`s on a `SpannableString`.
+    private static func linkifyClass() -> NativeClass {
+        let linkify = NativeClass("Landroid/text/util/Linkify;", superclass: "Ljava/lang/Object;")
+        let masks: [(String, Int32)] = [
+            ("WEB_URLS", 0x01),
+            ("EMAIL_ADDRESSES", 0x02),
+            ("PHONE_NUMBERS", 0x04),
+            ("MAP_ADDRESSES", 0x08),
+            ("ALL", 0x0F),
+        ]
+        for (name, _) in masks { linkify.staticField(name, "I") }
+        linkify.prepare = { _, cls in
+            for (offset, entry) in masks.enumerated() { cls.staticValues[offset] = .int32(entry.1) }
+        }
+        linkify.staticMethod("addLinks", "(Landroid/text/Spannable;I)Z") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMSpannablePayload.self) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            let mask = args[1].asInt32
+            guard mask != 0 else { return .boolean(false) }
+            let matches = linkMatches(in: payload.text, mask: mask)
+            guard !matches.isEmpty else { return .boolean(false) }
+            let urlSpanClass = "Landroid/text/style/URLSpan;"
+            for match in matches {
+                let span = runtime.makeNative(urlSpanClass, payload: VMURLSpanPayload(match.url))
+                payload.spans.removeAll {
+                    $0.object.bits == span.bits || $0.start == match.start && $0.end == match.end
+                }
+                payload.spans.append(VMTextSpanRecord(object: span, start: match.start, end: match.end, flags: 33))
+            }
+            return .boolean(true)
+        }
+        return linkify
+    }
+
+    private struct VMLinkMatch {
+        let start: Int
+        let end: Int
+        let url: String
+        let priority: Int
+    }
+
+    /// Detects links for `Linkify.addLinks`. Offsets are UTF-16, matching the
+    /// span API.
+    private static func linkMatches(in text: String, mask: Int32) -> [VMLinkMatch] {
+        #if canImport(Darwin)
+        if let detected = dataDetectorMatches(in: text, mask: mask) { return detected }
+        #endif
+        return regexMatches(in: text, mask: mask)
+    }
+
+    #if canImport(Darwin)
+    /// Apple's data detector covers the URL, e-mail and phone matchers with the
+    /// platform's own knowledge of what a link looks like.
+    private static func dataDetectorMatches(in text: String, mask: Int32) -> [VMLinkMatch]? {
+        var types: UInt64 = 0
+        if mask & 0x03 != 0 { types |= NSTextCheckingResult.CheckingType.link.rawValue }
+        if mask & 0x04 != 0 { types |= NSTextCheckingResult.CheckingType.phoneNumber.rawValue }
+        guard types != 0, let detector = try? NSDataDetector(types: types) else { return nil }
+        let full = NSRange(location: 0, length: (text as NSString).length)
+        var matches: [VMLinkMatch] = []
+        detector.enumerateMatches(in: text, options: [], range: full) { result, _, _ in
+            guard let result else { return }
+            if let url = result.url {
+                let isEmail = url.scheme?.lowercased() == "mailto"
+                if isEmail {
+                    guard mask & 0x02 != 0 else { return }
+                } else {
+                    guard mask & 0x01 != 0 else { return }
+                }
+                matches.append(VMLinkMatch(
+                    start: result.range.location,
+                    end: result.range.location + result.range.length,
+                    url: url.absoluteString,
+                    priority: isEmail ? 1 : 0
+                ))
+            } else if result.resultType == .phoneNumber, mask & 0x04 != 0 {
+                let digits = (result.phoneNumber ?? "").filter { $0.isNumber || $0 == "+" }
+                guard digits.filter({ $0.isNumber }).count >= 7 else { return }
+                matches.append(VMLinkMatch(
+                    start: result.range.location,
+                    end: result.range.location + result.range.length,
+                    url: "tel:" + digits,
+                    priority: 2
+                ))
+            }
+        }
+        return deduplicate(matches)
+    }
+    #endif
+
+    private static let linkURLPattern =
+        #"(?i)\b(?:(?:https?://|www\.)[^\s<>"']+|"# +
+        #"(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+"# +
+        #"(?:com|org|net|edu|gov|mil|int|io|co|me|tv|info|biz|app|dev|xyz|online|site|shop|store|club|pro|"# +
+        #"mobi|name|asia|ru|de|jp|cn|uk|fr|es|it|nl|pl|br|id|vn|th|tr|kr|in|au|ca|mx|ar|ch|se|no|fi|dk|cz|"# +
+        #"at|be|pt|gr|ro|hu|ua|by|kz|il|ae|sa|za|ng|ke|pk|bd|lk|my|sg|ph|tw|hk)\b(?:/[^\s<>"']*)?)"#
+    private static let linkEmailPattern = #"(?i)\b[a-z0-9._%+\-]+@[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?)+\b"#
+    private static let linkPhonePattern = #"(?<![0-9A-Za-z])\+?\d[\d\s().\-]{5,}\d(?![0-9A-Za-z])"#
+
+    /// Portable matcher used off Apple (and whenever the data detector is
+    /// unavailable): Android-like URL/e-mail/phone patterns with punctuation
+    /// trimming and overlap removal.
+    private static func regexMatches(in text: String, mask: Int32) -> [VMLinkMatch] {
+        let full = NSRange(location: 0, length: (text as NSString).length)
+        let scalars = Array(text.utf16)
+        func slice(_ range: NSRange) -> String { String(decoding: scalars[range.location..<(range.location + range.length)], as: UTF16.self) }
+        func candidates(_ pattern: String) -> [NSRange] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+            return regex.matches(in: text, options: [], range: full).map(\.range)
+        }
+        var matches: [VMLinkMatch] = []
+        if mask & 0x01 != 0 {
+            for range in candidates(linkURLPattern) {
+                var adjusted = range
+                // Android trims sentence punctuation from the end of a URL.
+                while adjusted.length > 0 {
+                    let last = String(decoding: [scalars[adjusted.location + adjusted.length - 1]], as: UTF16.self)
+                    if ".,;:!?\"'".contains(last) {
+                        adjusted.length -= 1
+                    } else if [")", "]", "}"].contains(last) {
+                        let body = slice(adjusted)
+                        let open = [Character(")"): Character("("), Character("]"): Character("["), Character("}"): Character("{")][last]!
+                        if body.components(separatedBy: String(open)).count < body.components(separatedBy: String(last)).count {
+                            adjusted.length -= 1
+                        } else { break }
+                    } else { break }
+                }
+                guard adjusted.length > 0 else { continue }
+                var url = slice(adjusted)
+                let lower = url.lowercased()
+                if !lower.hasPrefix("http://"), !lower.hasPrefix("https://") {
+                    url = "http://" + url
+                }
+                matches.append(VMLinkMatch(start: adjusted.location, end: adjusted.location + adjusted.length, url: url, priority: 0))
+            }
+        }
+        if mask & 0x02 != 0 {
+            for range in candidates(linkEmailPattern) {
+                matches.append(VMLinkMatch(
+                    start: range.location,
+                    end: range.location + range.length,
+                    url: "mailto:" + slice(range),
+                    priority: 1
+                ))
+            }
+        }
+        if mask & 0x04 != 0 {
+            for range in candidates(linkPhonePattern) {
+                let body = slice(range)
+                let digits = body.filter { $0.isNumber }
+                guard digits.count >= 7, digits.count <= 15 else { continue }
+                matches.append(VMLinkMatch(
+                    start: range.location,
+                    end: range.location + range.length,
+                    url: "tel:" + body.filter { $0.isNumber || $0 == "+" },
+                    priority: 2
+                ))
+            }
+        }
+        return deduplicate(matches)
+    }
+
+    /// Earliest match wins; later matches overlapping it are dropped.
+    private static func deduplicate(_ matches: [VMLinkMatch]) -> [VMLinkMatch] {
+        let sorted = matches.sorted {
+            $0.start != $1.start ? $0.start < $1.start : $0.priority < $1.priority
+        }
+        var result: [VMLinkMatch] = []
+        for match in sorted {
+            if result.contains(where: { $0.start < match.end && match.start < $0.end }) { continue }
+            result.append(match)
+        }
         return result
     }
 

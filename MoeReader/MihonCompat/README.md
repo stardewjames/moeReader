@@ -354,6 +354,14 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - The static audit (runtime registry dump fed to `SiteTests/harness/audit.py`)
   reports zero missing host classes, methods, fields or supertypes across the
   same 35 APKs.
+- The same measurement was run over the whole published index: 1,435
+  extensions, all on extension-lib 1.6, audited by dumping the engine's runtime
+  registry and comparing every APK's DEX host-API references against it. The
+  baseline found 1,044 missing host symbols referenced by 1,055 extensions;
+  with the surface in this tree the residue is 30 symbols referenced by a
+  single extension, all of them the virtual-display and touch-injection
+  presentation surface, which the engine deliberately does not fake. Per-symbol
+  data is kept outside the repository.
 - Page images reach the reader through the extension: `getImage` when the
   source overrides it, otherwise `imageRequest` and the source's
   `OkHttpClient`, so its interceptors see the request and the returned bytes
