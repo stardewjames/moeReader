@@ -37,6 +37,33 @@ if [ "$PLATFORM" = iphonesimulator ]; then
 fi
 
 cd "$SRC"
+
+# HotSpot's macOS/arm64 write-xor-execute helpers live in
+# os_cpu/bsd_aarch64/os_bsd_aarch64.cpp, but a Zero build compiles
+# os_cpu/bsd_zero instead and still defines MACOS_AARCH64 (macros.hpp keys it on
+# __APPLE__ && AARCH64), so every inline W^X transition in shared code
+# references os::thread_wx_enable_write_impl, os::_jit_exec_enabled and
+# DefaultWXWriteMode, which nothing defines: the static link fails. Zero never
+# generates code and needs no W^X transition, so the macro is gated on the
+# variant here rather than patching the pinned sources upstream. Idempotent.
+MACROS="src/hotspot/share/utilities/macros.hpp"
+if ! grep -q "defined(ZERO) /\* mihoncompat: no W^X for Zero \*/" "$MACROS"; then
+  python3 - "$MACROS" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+old = "#if defined(__APPLE__) && defined(AARCH64)\n#define MACOS_AARCH64 1\n#endif"
+new = ("// Zero builds compile os_cpu/bsd_zero and never generate code, so the\n"
+       "// apple/arm64 W^X helpers in os_cpu/bsd_aarch64 are not linked in.\n"
+       "#if defined(__APPLE__) && defined(AARCH64) && !defined(ZERO) /* mihoncompat: no W^X for Zero */\n"
+       "#define MACOS_AARCH64 1\n"
+       "#endif")
+if old not in text:
+    sys.exit("build-openjdk-ios: MACOS_AARCH64 block not found in macros.hpp")
+open(path, "w", encoding="utf-8").write(text.replace(old, new, 1))
+PY
+fi
+
 if [ ! -f "build/$CONF/spec.gmk" ]; then
   # configure's compiler checks run in the source root: one configure at a time.
   mkdir -p build
