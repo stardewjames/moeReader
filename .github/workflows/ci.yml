@@ -11,6 +11,9 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
+        with:
+          # SuwayomiHost/vendor/suwayomi (upstream Suwayomi-Server, pinned).
+          submodules: true
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
