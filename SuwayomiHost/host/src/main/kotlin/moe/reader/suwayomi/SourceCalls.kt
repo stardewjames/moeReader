@@ -138,8 +138,17 @@ object SourceCalls {
         state: SourceState,
         page: MangasPage,
     ) {
+        // A manga without a url cannot be opened: drop it instead of sending
+        // the app a dead entry it cannot resolve later.
+        val mangas = page.mangas.filter { it.urlOrEmpty().isNotEmpty() }
+        if (mangas.size != page.mangas.size) {
+            Host.services.log(
+                HostServices.LOG_WARN,
+                "listing: dropped ${page.mangas.size - mangas.size} entries without a url",
+            )
+        }
         writer.bool(page.hasNextPage)
-        writer.list(page.mangas) { manga ->
+        writer.list(mangas) { manga ->
             state.remember(manga)
             writeManga(this, manga)
         }
@@ -150,8 +159,8 @@ object SourceCalls {
         manga: SManga,
     ) {
         writer
-            .string(manga.url)
-            .string(manga.title)
+            .string(manga.urlOrEmpty())
+            .string(manga.titleOrEmpty())
             .string(manga.thumbnail_url)
             .string(manga.description)
             .string(manga.author)
@@ -173,8 +182,10 @@ object SourceCalls {
             await { state.source.getMangaUpdate(manga, emptyList(), true, false) }
         }
         val result = update.manga
-        if (result.url.isEmpty()) result.url = url
-        if (result.title.isEmpty() && !title.isNullOrEmpty()) result.title = title
+        // A source may answer with a model it only partly filled; the app's
+        // request is the fallback for both the identity and the title.
+        if (result.urlOrEmpty().isEmpty()) result.url = url
+        if (result.titleOrEmpty().isEmpty() && !title.isNullOrEmpty()) result.title = title
         state.remember(result)
         writeManga(writer, result)
     }
@@ -190,7 +201,14 @@ object SourceCalls {
         val update = state.forManga(url) {
             await { state.source.getMangaUpdate(manga, emptyList(), false, true) }
         }
-        writer.list(update.chapters) { chapter ->
+        val chapters = update.chapters.filter { it.urlOrEmpty().isNotEmpty() }
+        if (chapters.size != update.chapters.size) {
+            Host.services.log(
+                HostServices.LOG_WARN,
+                "chapters: dropped ${update.chapters.size - chapters.size} entries without a url",
+            )
+        }
+        writer.list(chapters) { chapter ->
             state.remember(chapter)
             writeChapter(this, chapter)
         }
@@ -201,8 +219,8 @@ object SourceCalls {
         chapter: SChapter,
     ) {
         writer
-            .string(chapter.url)
-            .string(chapter.name)
+            .string(chapter.urlOrEmpty())
+            .string(chapter.nameOrEmpty())
             .f64(chapter.chapter_number.toDouble())
             .string(chapter.scanlator)
             .i64(chapter.date_upload)

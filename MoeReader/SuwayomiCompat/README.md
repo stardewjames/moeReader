@@ -63,6 +63,12 @@ memory idle when the reader is not asking for anything.
 - **Positional binary wire format.** Requests and replies are length-prefixed
   fields in a fixed order (`SuwayomiWire.swift`, `Wire.kt`): no JSON parser or
   reflection runs in the interpreter for a call.
+- **A partly filled model is not an error.** Extensions build `SManga`/
+  `SChapter` with `SMangaImpl`/`SChapterImpl`, whose `url`, `title` and `name`
+  are `lateinit`: one left unset used to fail the whole call with
+  `UninitializedPropertyAccessException`. The host treats those as empty, falls
+  back to the app's request for details, and drops entries without a url (they
+  could not be opened), logging what it dropped.
 - **Convert once, load uncompressed.** dex2jar runs once per APK content; the
   converted jar is cached under Application Support (excluded from backups)
   and written with stored entries, so later sessions skip both conversion and
@@ -154,6 +160,13 @@ picked up without relaunching the app.
   with the actual bundled options, catching rejected flags and incorrect
   diagnostic-option ordering. CI runs it on JDK 21 before building the host.
   It does not verify the iOS VM itself.
+- `SuwayomiHost/host`'s `ExtensionSweepTest` (opt-in, `SUWAYOMI_TEST_APK_DIR`)
+  converted and loaded every extension in a local set offline and built each
+  source's filter list. A live pass over the same set reached popular, details,
+  chapters and pages for 31 of 36; the other five need a browser check (the app
+  solves those in its off-screen `WKWebView`), a JavaScript engine
+  (JavaScriptCore on device) or hit a mirror answering with HTML. The sweep also
+  found the unset-`lateinit` failure class described above.
 - `SuwayomiHost/harness/run-linux.sh` builds this folder's Swift and C sources
   in Swift 6 mode with the shared layer and runs one extension end to end on a
   desktop HotSpot: load, popular (two pages), latest, filters, search,

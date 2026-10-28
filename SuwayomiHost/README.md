@@ -97,6 +97,14 @@ asks for them concurrently. Some extensions reject that with
 manga`, so `SourceCalls` serialises the two per manga with striped reentrant
 locks; different manga, sources and page fetches still run in parallel.
 
+A source may also answer with a partly filled model: `SManga.create()` and
+`SChapter.create()` return `SMangaImpl`/`SChapterImpl`, whose `url`, `title` and
+`name` are `lateinit`, so reading an unset one throws
+`UninitializedPropertyAccessException`. The host reads those fields defensively
+— a missing details url or title falls back to the app's request, an unset
+chapter name reads as empty, and a listing or chapter entry without a url is
+dropped with a warning (the app could not open it) instead of failing the call.
+
 Upcalls go the other way through two natives the app registers:
 `Native.fetch(meta, body): Array<ByteArray?>` for HTTP, and
 `Native.call(op, payload)` for cookies, browser checks, JavaScript and logging
@@ -118,6 +126,11 @@ cd SuwayomiHost
   `SUWAYOMI_TEST_JVM_ARGS=-Xint` runs it interpreter-only, as on the phone.
   On a desktop CPU a JSON API extension took about 2 s to convert and load
   and about 10 s for the whole sequence with `-Xint` (6 s with the JIT).
+- `SUWAYOMI_TEST_APK_DIR=/path/to/apks ./gradlew :host:test --tests '*ExtensionSweepTest*'`
+  converts and loads every APK in the directory offline and builds each
+  source's filter list, reporting failures per file. This covers dex2jar, class
+  loading and the Android/Java API a source touches while being constructed,
+  without needing the sites.
 - `harness/run-linux.sh <apk> [source-index|lang] [query]` runs the app's
   Swift runtime, the JNI shim and this jar together on Linux;
   `harness/test-linux.sh` runs the app side's Swift tests. See

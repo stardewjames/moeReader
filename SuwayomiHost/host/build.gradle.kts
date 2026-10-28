@@ -188,12 +188,15 @@ tasks.test {
     systemProperty("java.awt.headless", "true")
     // Opt-in live test against a real extension APK (never committed).
     System.getenv("SUWAYOMI_TEST_APK")?.let { environment("SUWAYOMI_TEST_APK", it) }
+    // Opt-in audit over a directory of extension APKs (never committed).
+    System.getenv("SUWAYOMI_TEST_APK_DIR")?.let { environment("SUWAYOMI_TEST_APK_DIR", it) }
     // Extra VM flags, e.g. SUWAYOMI_TEST_JVM_ARGS=-Xint to time the
     // interpreter-only mode the phone runs in.
     System.getenv("SUWAYOMI_TEST_JVM_ARGS")?.let { jvmArgs(it.split(' ').filter(String::isNotBlank)) }
     testLogging {
         events("failed", "skipped", "passed")
-        showStandardStreams = System.getenv("SUWAYOMI_TEST_APK") != null
+        showStandardStreams =
+            System.getenv("SUWAYOMI_TEST_APK") != null || System.getenv("SUWAYOMI_TEST_APK_DIR") != null
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
 }

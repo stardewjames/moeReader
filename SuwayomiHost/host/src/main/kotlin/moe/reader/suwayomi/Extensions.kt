@@ -178,6 +178,29 @@ object ExtensionConverter {
     }
 }
 
+/**
+ * Sources return `SManga`/`SChapter` built by `SManga.create()`/`SChapter.create()`,
+ * which are `SMangaImpl`/`SChapterImpl`: `url`, `title` and `name` are
+ * `lateinit`, so a source that leaves one unset throws
+ * `UninitializedPropertyAccessException` on the first read. Upstream Suwayomi
+ * treats exactly that case as an empty value (`Manga.updateMangaDatabase`), so
+ * a source's omission must not fail the whole call.
+ */
+private fun unsetAsEmpty(read: () -> String): String =
+    try {
+        read()
+    } catch (_: UninitializedPropertyAccessException) {
+        ""
+    }
+
+internal fun SManga.urlOrEmpty(): String = unsetAsEmpty { url }
+
+internal fun SManga.titleOrEmpty(): String = unsetAsEmpty { title }
+
+internal fun SChapter.urlOrEmpty(): String = unsetAsEmpty { url }
+
+internal fun SChapter.nameOrEmpty(): String = unsetAsEmpty { name }
+
 /** Per-source state the host keeps between calls. */
 class SourceState(
     val source: CatalogueSource,
@@ -211,7 +234,12 @@ class SourceState(
         }
 
     fun remember(manga: SManga) {
-        if (manga.url.isNotEmpty()) synchronized(mangas) { mangas[manga.url] = manga }
+        val url = manga.urlOrEmpty()
+        // A url is the identity; without one the entry cannot be found again.
+        if (url.isEmpty()) return
+        // Initialise what a source may read back later (details, writeManga).
+        if (manga.titleOrEmpty().isEmpty()) manga.title = ""
+        synchronized(mangas) { mangas[url] = manga }
     }
 
     fun chapter(
@@ -226,7 +254,11 @@ class SourceState(
         }
 
     fun remember(chapter: SChapter) {
-        if (chapter.url.isNotEmpty()) synchronized(chapters) { chapters[chapter.url] = chapter }
+        val url = chapter.urlOrEmpty()
+        if (url.isEmpty()) return
+        // `getPageList` is handed this object, so its name must be readable.
+        if (chapter.nameOrEmpty().isEmpty()) chapter.name = ""
+        synchronized(chapters) { chapters[url] = chapter }
     }
 
     fun pages(chapterUrl: String): List<Page>? = synchronized(pageLists) { pageLists[chapterUrl] }

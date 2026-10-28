@@ -1,8 +1,6 @@
 package moe.reader.suwayomi
 
-import net.dongliu.apk.parser.ApkFile
 import java.io.File
-import java.security.MessageDigest
 import kotlin.system.measureTimeMillis
 import kotlin.test.Test
 import kotlin.test.assertTrue
@@ -21,28 +19,12 @@ class ExtensionLiveTest {
         assumeTrue(path != null, "set SUWAYOMI_TEST_APK to run the live extension check")
         TestHost.boot()
         val apk = File(path!!)
-        val (packageName, classNames) =
-            ApkFile(apk).use { parsed ->
-                val pkg = parsed.apkMeta.packageName
-                val raw =
-                    Regex("""android:name="tachiyomi\.extension\.class"\s+android:value="([^"]+)"""")
-                        .find(parsed.manifestXml)
-                        ?.groupValues
-                        ?.get(1) ?: error("no extension class metadata")
-                pkg to raw.split(';').map { if (it.startsWith(".")) pkg + it else it }
-            }
-        val key = MessageDigest.getInstance("SHA-256").digest(apk.readBytes()).joinToString("") { "%02x".format(it) }
-        fun WireWriter.header() {
-            string(packageName)
-            string(apk.absolutePath)
-            string(key)
-            strings(classNames)
-        }
+        val header = TestHost.headerFor(apk)
 
         var sourceId = 0L
         val load =
             measureTimeMillis {
-                val reply = TestHost.call(Bridge.LOAD) { header() }
+                val reply = TestHost.call(Bridge.LOAD) { writeHeader(header) }
                 val sources =
                     reply.list {
                         val id = i64()
@@ -67,7 +49,7 @@ class ExtensionLiveTest {
             "popular: " +
                 measureTimeMillis {
                     val page = TestHost.call(Bridge.POPULAR) {
-                        header()
+                        writeHeader(header)
                         i64(sourceId)
                         i32(1)
                     }
@@ -81,7 +63,7 @@ class ExtensionLiveTest {
         )
 
         val details = TestHost.call(Bridge.DETAILS) {
-            header()
+            writeHeader(header)
             i64(sourceId)
             string(mangaUrl)
             string(mangaTitle)
@@ -90,7 +72,7 @@ class ExtensionLiveTest {
         println("details title: ${details.requireString()}")
 
         val chapters = TestHost.call(Bridge.CHAPTERS) {
-            header()
+            writeHeader(header)
             i64(sourceId)
             string(mangaUrl)
             string(mangaTitle)
@@ -102,7 +84,7 @@ class ExtensionLiveTest {
         println("chapters: $chapterCount, first: $chapterName")
 
         val pages = TestHost.call(Bridge.PAGES) {
-            header()
+            writeHeader(header)
             i64(sourceId)
             string(chapterUrl)
             string(chapterName)
@@ -113,7 +95,7 @@ class ExtensionLiveTest {
 
         // Whether page images can skip the JVM depends on what the client adds.
         val client =
-            ExtensionRegistry.use(ExtensionHeader(packageName, apk.absolutePath, key, classNames)) {
+            ExtensionRegistry.use(header) {
                 (it.source(sourceId).source as? eu.kanade.tachiyomi.source.online.HttpSource)?.client
             }
         println(
@@ -123,7 +105,7 @@ class ExtensionLiveTest {
 
         for (allowDirect in listOf(true, false)) {
             val image = TestHost.call(Bridge.IMAGE) {
-                header()
+                writeHeader(header)
                 i64(sourceId)
                 string(chapterUrl)
                 string(chapterName)
