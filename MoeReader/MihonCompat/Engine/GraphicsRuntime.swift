@@ -545,14 +545,14 @@ enum VMBitmapStore {
         }
         // setPixels/getPixels address the backing store, so ignore any canvas
         // transform and replace pixels (including transparent ones).
+        // setPixels replaces the backing store: draw the pixels into the device
+        // area regardless of any transform the canvas has picked up, like
+        // Canvas.drawBitmap after resetting the matrix.
         context.saveGState()
-        context.setCTM(bitmap.baseTransform)
+        let area = CGRect(x: 0, y: 0, width: CGFloat(bitmap.width), height: CGFloat(bitmap.height))
+            .applying(context.ctm.inverted())
         context.setBlendMode(.copy)
-        drawImage(
-            image,
-            in: CGRect(x: 0, y: 0, width: CGFloat(bitmap.width), height: CGFloat(bitmap.height)),
-            context: context
-        )
+        drawImage(image, in: area, context: context)
         context.restoreGState()
     }
 
@@ -582,7 +582,7 @@ enum VMBitmapStore {
             data[offset + 2] = UInt8((channel(10) * alphaValue / 255).rounded())
             data[offset + 3] = UInt8(alphaValue.rounded())
         }
-        return image(fromRGBA: data, width: image.width, height: image.height)
+        return VMBitmapStore.image(fromRGBA: data, width: image.width, height: image.height)
     }
 
     /// Font metrics in Android's sign convention: distances above the baseline
