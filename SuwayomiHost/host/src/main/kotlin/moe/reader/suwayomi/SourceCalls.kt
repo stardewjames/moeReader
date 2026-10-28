@@ -19,6 +19,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import okhttp3.Request
 import java.lang.reflect.Method
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * The source operations the app calls. Each runs on the calling (app worker)
@@ -28,6 +29,30 @@ import java.lang.reflect.Method
 object SourceCalls {
     /** Wall-clock budget of one source operation. */
     private const val OPERATION_TIMEOUT_MILLIS = 90_000L
+
+    /**
+     * Extensions may reject a second concurrent `getMangaUpdate` for one manga
+     * with `IllegalStateException`. The app asks for details and chapters at
+     * the same time, so the host runs them one after the other: the extension's
+     * threading contract is enforced here, once, for every app caller. Striped
+     * locks keep the memory bounded, and they are reentrant because a source
+     * may call its own update while parsing.
+     */
+    private val mangaLocks = Array(32) { ReentrantLock() }
+
+    private fun <T> SourceState.forManga(
+        url: String,
+        block: () -> T,
+    ): T {
+        val hash = System.identityHashCode(this) * 31 xor url.hashCode()
+        val lock = mangaLocks[(hash and Int.MAX_VALUE) % mangaLocks.size]
+        lock.lock()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
 
     private fun <T> await(block: suspend () -> T): T = runBlocking { withTimeout(OPERATION_TIMEOUT_MILLIS) { block() } }
 
@@ -144,7 +169,9 @@ object SourceCalls {
         val url = reader.requireString()
         val title = reader.string()
         val manga = state.manga(url, title)
-        val update = await { state.source.getMangaUpdate(manga, emptyList(), true, false) }
+        val update = state.forManga(url) {
+            await { state.source.getMangaUpdate(manga, emptyList(), true, false) }
+        }
         val result = update.manga
         if (result.url.isEmpty()) result.url = url
         if (result.title.isEmpty() && !title.isNullOrEmpty()) result.title = title
@@ -160,7 +187,9 @@ object SourceCalls {
         val title = reader.string()
         val manga = state.manga(url, title)
         // Mihon's chapter refresh: details are not parsed a second time.
-        val update = await { state.source.getMangaUpdate(manga, emptyList(), false, true) }
+        val update = state.forManga(url) {
+            await { state.source.getMangaUpdate(manga, emptyList(), false, true) }
+        }
         writer.list(update.chapters) { chapter ->
             state.remember(chapter)
             writeChapter(this, chapter)

@@ -91,6 +91,12 @@ extension on demand, so it can evict extensions without telling the app.
 | 13 `UNLOAD` | package, purge jars (no header) | — |
 | 14 `TRIM` | — | drops idle extensions, collects |
 
+`DETAILS` and `CHAPTERS` both call the source's `getMangaUpdate`, and the app
+asks for them concurrently. Some extensions reject that with
+`IllegalStateException: getMangaUpdate must not be called concurrently for same
+manga`, so `SourceCalls` serialises the two per manga with striped reentrant
+locks; different manga, sources and page fetches still run in parallel.
+
 Upcalls go the other way through two natives the app registers:
 `Native.fetch(meta, body): Array<ByteArray?>` for HTTP, and
 `Native.call(op, payload)` for cookies, browser checks, JavaScript and logging

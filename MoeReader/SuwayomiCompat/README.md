@@ -45,6 +45,11 @@ memory idle when the reader is not asking for anything.
   (`unload`, `trim`) is a job like any other and takes the same start lock, so
   a memory warning during the first start trims after it rather than being
   dropped while the state was still `stopped`.
+- **Details and chapters of one manga never overlap.** The app asks for both at
+  the same time, and some extensions reject a second concurrent
+  `getMangaUpdate` for one manga with `IllegalStateException`. `SourceCalls`
+  runs those two calls one after the other per manga, so the extension's
+  contract holds for every caller, not just the browse screen.
 - **The app owns the network.** OkHttp's chain is kept (extension interceptors,
   redirects with per-hop cookies, cookie jar, gzip), but the final hop is the
   app's `URLSession`: the system TLS stack, HTTP/2 and connection reuse instead
