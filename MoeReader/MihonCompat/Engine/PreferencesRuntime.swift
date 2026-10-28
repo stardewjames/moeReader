@@ -13,6 +13,15 @@ import Foundation
 final class VMTextViewPayload {
     var text: VMValue = .null
     var error: VMValue = .null
+    /// Selection written by `setSelection`, or nil while it still follows the
+    /// end of the text the way a freshly filled editor does.
+    var selectionStart: Int?
+    var selectionEnd: Int?
+    /// The values installed by `setTransformationMethod`/`setMovementMethod`.
+    /// Both are pure presentation hooks, so keeping them is all the engine can
+    /// do with them.
+    var transformationMethod: VMValue = .null
+    var movementMethod: VMValue = .null
 }
 
 final class VMUiPreferencePayload {
@@ -313,16 +322,45 @@ enum PreferencesRuntime {
         textView.method("setSingleLine", "(Z)V") { _, _, _ in .zero }
         textView.method("setEnabled", "(Z)V") { _, _, _ in .zero }
         textView.method("isEnabled", "()Z") { _, _, _ in .boolean(true) }
-        textView.method("getSelectionStart", "()I") { _, _, _ in .int32(0) }
+        // The platform default text color of the light theme. Nothing renders,
+        // so it never changes.
+        textView.method("getCurrentTextColor", "()I") { _, _, _ in .int32(Int32(bitPattern: 0xFF00_0000)) }
+        // Both methods only affect presentation; the values are kept so the
+        // object reports back what the extension installed.
+        textView.method("setTransformationMethod", "(Landroid/text/method/TransformationMethod;)V") { runtime, args, _ in
+            runtime.setTextViewTransformationMethod(args[0], args[1])
+            return .zero
+        }
+        textView.method("setMovementMethod", "(Landroid/text/method/MovementMethod;)V") { runtime, args, _ in
+            runtime.setTextViewMovementMethod(args[0], args[1])
+            return .zero
+        }
+        textView.method("getSelectionStart", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.textViewSelection(args[0]).start))
+        }
         textView.method("getSelectionEnd", "()I") { runtime, args, _ in
-            .int32(Int32(runtime.stringValue(runtime.textViewText(args[0]) ?? .null)?.utf16.count ?? 0))
+            .int32(Int32(runtime.textViewSelection(args[0]).end))
         }
         result.append(textView)
 
         let editText = NativeClass("Landroid/widget/EditText;", superclass: "Landroid/widget/TextView;")
         editText.method("<init>", "(Landroid/content/Context;)V") { _, _, _ in .zero }
-        editText.method("selectAll", "()V") { _, _, _ in .zero }
-        editText.method("setSelection", "(I)V") { _, _, _ in .zero }
+        editText.method("selectAll", "()V") { runtime, args, _ in
+            let length = runtime.textViewTextLength(args[0])
+            try runtime.setTextViewSelection(args[0], start: 0, end: length)
+            return .zero
+        }
+        editText.method("setSelection", "(I)V") { runtime, args, _ in
+            let index = Int(Int32(truncatingIfNeeded: args[1].asInt64))
+            try runtime.setTextViewSelection(args[0], start: index, end: index)
+            return .zero
+        }
+        editText.method("setSelection", "(II)V") { runtime, args, _ in
+            let start = Int(Int32(truncatingIfNeeded: args[1].asInt64))
+            let end = Int(Int32(truncatingIfNeeded: args[2].asInt64))
+            try runtime.setTextViewSelection(args[0], start: start, end: end)
+            return .zero
+        }
         editText.method("append", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
             let existing = runtime.stringValue(runtime.textViewText(args[0]) ?? .null) ?? ""
             runtime.setTextViewText(args[0], runtime.newString(existing + (runtime.stringValue(args[1]) ?? "")))
@@ -333,6 +371,35 @@ enum PreferencesRuntime {
         result.append(NativeClass("Landroid/text/TextWatcher;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
         result.append(NativeClass("Landroid/graphics/drawable/Drawable;", superclass: "Ljava/lang/Object;"))
         result.append(NativeClass("Landroid/util/AttributeSet;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
+
+        // Presentation hooks `TextView` takes. `TextView` owns them, so they are
+        // declared here; the engine never transforms or moves text.
+        let transformationMethod = NativeClass(
+            "Landroid/text/method/TransformationMethod;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        transformationMethod.method("getTransformation", "(Ljava/lang/CharSequence;Landroid/view/View;)Ljava/lang/CharSequence;") { _, args, _ in args[1] }
+        transformationMethod.method(
+            "onFocusChanged",
+            "(Landroid/view/View;Ljava/lang/CharSequence;ZILandroid/graphics/Rect;)V"
+        ) { _, _, _ in .zero }
+        result.append(transformationMethod)
+
+        let movementMethod = NativeClass(
+            "Landroid/text/method/MovementMethod;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        movementMethod.method("initialize", "(Landroid/widget/TextView;Landroid/text/Spannable;)V") { _, _, _ in .zero }
+        movementMethod.method(
+            "onTouchEvent",
+            "(Landroid/widget/TextView;Landroid/text/Spannable;Landroid/view/MotionEvent;)Z"
+        ) { _, _, _ in .boolean(false) }
+        movementMethod.method("canSelectArbitrarily", "()Z") { _, _, _ in .boolean(false) }
+        result.append(movementMethod)
         return result
     }
 
@@ -365,6 +432,38 @@ extension VMRuntime {
 
     func textViewError(_ value: VMValue) -> VMValue? {
         payload(value, as: VMTextViewPayload.self)?.error
+    }
+
+    func setTextViewTransformationMethod(_ value: VMValue, _ method: VMValue) {
+        textViewStore(value).transformationMethod = method
+    }
+
+    func setTextViewMovementMethod(_ value: VMValue, _ method: VMValue) {
+        textViewStore(value).movementMethod = method
+    }
+
+    /// Length of the editor buffer in UTF-16 units, the unit `setSelection`
+    /// bounds and `getSelectionEnd` report in.
+    func textViewTextLength(_ value: VMValue) -> Int {
+        (stringValue(textViewText(value) ?? .null) ?? "").utf16.count
+    }
+
+    /// `getSelectionStart`/`getSelectionEnd`: the selection the extension set,
+    /// or the end of the text while it has set none.
+    func textViewSelection(_ value: VMValue) -> (start: Int, end: Int) {
+        let store = payload(value, as: VMTextViewPayload.self)
+        return (store?.selectionStart ?? 0, store?.selectionEnd ?? textViewTextLength(value))
+    }
+
+    /// `Selection.setSelection`: both offsets must fall inside the buffer.
+    func setTextViewSelection(_ value: VMValue, start: Int, end: Int) throws {
+        let length = textViewTextLength(value)
+        guard start >= 0, start <= length, end >= 0, end <= length else {
+            throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "setSelection \(start), \(end)")
+        }
+        let store = textViewStore(value)
+        store.selectionStart = start
+        store.selectionEnd = end
     }
 
     func preference(_ value: VMValue) throws -> VMUiPreferencePayload {

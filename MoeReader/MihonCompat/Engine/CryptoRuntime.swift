@@ -42,7 +42,13 @@ final class VMCipherPayload {
     var key: [UInt8] = []
     var iv: [UInt8] = []
     var tagLength = 128
+    var aad: [UInt8] = []
     var buffered = Data()
+    /// RSA arm; nil while the cipher is AES or uninitialised.
+    var rsaKey: VMRSAKeyPayload?
+    var oaepDigest: String?
+    var oaepMGFDigest: String?
+    var oaepLabel: [UInt8]?
 
     init(transformation: String) {
         self.transformation = transformation
@@ -530,18 +536,13 @@ enum CryptoRuntime {
         cipher.staticMethod("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;") { runtime, args, _ in
             let transformation = runtime.stringValue(args[0]) ?? ""
             let payload = VMCipherPayload(transformation: transformation)
-            guard ["AES"].contains(payload.algorithm) else {
-                throw VMJavaException("Ljava/security/NoSuchAlgorithmException;", transformation)
-            }
-            guard ["CBC", "GCM", "ECB", "CTR"].contains(payload.modeName) else {
-                throw VMJavaException("Ljavax/crypto/NoSuchPaddingException;", transformation)
-            }
+            try validate(payload, transformation: transformation)
             return runtime.makeNative("Ljavax/crypto/Cipher;", payload: payload)
         }
         cipher.staticMethod("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;") { runtime, args, _ in
             let transformation = runtime.stringValue(args[0]) ?? ""
             let payload = VMCipherPayload(transformation: transformation)
-            guard ["AES"].contains(payload.algorithm) else {
+            guard ["AES", "RSA"].contains(payload.algorithm) else {
                 throw VMJavaException("Ljava/security/NoSuchAlgorithmException;", transformation)
             }
             return runtime.makeNative("Ljavax/crypto/Cipher;", payload: payload)
@@ -563,7 +564,7 @@ enum CryptoRuntime {
             var input = payload.buffered
             input.append(contentsOf: bytes(from: args[1], runtime: runtime))
             payload.buffered = Data()
-            let output = try run(payload, input: Array(input))
+            let output = try run(runtime, payload, input: Array(input))
             return byteArray(output, runtime: runtime)
         }
         cipher.method("doFinal", "([BI)I") { runtime, args, _ in
@@ -571,18 +572,28 @@ enum CryptoRuntime {
             var input = payload.buffered
             input.append(contentsOf: bytes(from: args[1], runtime: runtime))
             payload.buffered = Data()
-            let output = try run(payload, input: Array(input))
+            let output = try run(runtime, payload, input: Array(input))
             let count = min(output.count, runtime.arrayLength(args[1]))
             for index in 0..<count {
                 runtime.setArrayElement(args[1], index: index, value: .int32(Int32(Int8(bitPattern: output[index]))))
             }
             return .int32(Int32(count))
         }
+        cipher.method("doFinal", "([BII)[B") { runtime, args, _ in
+            let payload: VMCipherPayload = try runtime.payloadBox(args[0])
+            let all = bytes(from: args[1], runtime: runtime)
+            let start = max(0, min(Int(args[2].asInt32), all.count))
+            let length = max(0, min(Int(args[3].asInt32), all.count - start))
+            var input = payload.buffered
+            input.append(contentsOf: all[start..<(start + length)])
+            payload.buffered = Data()
+            return byteArray(try run(runtime, payload, input: Array(input)), runtime: runtime)
+        }
         cipher.method("doFinal", "()[B") { runtime, args, _ in
             let payload: VMCipherPayload = try runtime.payloadBox(args[0])
             let input = Array(payload.buffered)
             payload.buffered = Data()
-            return byteArray(try run(payload, input: input), runtime: runtime)
+            return byteArray(try run(runtime, payload, input: input), runtime: runtime)
         }
         cipher.method("update", "([B)[B") { runtime, args, _ in
             let payload: VMCipherPayload = try runtime.payloadBox(args[0])
@@ -597,17 +608,80 @@ enum CryptoRuntime {
             payload.buffered.append(contentsOf: all[start..<(start + length)])
             return runtime.newArray(component: "B", count: 0)
         }
+        cipher.method("updateAAD", "([B)V") { runtime, args, _ in
+            let payload: VMCipherPayload = try runtime.payloadBox(args[0])
+            try checkAAD(payload)
+            payload.aad.append(contentsOf: bytes(from: args[1], runtime: runtime))
+            return .zero
+        }
+        cipher.method("updateAAD", "([BII)V") { runtime, args, _ in
+            let payload: VMCipherPayload = try runtime.payloadBox(args[0])
+            try checkAAD(payload)
+            let all = bytes(from: args[1], runtime: runtime)
+            let start = max(0, min(Int(args[2].asInt32), all.count))
+            let length = max(0, min(Int(args[3].asInt32), all.count - start))
+            payload.aad.append(contentsOf: all[start..<(start + length)])
+            return .zero
+        }
         cipher.method("getAlgorithm", "()Ljava/lang/String;") { runtime, args, _ in
             let payload: VMCipherPayload? = runtime.payload(args[0], as: VMCipherPayload.self)
             return runtime.newString(payload?.algorithm ?? "AES")
         }
-        cipher.method("getBlockSize", "()I") { _, _, _ in .int32(16) }
+        cipher.method("getBlockSize", "()I") { runtime, args, _ in
+            let payload: VMCipherPayload? = runtime.payload(args[0], as: VMCipherPayload.self)
+            return .int32(payload?.algorithm == "RSA" ? 0 : 16)
+        }
         cipher.method("getIV", "()[B") { runtime, args, _ in
             let payload: VMCipherPayload? = runtime.payload(args[0], as: VMCipherPayload.self)
             return byteArray(payload?.iv ?? [], runtime: runtime)
         }
-        cipher.method("getOutputSize", "(I)I") { _, args, _ in .int32(args[1].asInt32 + 16) }
+        cipher.method("getOutputSize", "(I)I") { runtime, args, _ in
+            let payload: VMCipherPayload? = runtime.payload(args[0], as: VMCipherPayload.self)
+            if payload?.algorithm == "RSA", let key = payload?.rsaKey {
+                return .int32(Int32(key.modulusByteCount))
+            }
+            return .int32(args[1].asInt32 + 16)
+        }
         return [cipher]
+    }
+
+    /// Algorithm/mode/padding names the host implements. AES keeps the modes
+    /// it always accepted; RSA supports ECB (and the implicit form) with
+    /// PKCS#1 v1.5, OAEP and no padding.
+    private static func validate(_ payload: VMCipherPayload, transformation: String) throws {
+        guard ["AES", "RSA"].contains(payload.algorithm) else {
+            throw VMJavaException("Ljava/security/NoSuchAlgorithmException;", transformation)
+        }
+        if payload.algorithm == "AES" {
+            guard ["CBC", "GCM", "ECB", "CTR"].contains(payload.modeName) else {
+                throw VMJavaException("Ljavax/crypto/NoSuchPaddingException;", transformation)
+            }
+            return
+        }
+        let parts = transformation.split(separator: "/")
+        if parts.count > 1 {
+            guard payload.modeName == "ECB" || payload.modeName == "NONE" else {
+                throw VMJavaException("Ljava/security/NoSuchAlgorithmException;", transformation)
+            }
+        }
+        let padding = parts.count > 2 ? payload.paddingName : "PKCS1PADDING"
+        guard [
+            "PKCS1PADDING",
+            "OAEPWITHSHA-256ANDMGF1PADDING",
+            "OAEPWITHSHA-1ANDMGF1PADDING",
+            "NOPADDING",
+        ].contains(padding) else {
+            throw VMJavaException("Ljavax/crypto/NoSuchPaddingException;", transformation)
+        }
+    }
+
+    private static func checkAAD(_ payload: VMCipherPayload) throws {
+        guard payload.mode == 1 || payload.mode == 2 else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "cipher not initialized")
+        }
+        guard payload.modeName == "GCM" else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "updateAAD requires an AEAD mode")
+        }
     }
 
     private static func configure(
@@ -620,6 +694,16 @@ enum CryptoRuntime {
         guard payload.mode == 1 || payload.mode == 2 else {
             throw VMJavaException("Ljava/security/InvalidKeyException;", "unsupported cipher mode \(payload.mode)")
         }
+        if let rsa = runtime.payload(args[2], as: VMRSAKeyPayload.self) {
+            payload.rsaKey = rsa
+            if let specIndex, let oaep = runtime.payload(args[specIndex], as: VMOAEPPayload.self) {
+                payload.oaepDigest = oaep.digest
+                payload.oaepMGFDigest = oaep.mgfDigest
+                payload.oaepLabel = oaep.label
+            }
+            payload.aad.removeAll(keepingCapacity: true)
+            return
+        }
         guard let key = runtime.payload(args[2], as: VMSecretKeyPayload.self) else {
             throw VMJavaException("Ljava/security/InvalidKeyException;", "missing key")
         }
@@ -627,6 +711,7 @@ enum CryptoRuntime {
             throw VMJavaException("Ljava/security/InvalidKeyException;", "invalid AES key length \(key.encoded.count)")
         }
         payload.key = key.encoded
+        payload.aad.removeAll(keepingCapacity: true)
         if let specIndex {
             if let gcm = runtime.payload(args[specIndex], as: VMGCMParameterPayload.self) {
                 payload.iv = gcm.iv
@@ -640,16 +725,31 @@ enum CryptoRuntime {
         }
     }
 
-    private static func run(_ payload: VMCipherPayload, input: [UInt8]) throws -> [UInt8] {
+    private static func run(_ runtime: VMRuntime, _ payload: VMCipherPayload, input: [UInt8]) throws -> [UInt8] {
+        if payload.algorithm == "RSA" {
+            return try JavaPublicKeyRuntime.cipher(runtime, payload, input: input)
+        }
         switch payload.modeName {
         case "GCM":
             if payload.mode == 1 {
-                return MihonAES.gcmEncrypt(input, key: payload.key, iv: payload.iv, tagLength: payload.tagLength / 8)
+                return MihonAES.gcmEncrypt(
+                    input,
+                    key: payload.key,
+                    iv: payload.iv,
+                    aad: payload.aad,
+                    tagLength: payload.tagLength / 8
+                )
             }
             guard payload.tagLength == 128 else {
                 throw VMJavaException("Ljava/security/InvalidAlgorithmParameterException;", "unsupported GCM tag length")
             }
-            guard let plaintext = MihonAES.gcmDecrypt(input, key: payload.key, iv: payload.iv, tagLength: payload.tagLength / 8) else {
+            guard let plaintext = MihonAES.gcmDecrypt(
+                input,
+                key: payload.key,
+                iv: payload.iv,
+                aad: payload.aad,
+                tagLength: payload.tagLength / 8
+            ) else {
                 throw VMJavaException("Ljavax/crypto/AEADBadTagException;", "GCM tag mismatch")
             }
             return plaintext
@@ -709,7 +809,7 @@ enum CryptoRuntime {
         let secret = NativeClass(
             "Ljavax/crypto/spec/SecretKeySpec;",
             superclass: "Ljava/lang/Object;",
-            interfaces: ["Ljava/security/Key;", "Ljava/security/spec/KeySpec;", "Ljava/io/Serializable;"]
+            interfaces: ["Ljava/security/Key;", "Ljavax/crypto/SecretKey;", "Ljava/security/spec/KeySpec;", "Ljava/io/Serializable;"]
         )
         secret.method("<init>", "([BLjava/lang/String;)V") { runtime, args, _ in
             let algorithm = runtime.stringValue(args[2]) ?? ""

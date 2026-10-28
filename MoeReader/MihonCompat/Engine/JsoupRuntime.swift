@@ -136,14 +136,70 @@ final class JNode {
             return children.contains { $0.hasTextContent }
         }
     }
+
+    /// Index among the parent's children (`-1` when detached).
+    var siblingIndex: Int {
+        guard let parent else { return -1 }
+        return parent.children.firstIndex { $0 === self } ?? -1
+    }
+
+    var nextSiblingNode: JNode? {
+        guard let parent, let index = parent.children.firstIndex(where: { $0 === self }),
+              index + 1 < parent.children.count else { return nil }
+        return parent.children[index + 1]
+    }
+
+    var previousSiblingNode: JNode? {
+        guard let parent, let index = parent.children.firstIndex(where: { $0 === self }),
+              index > 0 else { return nil }
+        return parent.children[index - 1]
+    }
+
+    /// Detached deep copy, like jsoup's `Node.clone()`: the clone has no parent
+    /// and owns copies of the whole subtree.
+    func deepCopy() -> JNode {
+        let copy = JNode(kind: kind, tag: tag, text: text, attributes: attributes)
+        copy.children.reserveCapacity(children.count)
+        for child in children {
+            let childCopy = child.deepCopy()
+            childCopy.parent = copy
+            copy.children.append(childCopy)
+        }
+        return copy
+    }
 }
 
 final class JDocumentPayload {
     let root: JNode
-    let baseUri: String
+    /// Mutable: jsoup's `Document.setBaseUri(String)` changes `abs:` resolution
+    /// and `location()` for the whole document.
+    var baseUri: String
     init(root: JNode, baseUri: String) {
         self.root = root
         self.baseUri = baseUri
+    }
+}
+
+/// jsoup `Parser`: selects the tree builder (`htmlParser()` or `xmlParser()`).
+final class JParserPayload {
+    let xml: Bool
+    init(xml: Bool) { self.xml = xml }
+}
+
+/// jsoup `Evaluator`: typed evaluators are reduced to their CSS selector,
+/// because the host selector engine is CSS-native.
+final class JEvaluatorPayload {
+    let selector: String
+    init(_ selector: String) { self.selector = selector }
+}
+
+/// jsoup `Attribute`: a live key/value view over its owner element.
+final class JAttributePayload {
+    let node: JNode
+    let name: String
+    init(node: JNode, name: String) {
+        self.node = node
+        self.name = name
     }
 }
 
@@ -431,6 +487,107 @@ enum JsoupHTML {
                 }
             }
             body.children = flattened
+        }
+
+        return JDocumentPayload(root: documentNode, baseUri: baseUri)
+    }
+
+    /// Finds the `>` that closes a tag, skipping `>` inside quoted attribute
+    /// values. `start` is the index of the opening `<`.
+    private static func tagEnd(in text: String, from start: String.Index) -> String.Index? {
+        var index = text.index(after: start)
+        var quote: Character?
+        while index < text.endIndex {
+            let character = text[index]
+            if let current = quote {
+                if character == current { quote = nil }
+            } else if character == "\"" || character == "'" {
+                quote = character
+            } else if character == ">" {
+                return index
+            }
+            index = text.index(after: index)
+        }
+        return nil
+    }
+
+    /// jsoup's XML tree builder (`Parser.xmlParser()`): no implied
+    /// `html`/`head`/`body` wrappers, tags keep their source case, elements are
+    /// never void or auto-closed, and `<tag/>` self-closes.
+    static func parseXML(_ xml: String, baseUri: String) -> JDocumentPayload {
+        let documentNode = JNode(kind: .document)
+        var stack: [JNode] = [documentNode]
+        var index = xml.startIndex
+
+        func parent() -> JNode { stack.last ?? documentNode }
+        func appendText(_ raw: String) {
+            guard !raw.isEmpty else { return }
+            let node = JNode(kind: .text, text: decodeEntities(raw))
+            node.parent = parent()
+            parent().children.append(node)
+        }
+
+        while index < xml.endIndex {
+            guard let open = xml[index...].firstIndex(of: "<") else {
+                appendText(String(xml[index...]))
+                break
+            }
+            appendText(String(xml[index..<open]))
+            index = open
+            let remainder = xml[index...]
+            if remainder.hasPrefix("<!--") {
+                if let end = xml.range(of: "-->", range: index..<xml.endIndex) {
+                    let text = String(xml[xml.index(index, offsetBy: 4)..<end.lowerBound])
+                    let node = JNode(kind: .comment, text: text)
+                    node.parent = parent()
+                    parent().children.append(node)
+                    index = end.upperBound
+                    continue
+                }
+                break
+            }
+            if remainder.hasPrefix("<![CDATA[") {
+                if let end = xml.range(of: "]]>", range: index..<xml.endIndex) {
+                    let text = String(xml[xml.index(index, offsetBy: 9)..<end.lowerBound])
+                    if !text.isEmpty {
+                        let node = JNode(kind: .text, text: text)
+                        node.parent = parent()
+                        parent().children.append(node)
+                    }
+                    index = end.upperBound
+                    continue
+                }
+                break
+            }
+            if remainder.hasPrefix("<!") || remainder.hasPrefix("<?") {
+                guard let end = tagEnd(in: xml, from: index) else { break }
+                index = xml.index(after: end)
+                continue
+            }
+            if remainder.hasPrefix("</") {
+                guard let end = tagEnd(in: xml, from: index) else { break }
+                let name = String(xml[xml.index(index, offsetBy: 2)..<end])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let target = stack.lastIndex(where: { $0 !== documentNode && $0.tag == name }) {
+                    stack.removeSubrange(target..<stack.count)
+                }
+                index = xml.index(after: end)
+                continue
+            }
+            guard let end = tagEnd(in: xml, from: index) else { break }
+            let rawTag = String(xml[xml.index(after: index)..<end])
+            let selfClosing = rawTag.hasSuffix("/")
+            let content = selfClosing ? String(rawTag.dropLast()) : rawTag
+            let tokenizer = TagTokenizer(content)
+            guard !tokenizer.name.isEmpty else {
+                index = xml.index(after: index)
+                continue
+            }
+            let element = JNode(kind: .element, tag: tokenizer.name, attributes: tokenizer.attributes)
+            element.parent = parent()
+            parent().children.append(element)
+            index = xml.index(after: end)
+            if !selfClosing { stack.append(element) }
         }
 
         return JDocumentPayload(root: documentNode, baseUri: baseUri)
@@ -1276,6 +1433,7 @@ enum JsoupRuntime {
         result += htmlClasses()
         result += elementClasses().flatMap { $0 }
         result += elementsClasses().flatMap { $0 }
+        result += attributeClasses().flatMap { $0 }
         result += textNodeClasses().flatMap { $0 }
         result += attributesClasses().flatMap { $0 }
         result += parseClasses().flatMap { $0 }
@@ -1330,6 +1488,29 @@ enum JsoupRuntime {
             }
             return args[0]
         }
+        document.method("createElement", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            let payload: JElementPayload? = runtime.payload(args[0], as: JElementPayload.self)
+            let node = JNode(kind: .element, tag: (runtime.stringValue(args[1]) ?? "").lowercased())
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload?.document ?? JsoupHTML.parse("", baseUri: "")))
+        }
+        document.method("setBaseUri", "(Ljava/lang/String;)V") { runtime, args, _ in
+            if let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) {
+                payload.document.baseUri = runtime.stringValue(args[1]) ?? ""
+            }
+            return .zero
+        }
+        document.method("select", "(Lorg/jsoup/select/Evaluator;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let selector = runtime.payload(args[1], as: JEvaluatorPayload.self)?.selector ?? ""
+            let nodes = try JsoupSelector.select(payload.node, selector: selector, runtime: runtime)
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        document.method("selectFirst", "(Lorg/jsoup/select/Evaluator;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let selector = runtime.payload(args[1], as: JEvaluatorPayload.self)?.selector ?? ""
+            guard let node = try JsoupSelector.select(payload.node, selector: selector, runtime: runtime).first else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload.document))
+        }
 
         let node = NativeClass("Lorg/jsoup/nodes/Node;", superclass: "Ljava/lang/Object;")
         node.method("nodeName", "()Ljava/lang/String;") { runtime, args, _ in
@@ -1352,6 +1533,20 @@ enum JsoupRuntime {
         node.method("ownerDocument", "()Lorg/jsoup/nodes/Document;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: payload.document.root, document: payload.document))
+        }
+        node.method("nextSibling", "()Lorg/jsoup/nodes/Node;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let sibling = payload.node.nextSiblingNode else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Node;", payload: JElementPayload(node: sibling, document: payload.document))
+        }
+        node.method("previousSibling", "()Lorg/jsoup/nodes/Node;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let sibling = payload.node.previousSiblingNode else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Node;", payload: JElementPayload(node: sibling, document: payload.document))
+        }
+        node.method("siblingIndex", "()I") { runtime, args, _ in
+            let payload: JElementPayload? = runtime.payload(args[0], as: JElementPayload.self)
+            return .int32(Int32(payload?.node.siblingIndex ?? 0))
         }
         node.method("baseUri", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
@@ -1541,6 +1736,85 @@ enum JsoupRuntime {
                   let sibling = JsoupSelector.previousElementPublic(payload.node) else { return .null }
             return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: sibling, document: payload.document))
         }
+        element.method("nextElementSiblings", "()Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            var siblings: [JNode] = []
+            var cursor = JsoupSelector.nextElement(payload.node)
+            while let node = cursor {
+                siblings.append(node)
+                cursor = JsoupSelector.nextElement(node)
+            }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: siblings, document: payload.document))
+        }
+        element.method("previousElementSiblings", "()Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            var siblings: [JNode] = []
+            var cursor = JsoupSelector.previousElementPublic(payload.node)
+            while let node = cursor {
+                siblings.append(node)
+                cursor = JsoupSelector.previousElementPublic(node)
+            }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: siblings, document: payload.document))
+        }
+        element.method("siblingIndex", "()I") { runtime, args, _ in
+            let payload: JElementPayload? = runtime.payload(args[0], as: JElementPayload.self)
+            return .int32(Int32(payload?.node.siblingIndex ?? 0))
+        }
+        element.method("closest", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let selector = runtime.stringValue(args[1]) ?? ""
+            var cursor: JNode? = payload.node
+            while let node = cursor {
+                if node.isElement, try JsoupSelector.matches(node, selector: selector, runtime: runtime) {
+                    return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload.document))
+                }
+                cursor = node.parent
+            }
+            return .null
+        }
+        element.method("textNodes", "()Ljava/util/List;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let values = payload.node.children
+                .filter { $0.kind == .text || $0.kind == .data }
+                .map { runtime.makeNative("Lorg/jsoup/nodes/TextNode;", payload: JElementPayload(node: $0, document: payload.document)) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+        }
+        element.method("childNodes", "()Ljava/util/List;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let values = payload.node.children.map { node in
+                runtime.makeNative("Lorg/jsoup/nodes/Node;", payload: JElementPayload(node: node, document: payload.document))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+        }
+        element.method("attributes", "()Lorg/jsoup/nodes/Attributes;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Attributes;", payload: payload)
+        }
+        element.method("dataset", "()Ljava/util/Map;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let entries = payload.node.attributes.compactMap { (name, value) -> (VMValue, VMValue)? in
+                guard name.lowercased().hasPrefix("data-") else { return nil }
+                return (runtime.newString(String(name.dropFirst(5))), runtime.newString(value))
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        element.method("getAllElements", "()Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let nodes = [payload.node] + payload.node.descendants()
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsContainingText", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let needle = (runtime.stringValue(args[1]) ?? "").lowercased()
+            let nodes = payload.node.descendants().filter { $0.textContent().lowercased().contains(needle) }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("wholeOwnText", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            var output = ""
+            for child in payload.node.children where child.kind == .text || child.kind == .data { output += child.text }
+            return runtime.newString(output)
+        }
         element.method("siblings", "()Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let siblings = (payload.node.parent?.elementChildren ?? []).filter { $0 !== payload.node }
@@ -1579,7 +1853,7 @@ enum JsoupRuntime {
         element.method("getElementsByTag", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let tag = (runtime.stringValue(args[1]) ?? "").lowercased()
-            let nodes = payload.node.descendants().filter { $0.tag == tag }
+            let nodes = payload.node.descendants().filter { $0.tag.lowercased() == tag }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByClass", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
@@ -1596,6 +1870,61 @@ enum JsoupRuntime {
             let nodes = payload.node.descendants().filter { $0.attribute(name) != nil }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
+        element.method("getElementsByAttributeStarting", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let prefix = (runtime.stringValue(args[1]) ?? "").lowercased()
+            let nodes = payload.node.descendants().filter { node in
+                node.attributes.contains { $0.0.lowercased().hasPrefix(prefix) }
+            }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsByAttributeValue", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            let nodes = payload.node.descendants().filter { $0.attribute(name) == value }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsByAttributeValueNot", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "") != value }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsByAttributeValueContaining", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "").contains(value) }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsByAttributeValueStarting", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "").hasPrefix(value) }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsByAttributeValueEnding", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "").hasSuffix(value) }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("getElementsByAttributeValueMatching", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            guard let expression = try? NSRegularExpression(pattern: runtime.stringValue(args[2]) ?? "") else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+            }
+            let nodes = payload.node.descendants().filter { node in
+                guard let value = node.attribute(name) else { return false }
+                return expression.firstMatch(in: value, range: NSRange(value.startIndex..<value.endIndex, in: value)) != nil
+            }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
         element.method("append", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return args[0] }
             let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
@@ -1607,15 +1936,161 @@ enum JsoupRuntime {
             }
             return args[0]
         }
-        element.method("prepend", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in args[0] }
+        element.method("prepend", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return args[0] }
+            let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
+            if let body = parsed.root.descendants().first(where: { $0.tag == "body" }) {
+                for child in body.children.reversed() {
+                    child.parent = payload.node
+                    payload.node.children.insert(child, at: 0)
+                }
+            }
+            return args[0]
+        }
         element.method("empty", "()Lorg/jsoup/nodes/Element;") { runtime, args, _ in
             if let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) { payload.node.children.removeAll() }
             return args[0]
         }
-        element.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in .boolean(args[0].bits == args[1].bits) }
-        element.method("hashCode", "()I") { _, args, _ in
-            guard let pointer = args[0].object else { return .int32(0) }
-            return .int32(Int32(bitPattern: UInt32(truncatingIfNeeded: UInt(bitPattern: pointer) >> 4)))
+        element.method("text", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return args[0] }
+            payload.node.children.removeAll()
+            let text = JNode(kind: .text, text: runtime.stringValue(args[1]) ?? "")
+            text.parent = payload.node
+            payload.node.children.append(text)
+            return args[0]
+        }
+        element.method("before", "(Lorg/jsoup/nodes/Node;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let other: JElementPayload = runtime.payload(args[1], as: JElementPayload.self),
+                  let parent = payload.node.parent else { return args[0] }
+            JsoupRuntime.detach(other.node)
+            let index = parent.children.firstIndex { $0 === payload.node } ?? parent.children.count
+            other.node.parent = parent
+            parent.children.insert(other.node, at: index)
+            return args[0]
+        }
+        element.method("before", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let parent = payload.node.parent else { return args[0] }
+            let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
+            guard let body = parsed.root.descendants().first(where: { $0.tag == "body" }) else { return args[0] }
+            let index = parent.children.firstIndex { $0 === payload.node } ?? parent.children.count
+            for (offset, child) in body.children.enumerated() {
+                child.parent = parent
+                parent.children.insert(child, at: index + offset)
+            }
+            return args[0]
+        }
+        element.method("after", "(Lorg/jsoup/nodes/Node;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let other: JElementPayload = runtime.payload(args[1], as: JElementPayload.self),
+                  let parent = payload.node.parent else { return args[0] }
+            JsoupRuntime.detach(other.node)
+            let index = parent.children.firstIndex { $0 === payload.node } ?? parent.children.count
+            other.node.parent = parent
+            parent.children.insert(other.node, at: min(index + 1, parent.children.count))
+            return args[0]
+        }
+        element.method("after", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let parent = payload.node.parent else { return args[0] }
+            let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
+            guard let body = parsed.root.descendants().first(where: { $0.tag == "body" }) else { return args[0] }
+            let index = (parent.children.firstIndex { $0 === payload.node } ?? parent.children.count) + 1
+            for (offset, child) in body.children.enumerated() {
+                child.parent = parent
+                parent.children.insert(child, at: index + offset)
+            }
+            return args[0]
+        }
+        element.method("replaceWith", "(Lorg/jsoup/nodes/Node;)V") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let other: JElementPayload = runtime.payload(args[1], as: JElementPayload.self),
+                  let parent = payload.node.parent else { return .zero }
+            JsoupRuntime.detach(other.node)
+            let index = parent.children.firstIndex { $0 === payload.node } ?? parent.children.count
+            other.node.parent = parent
+            parent.children.insert(other.node, at: index)
+            JsoupRuntime.detach(payload.node)
+            return .zero
+        }
+        element.method("wrap", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return args[0] }
+            let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
+            guard let body = parsed.root.descendants().first(where: { $0.tag == "body" }),
+                  let wrapper = body.elementChildren.first else { return args[0] }
+            let parent = payload.node.parent
+            let index = payload.node.siblingIndex
+            JsoupRuntime.detach(payload.node)
+            if let parent, index >= 0 {
+                wrapper.parent = parent
+                parent.children.insert(wrapper, at: min(index, parent.children.count))
+            }
+            var deepest = wrapper
+            while let child = deepest.elementChildren.first {
+                deepest = child
+            }
+            payload.node.parent = deepest
+            deepest.children.append(payload.node)
+            return args[0]
+        }
+        element.method("unwrap", "()Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let parent = payload.node.parent else { return args[0] }
+            let index = parent.children.firstIndex { $0 === payload.node } ?? parent.children.count
+            let children = payload.node.children
+            payload.node.children.removeAll()
+            for (offset, child) in children.enumerated() {
+                child.parent = parent
+                parent.children.insert(child, at: index + offset)
+            }
+            JsoupRuntime.detach(payload.node)
+            return args[0]
+        }
+        element.method("insertChildren", "(ILjava/util/Collection;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return args[0] }
+            let requested = Int(args[1].asInt32)
+            guard requested >= 0, requested <= payload.node.children.count else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+            }
+            var insertions: [JNode] = []
+            for value in runtime.listPayload(args[2])?.items ?? [] {
+                if let child: JElementPayload = runtime.payload(value, as: JElementPayload.self) {
+                    insertions.append(child.node)
+                }
+            }
+            for node in insertions { JsoupRuntime.detach(node) }
+            let index = min(requested, payload.node.children.count)
+            payload.node.children.insert(contentsOf: insertions, at: index)
+            for node in insertions { node.parent = payload.node }
+            return args[0]
+        }
+        element.method("clone", "()Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: payload.node.deepCopy(), document: payload.document))
+        }
+        element.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let left: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let right: JElementPayload = runtime.payload(args[1], as: JElementPayload.self) else {
+                return .boolean(args[0].bits == args[1].bits)
+            }
+            return .boolean(left.node === right.node)
+        }
+        element.method("hashCode", "()I") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .int32(0) }
+            return .int32(Int32(truncatingIfNeeded: ObjectIdentifier(payload.node).hashValue))
+        }
+        element.method("select", "(Lorg/jsoup/select/Evaluator;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let selector = runtime.payload(args[1], as: JEvaluatorPayload.self)?.selector ?? ""
+            let nodes = try JsoupSelector.select(payload.node, selector: selector, runtime: runtime)
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        element.method("selectFirst", "(Lorg/jsoup/select/Evaluator;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let selector = runtime.payload(args[1], as: JEvaluatorPayload.self)?.selector ?? ""
+            guard let node = try JsoupSelector.select(payload.node, selector: selector, runtime: runtime).first else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload.document))
         }
     }
 
@@ -1685,14 +2160,86 @@ enum JsoupRuntime {
             for node in payload.nodes { node.setAttribute(name, value) }
             return args[0]
         }
-        elements.method("remove", "()V") { runtime, args, _ in
-            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .zero }
+        elements.method("remove", "()Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return args[0] }
             for node in payload.nodes {
                 if let parent = node.parent, let index = parent.children.firstIndex(where: { $0 === node }) {
                     parent.children.remove(at: index)
                 }
             }
-            return .zero
+            return args[0]
+        }
+        elements.method("not", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
+            let selector = runtime.stringValue(args[1]) ?? ""
+            var nodes: [JNode] = []
+            for node in payload.nodes {
+                if try JsoupSelector.matches(node, selector: selector, runtime: runtime) { continue }
+                nodes.append(node)
+            }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        elements.method("hasClass", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .boolean(false) }
+            let name = runtime.stringValue(args[1]) ?? ""
+            return .boolean(payload.nodes.contains { node in
+                (node.attribute("class") ?? "").split(whereSeparator: { $0.isWhitespace }).contains(Substring(name))
+            })
+        }
+        elements.method("eachAttr", "(Ljava/lang/String;)Ljava/util/List;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            let resolved = name.hasPrefix("abs:") ? String(name.dropFirst(4)) : name
+            var values: [VMValue] = []
+            for node in payload.nodes {
+                guard let raw = node.attribute(resolved) else { continue }
+                let value = name.hasPrefix("abs:") ? JsoupHTML.absoluteUrl(raw, base: payload.document.baseUri) : raw
+                values.append(runtime.newString(value))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+        }
+        elements.method("selectFirst", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
+            let selector = runtime.stringValue(args[1]) ?? ""
+            for root in payload.nodes {
+                if let node = try JsoupSelector.select(root, selector: selector, runtime: runtime).first {
+                    return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload.document))
+                }
+            }
+            return .null
+        }
+        elements.method("select", "(Lorg/jsoup/select/Evaluator;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
+            let selector = runtime.payload(args[1], as: JEvaluatorPayload.self)?.selector ?? ""
+            var nodes: [JNode] = []
+            for root in payload.nodes { nodes.append(contentsOf: try JsoupSelector.select(root, selector: selector, runtime: runtime)) }
+            return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
+        }
+        elements.method("append", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return args[0] }
+            let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
+            guard let body = parsed.root.descendants().first(where: { $0.tag == "body" }) else { return args[0] }
+            for node in payload.nodes {
+                for child in body.children {
+                    let copy = child.deepCopy()
+                    copy.parent = node
+                    node.children.append(copy)
+                }
+            }
+            return args[0]
+        }
+        elements.method("prepend", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return args[0] }
+            let parsed = JsoupHTML.parse(runtime.stringValue(args[1]) ?? "", baseUri: payload.document.baseUri)
+            guard let body = parsed.root.descendants().first(where: { $0.tag == "body" }) else { return args[0] }
+            for node in payload.nodes {
+                for child in body.children.reversed() {
+                    let copy = child.deepCopy()
+                    copy.parent = node
+                    node.children.insert(copy, at: 0)
+                }
+            }
+            return args[0]
         }
         elements.method("addClass", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return args[0] }
@@ -1757,19 +2304,116 @@ enum JsoupRuntime {
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             return runtime.newString(payload.node.attribute(runtime.stringValue(args[1]) ?? "") ?? "")
         }
+        attributes.method("hasKey", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .boolean(false) }
+            return .boolean(payload.node.attribute(runtime.stringValue(args[1]) ?? "") != nil)
+        }
+        attributes.method("put", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Attributes;") { runtime, args, _ in
+            if let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) {
+                payload.node.setAttribute(runtime.stringValue(args[1]) ?? "", runtime.stringValue(args[2]) ?? "")
+            }
+            return args[0]
+        }
+        attributes.method("remove", "(Ljava/lang/String;)V") { runtime, args, _ in
+            if let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) {
+                payload.node.removeAttribute(runtime.stringValue(args[1]) ?? "")
+            }
+            return .zero
+        }
         attributes.method("size", "()I") { runtime, args, _ in
             let payload: JElementPayload? = runtime.payload(args[0], as: JElementPayload.self)
             return .int32(Int32(payload?.node.attributes.count ?? 0))
         }
-        attributes.method("html", "()Ljava/lang/String;") { _, _, _ in .null }
+        attributes.method("asList", "()Ljava/util/List;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let values = payload.node.attributes.map { (name, _) in
+                runtime.makeNative("Lorg/jsoup/nodes/Attribute;", payload: JAttributePayload(node: payload.node, name: name))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+        }
+        attributes.method("keys", "()Ljava/util/Set;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(payload.node.attributes.map { runtime.newString($0.0) }))
+        }
+        attributes.method("html", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let html = payload.node.attributes.map { " \($0.0)=\"\(JsoupHTML.escape($0.1))\"" }.joined()
+            return runtime.newString(html)
+        }
         return [[elements, attributes]]
+    }
+
+    /// jsoup `Attribute`: a live view over one attribute of its owner element.
+    private static func attributeClasses() -> [[NativeClass]] {
+        let attribute = NativeClass("Lorg/jsoup/nodes/Attribute;", superclass: "Ljava/lang/Object;")
+        attribute.method("<init>", "(Ljava/lang/String;Ljava/lang/String;)V") { runtime, args, _ in
+            let node = JNode(kind: .element, tag: "")
+            node.setAttribute(runtime.stringValue(args[1]) ?? "", runtime.stringValue(args[2]) ?? "")
+            runtime.setPayload(args[0], JAttributePayload(node: node, name: runtime.stringValue(args[1]) ?? ""))
+            return .zero
+        }
+        attribute.method("getKey", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: JAttributePayload.self)?.name ?? "")
+        }
+        attribute.method("getValue", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JAttributePayload = runtime.payload(args[0], as: JAttributePayload.self) else { return .null }
+            return runtime.newString(payload.node.attribute(payload.name) ?? "")
+        }
+        attribute.method("setValue", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JAttributePayload = runtime.payload(args[0], as: JAttributePayload.self) else { return .null }
+            let previous = payload.node.attribute(payload.name) ?? ""
+            payload.node.setAttribute(payload.name, runtime.stringValue(args[1]) ?? "")
+            return runtime.newString(previous)
+        }
+        attribute.method("html", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JAttributePayload = runtime.payload(args[0], as: JAttributePayload.self) else { return .null }
+            return runtime.newString("\(payload.name)=\"\(JsoupHTML.escape(payload.node.attribute(payload.name) ?? ""))\"")
+        }
+        attribute.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JAttributePayload = runtime.payload(args[0], as: JAttributePayload.self) else { return .null }
+            return runtime.newString("\(payload.name)=\"\(payload.node.attribute(payload.name) ?? "")\"")
+        }
+        return [[attribute]]
     }
 
     private static func textNodeClasses() -> [[NativeClass]] {
         let text = NativeClass("Lorg/jsoup/nodes/TextNode;", superclass: "Lorg/jsoup/nodes/Node;")
+        text.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            let node = JNode(kind: .text, text: runtime.stringValue(args[1]) ?? "")
+            runtime.setPayload(args[0], JElementPayload(node: node, document: JsoupHTML.parse("", baseUri: "")))
+            return .zero
+        }
         text.method("text", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
-            return runtime.newString(payload.node.textContent())
+            return runtime.newString(payload.node.text)
+        }
+        text.method("text", "(Ljava/lang/String;)Lorg/jsoup/nodes/TextNode;") { runtime, args, _ in
+            if let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) {
+                payload.node.text = runtime.stringValue(args[1]) ?? ""
+            }
+            return args[0]
+        }
+        text.method("getWholeText", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            return runtime.newString(payload.node.text)
+        }
+        text.method("wholeText", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            return runtime.newString(payload.node.text)
+        }
+        text.method("isBlank", "()Z") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .boolean(true) }
+            return .boolean(payload.node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        text.method("nextElementSibling", "()Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let sibling = JsoupSelector.nextElement(payload.node) else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: sibling, document: payload.document))
+        }
+        text.method("previousElementSibling", "()Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
+                  let sibling = JsoupSelector.previousElementPublic(payload.node) else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: sibling, document: payload.document))
         }
         return [[text]]
     }
@@ -1788,17 +2432,33 @@ enum JsoupRuntime {
         tag.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: String.self) ?? "")
         }
+        tag.method("normalName", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString((runtime.payload(args[0], as: String.self) ?? "").lowercased())
+        }
         tag.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: String.self) ?? "")
         }
+
         let parser = NativeClass("Lorg/jsoup/parser/Parser;")
+        parser.staticMethod("htmlParser", "()Lorg/jsoup/parser/Parser;") { runtime, _, _ in
+            runtime.makeNative("Lorg/jsoup/parser/Parser;", payload: JParserPayload(xml: false))
+        }
+        parser.staticMethod("xmlParser", "()Lorg/jsoup/parser/Parser;") { runtime, _, _ in
+            runtime.makeNative("Lorg/jsoup/parser/Parser;", payload: JParserPayload(xml: true))
+        }
         parser.staticMethod("unescapeEntities", "(Ljava/lang/String;Z)Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(JsoupHTML.decodeEntities(runtime.stringValue(args[0]) ?? ""))
         }
-        parser.staticMethod("parse", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
-            let document = JsoupHTML.parse(runtime.stringValue(args[0]) ?? "", baseUri: runtime.stringValue(args[1]) ?? "")
+        parser.method("parse", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
+            let document = try parseDocument(
+                runtime,
+                html: runtime.stringValue(args[1]) ?? "",
+                baseUri: runtime.stringValue(args[2]) ?? "",
+                parser: args[0]
+            )
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
         }
+
         let jsoup = NativeClass("Lorg/jsoup/Jsoup;")
         jsoup.staticMethod("parse", "(Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
             let html = runtime.stringValue(args[0]) ?? ""
@@ -1811,11 +2471,32 @@ enum JsoupRuntime {
             let document = JsoupHTML.parse(html, baseUri: baseUri)
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
         }
+        jsoup.staticMethod("parse", "(Ljava/lang/String;Ljava/lang/String;Lorg/jsoup/parser/Parser;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
+            let document = try parseDocument(
+                runtime,
+                html: runtime.stringValue(args[0]) ?? "",
+                baseUri: runtime.stringValue(args[1]) ?? "",
+                parser: args[2]
+            )
+            return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
+        }
         jsoup.staticMethod("parse", "(Ljava/io/InputStream;Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
             let data: Data = runtime.payload(args[0], as: Data.self) ?? Data()
             let charset = runtime.stringValue(args[1]) ?? "UTF-8"
             let html = runtime.decode(bytes: Array(data), charset: charset)
             let document = JsoupHTML.parse(html, baseUri: runtime.stringValue(args[2]) ?? "")
+            return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
+        }
+        jsoup.staticMethod("parse", "(Ljava/io/InputStream;Ljava/lang/String;Ljava/lang/String;Lorg/jsoup/parser/Parser;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
+            let data: Data = runtime.payload(args[0], as: Data.self) ?? Data()
+            let charset = runtime.stringValue(args[1]) ?? "UTF-8"
+            let html = runtime.decode(bytes: Array(data), charset: charset)
+            let document = try parseDocument(
+                runtime,
+                html: html,
+                baseUri: runtime.stringValue(args[2]) ?? "",
+                parser: args[3]
+            )
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
         }
         jsoup.staticMethod("parseBodyFragment", "(Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
@@ -1829,7 +2510,89 @@ enum JsoupRuntime {
         jsoup.staticMethod("unescapeEntities", "(Ljava/lang/String;Z)Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(JsoupHTML.decodeEntities(runtime.stringValue(args[0]) ?? ""))
         }
-        return [[tag], [parser], [jsoup]]
+
+        let entities = NativeClass("Lorg/jsoup/nodes/Entities;", superclass: "Ljava/lang/Object;")
+        entities.staticMethod("unescape", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(JsoupHTML.decodeEntities(runtime.stringValue(args[0]) ?? ""))
+        }
+        entities.staticMethod("escape", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(JsoupHTML.escape(runtime.stringValue(args[0]) ?? ""))
+        }
+
+        let validate = NativeClass("Lorg/jsoup/helper/Validate;", superclass: "Ljava/lang/Object;")
+        validate.staticMethod("notNull", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            guard runtime.isObjectValue(args[0]) else { throw VMJavaException("Ljava/lang/IllegalArgumentException;") }
+            return .zero
+        }
+        validate.staticMethod("notNull", "(Ljava/lang/Object;Ljava/lang/String;)V") { runtime, args, _ in
+            guard runtime.isObjectValue(args[0]) else { throw VMJavaException("Ljava/lang/IllegalArgumentException;") }
+            return .zero
+        }
+        validate.staticMethod("notEmpty", "(Ljava/lang/String;)V") { runtime, args, _ in
+            guard let value = runtime.stringValue(args[0]), !value.isEmpty else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+            }
+            return .zero
+        }
+        validate.staticMethod("notEmpty", "(Ljava/lang/String;Ljava/lang/String;)V") { runtime, args, _ in
+            guard let value = runtime.stringValue(args[0]), !value.isEmpty else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+            }
+            return .zero
+        }
+
+        let evaluator = NativeClass("Lorg/jsoup/select/Evaluator;", superclass: "Ljava/lang/Object;")
+        let evaluatorTag = NativeClass("Lorg/jsoup/select/Evaluator$Tag;", superclass: "Lorg/jsoup/select/Evaluator;")
+        evaluatorTag.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], JEvaluatorPayload(runtime.stringValue(args[1]) ?? ""))
+            return .zero
+        }
+        let evaluatorClass = NativeClass("Lorg/jsoup/select/Evaluator$Class;", superclass: "Lorg/jsoup/select/Evaluator;")
+        evaluatorClass.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], JEvaluatorPayload("." + (runtime.stringValue(args[1]) ?? "")))
+            return .zero
+        }
+        let evaluatorId = NativeClass("Lorg/jsoup/select/Evaluator$Id;", superclass: "Lorg/jsoup/select/Evaluator;")
+        evaluatorId.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], JEvaluatorPayload("#" + (runtime.stringValue(args[1]) ?? "")))
+            return .zero
+        }
+
+        let collector = NativeClass("Lorg/jsoup/select/Collector;", superclass: "Ljava/lang/Object;")
+        collector.staticMethod("findFirst", "(Lorg/jsoup/select/Evaluator;Lorg/jsoup/nodes/Element;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
+            guard let root: JElementPayload = runtime.payload(args[1], as: JElementPayload.self) else { return .null }
+            guard let selector = runtime.payload(args[0], as: JEvaluatorPayload.self)?.selector else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            guard let node = try JsoupSelector.select(root.node, selector: selector, runtime: runtime).first else { return .null }
+            return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: root.document))
+        }
+
+        let queryParser = NativeClass("Lorg/jsoup/select/QueryParser;", superclass: "Ljava/lang/Object;")
+        queryParser.staticMethod("parse", "(Ljava/lang/String;)Lorg/jsoup/select/Evaluator;") { runtime, args, _ in
+            runtime.makeNative("Lorg/jsoup/select/Evaluator;", payload: JEvaluatorPayload(runtime.stringValue(args[0]) ?? ""))
+        }
+
+        return [
+            [tag], [parser], [jsoup], [entities], [validate],
+            [evaluator], [evaluatorTag], [evaluatorClass], [evaluatorId],
+            [collector], [queryParser],
+        ]
+    }
+
+    /// Builds a document with the tree builder selected by a jsoup `Parser`.
+    private static func parseDocument(_ runtime: VMRuntime, html: String, baseUri: String, parser: VMValue) throws -> JDocumentPayload {
+        guard let config: JParserPayload = runtime.payload(parser, as: JParserPayload.self) else {
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+        }
+        return config.xml ? JsoupHTML.parseXML(html, baseUri: baseUri) : JsoupHTML.parse(html, baseUri: baseUri)
+    }
+
+    /// Detaches `node` from its parent, like jsoup's `Node.remove()`.
+    private static func detach(_ node: JNode) {
+        guard let parent = node.parent, let index = parent.children.firstIndex(where: { $0 === node }) else { return }
+        parent.children.remove(at: index)
+        node.parent = nil
     }
 
     static func string(_ runtime: VMRuntime, _ value: VMValue, _ keyPath: KeyPath<JNode, String>) -> VMValue {

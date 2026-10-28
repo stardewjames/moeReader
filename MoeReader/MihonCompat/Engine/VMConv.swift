@@ -525,7 +525,20 @@ enum JavaShared {
 
     private static func charsetClass() -> NativeClass {
         let cls = NativeClass("Ljava/nio/charset/Charset;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Comparable;"])
+        for name in ["UTF_8", "UTF_16", "UTF_16BE", "UTF_16LE", "ISO_8859_1", "US_ASCII"] {
+            cls.staticField(name, "Ljava/nio/charset/Charset;")
+        }
+        cls.prepare = { runtime, cls in
+            let names = ["UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE", "ISO-8859-1", "US-ASCII"]
+            for (index, name) in names.enumerated() {
+                cls.staticValues[index] = runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: name))
+            }
+        }
         cls.method("name", "()Ljava/lang/String;") { runtime, args, _ in
+            let charset: VMCharset? = runtime.payload(args[0], as: VMCharset.self)
+            return runtime.newString(charset?.name ?? "UTF-8")
+        }
+        cls.method("displayName", "()Ljava/lang/String;") { runtime, args, _ in
             let charset: VMCharset? = runtime.payload(args[0], as: VMCharset.self)
             return runtime.newString(charset?.name ?? "UTF-8")
         }
@@ -533,8 +546,34 @@ enum JavaShared {
             let charset: VMCharset? = runtime.payload(args[0], as: VMCharset.self)
             return runtime.newString(charset?.name ?? "UTF-8")
         }
-        cls.method("forName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;") { runtime, args, _ in
-            runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: runtime.stringValue(args[0]) ?? "UTF-8"))
+        cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/nio/charset/Charset;" else {
+                return .boolean(false)
+            }
+            return .boolean(runtime.charsetName(args[0]).uppercased() == runtime.charsetName(args[1]).uppercased())
+        }
+        cls.method("hashCode", "()I") { runtime, args, _ in
+            .int32(runtime.stringHash(runtime.newString(runtime.charsetName(args[0]))))
+        }
+        cls.method("canEncode", "()Z") { _, _, _ in .boolean(true) }
+        cls.method("newDecoder", "()Ljava/nio/charset/CharsetDecoder;") { runtime, args, _ in
+            runtime.makeNative("Ljava/nio/charset/CharsetDecoder;", payload: VMCharset(name: runtime.charsetName(args[0])))
+        }
+        cls.method("newEncoder", "()Ljava/nio/charset/CharsetEncoder;") { runtime, args, _ in
+            runtime.makeNative("Ljava/nio/charset/CharsetEncoder;", payload: VMCharset(name: runtime.charsetName(args[0])))
+        }
+        cls.staticMethod("forName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let name = JavaUtil.canonicalCharset(text) else {
+                throw VMJavaException("Ljava/nio/charset/UnsupportedCharsetException;", text)
+            }
+            return runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: name))
+        }
+        cls.staticMethod("isSupported", "(Ljava/lang/String;)Z") { runtime, args, _ in
+            .boolean(JavaUtil.canonicalCharset(runtime.stringValue(args[0]) ?? "") != nil)
+        }
+        cls.staticMethod("defaultCharset", "()Ljava/nio/charset/Charset;") { runtime, _, _ in
+            runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: "UTF-8"))
         }
         return cls
     }
@@ -664,6 +703,15 @@ extension VMRuntime {
         return nil
     }
 
+    /// Raw slot value for a boxed primitive: `java.lang.Number` keeps its value
+    /// in the `value` slot, `Character`/`Boolean` in the payload word. Values
+    /// that are already primitive are returned unchanged, so array conversions
+    /// can accept both representations.
+    func unboxedPrimitive(_ value: VMValue) -> VMValue {
+        guard value.object != nil else { return value }
+        return VMValue(bits: value.asBoxedBits(self))
+    }
+
     func collectionToString(_ value: VMValue) -> VMValue {
         if let map = mapPayload(value) {
             let parts = map.entries.map { entry -> String in
@@ -725,6 +773,10 @@ extension VMRuntime {
             if leftString == rightString { return 0 }
             return leftString < rightString ? -1 : 1
         }
+        if let leftNumber = boxedNumber(left), let rightNumber = boxedNumber(right) {
+            if leftNumber == rightNumber { return 0 }
+            return leftNumber < rightNumber ? -1 : 1
+        }
         if let leftClass = classOf(left), let rightClass = classOf(right), leftClass === rightClass {
             if let method = leftClass.lookupVirtual(key: "compareTo(Ljava/lang/Object;)I") {
                 if let result = try? invoke(method, [left, right]) { return result.asInt32 }
@@ -734,6 +786,23 @@ extension VMRuntime {
         let b = stringValue(javaToString(right)) ?? ""
         if a == b { return 0 }
         return a < b ? -1 : 1
+    }
+
+    /// Ordering value of a boxed `java.lang.Number`. Comparing the `toString`
+    /// form instead would order `9` after `10`, so Kotlin's numeric sort paths
+    /// need this. Non-numeric values (and non-heap bits) answer nil.
+    func boxedNumber(_ value: VMValue) -> Double? {
+        guard isObjectValue(value), let descriptor = classOf(value)?.descriptor else { return nil }
+        switch descriptor {
+        case "Ljava/lang/Byte;", "Ljava/lang/Short;", "Ljava/lang/Integer;", "Ljava/lang/Long;":
+            return Double(Int64(bitPattern: value.asBoxedBits(self)))
+        case "Ljava/lang/Float;":
+            return Double(Float(bitPattern: UInt32(truncatingIfNeeded: value.asBoxedBits(self))))
+        case "Ljava/lang/Double;":
+            return Double(bitPattern: value.asBoxedBits(self))
+        default:
+            return nil
+        }
     }
 
     func sortList(_ listValue: VMValue, comparator: VMValue) throws {

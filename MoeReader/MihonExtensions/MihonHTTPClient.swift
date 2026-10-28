@@ -26,6 +26,11 @@ protocol MihonHTTPFetching: Sendable {
 }
 
 struct MihonHTTPClient: MihonHTTPFetching {
+    /// Headers the URLSession transport adds to every request. The encrypted
+    /// DNS path presents the same identity, so both read them from one place.
+    static let defaultUserAgent = "MoeReader/1.0 (iOS; MihonCompat)"
+    static let defaultAccept = "application/octet-stream, application/x-protobuf, application/json;q=0.9, */*;q=0.8"
+
     let session: URLSession
 
     init(
@@ -39,8 +44,8 @@ struct MihonHTTPClient: MihonHTTPFetching {
         configuration.httpCookieStorage = .shared
         configuration.httpShouldSetCookies = true
         configuration.httpAdditionalHeaders = [
-            "User-Agent": "MoeReader/1.0 (iOS; MihonCompat)",
-            "Accept": "application/octet-stream, application/x-protobuf, application/json;q=0.9, */*;q=0.8",
+            "User-Agent": Self.defaultUserAgent,
+            "Accept": Self.defaultAccept,
         ]
         self.session = URLSession(configuration: configuration)
     }
@@ -50,6 +55,9 @@ struct MihonHTTPClient: MihonHTTPFetching {
               scheme == "http" || scheme == "https",
               request.url.host() != nil else {
             throw MihonError.network("Unsupported URL: \(request.url.absoluteString)")
+        }
+        if DoHConfiguration.current().enabled {
+            return try await pinnedFetch(request)
         }
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
@@ -96,6 +104,48 @@ struct MihonHTTPClient: MihonHTTPFetching {
             statusCode: http.statusCode,
             headers: headers,
             url: http.url ?? request.url
+        )
+    }
+
+    /// The "Encrypted DNS" path: resolve the host through the DoH endpoint,
+    /// then talk to the resolved address with the hostname kept as SNI and
+    /// `Host`. Cookies come from the same shared jar the URLSession path uses.
+    /// A host without `Network` fails closed here; it never quietly reverts to
+    /// the system resolver.
+    private func pinnedFetch(_ request: MihonHTTPRequest) async throws -> MihonHTTPResponse {
+        var headers = request.headers.map { ($0.key, $0.value) }.sorted { $0.0 < $1.0 }
+        if PinnedHTTPHeaders.first("User-Agent", in: headers) == nil {
+            headers.append(("User-Agent", Self.defaultUserAgent))
+        }
+        if PinnedHTTPHeaders.first("Accept", in: headers) == nil {
+            headers.append(("Accept", Self.defaultAccept))
+        }
+        let pinned = PinnedHTTPRequest(
+            url: request.url,
+            method: request.method,
+            headers: headers,
+            body: request.body
+        )
+        let response: PinnedHTTPResponse
+        do {
+            response = try await PinnedHTTPClient.shared.sendAsync(pinned)
+        } catch let error as PinnedHTTPError {
+            throw MihonError.network(error.description)
+        }
+        if let maxBytes = request.maxBytes {
+            guard response.body.count <= maxBytes else {
+                throw MihonError.responseTooLarge(response.body.count)
+            }
+        }
+        var headerMap: [String: String] = [:]
+        for (name, value) in response.headers {
+            headerMap[name.lowercased()] = value
+        }
+        return MihonHTTPResponse(
+            data: response.body,
+            statusCode: response.statusCode,
+            headers: headerMap,
+            url: response.url
         )
     }
 }

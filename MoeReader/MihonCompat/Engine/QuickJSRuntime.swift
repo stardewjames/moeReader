@@ -120,10 +120,26 @@ enum QuickJSRuntime {
                 requested: nil
             )
         }
-        cls.method("execute", "([B)Ljava/lang/Object;") { _, _, _ in
-            throw VMJavaException(
-                exceptionDescriptor,
-                "QuickJS bytecode is engine-private; execute(String) or evaluate(String) instead"
+        // QuickJS bytecode is engine-private, so this host cannot emit it.
+        // Extensions only hand the result straight back to `execute(byte[])`,
+        // so the compiled form is the UTF-8 source, which that method runs in
+        // JavaScriptCore: compile-then-execute keeps its observable behaviour.
+        cls.method("compile", "(Ljava/lang/String;Ljava/lang/String;)[B") { runtime, args, _ in
+            guard args[1].bits != 0 else {
+                throw VMJavaException(exceptionDescriptor, "source == null")
+            }
+            return runtime.byteArrayValue([UInt8]((runtime.stringValue(args[1]) ?? "").utf8))
+        }
+        cls.method("execute", "([B)Ljava/lang/Object;") { runtime, args, _ in
+            guard args[1].bits != 0 else {
+                throw VMJavaException(exceptionDescriptor, "bytecode == null")
+            }
+            return try evaluate(
+                runtime,
+                receiver: args[0],
+                script: String(decoding: runtime.byteValues(args[1]), as: UTF8.self),
+                fileName: nil,
+                requested: nil
             )
         }
 

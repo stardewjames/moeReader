@@ -70,6 +70,20 @@ class VMViewPayload: @unchecked Sendable {
     var measuredHeight = 0
     var width = 0
     var height = 0
+    /// Padding as stored by `setPadding`/`setPaddingRelative`. The layout
+    /// direction is always LTR here, so start/end are also left/right.
+    var paddingStart: Int32 = 0
+    var paddingTop: Int32 = 0
+    var paddingEnd: Int32 = 0
+    var paddingBottom: Int32 = 0
+    var contentDescription: VMValue = .null
+    var clickListener: VMValue = .null
+    /// `setOnHierarchyChangeListener` state; the listener is never fired
+    /// because no child list is ever presented.
+    var hierarchyListener: VMValue = .null
+    /// The context the view was constructed with, so `getContext` returns the
+    /// same instance the extension passed in.
+    var context: VMValue = .null
 }
 
 /// `WebSettings` values. Every setter stores state and every getter reports
@@ -490,6 +504,25 @@ enum WebKitRuntime {
         runtime.payload(value, as: VMViewPayload.self)
     }
 
+    private static func setPadding(
+        _ runtime: VMRuntime,
+        _ value: VMValue,
+        start: Int32,
+        top: Int32,
+        end: Int32,
+        bottom: Int32
+    ) {
+        guard let payload = buildScope(runtime, value) else { return }
+        payload.paddingStart = start
+        payload.paddingTop = top
+        payload.paddingEnd = end
+        payload.paddingBottom = bottom
+    }
+
+    private static func groupScope(_ runtime: VMRuntime, _ value: VMValue) -> VMViewGroupPayload? {
+        runtime.payload(value, as: VMViewGroupPayload.self)
+    }
+
     private static func viewClasses() -> [NativeClass] {
         var result: [NativeClass] = []
         let view = NativeClass("Landroid/view/View;", superclass: "Ljava/lang/Object;")
@@ -502,11 +535,15 @@ enum WebKitRuntime {
             cls.staticValues[2] = .int32(8)
         }
         view.method("<init>", "(Landroid/content/Context;)V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMViewPayload())
+            let payload = VMViewPayload()
+            payload.context = args[1]
+            runtime.setPayload(args[0], payload)
             return .zero
         }
         view.method("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMViewPayload())
+            let payload = VMViewPayload()
+            payload.context = args[1]
+            runtime.setPayload(args[0], payload)
             return .zero
         }
         view.method("getId", "()I") { runtime, args, _ in
@@ -590,7 +627,71 @@ enum WebKitRuntime {
         view.method("requestLayout", "()V") { _, _, _ in .zero }
         view.method("invalidate", "()V") { _, _, _ in .zero }
         view.method("setBackgroundColor", "(I)V") { _, _, _ in .zero }
-        view.method("setPadding", "(IIII)V") { _, _, _ in .zero }
+        view.method("setPadding", "(IIII)V") { runtime, args, _ in
+            setPadding(
+                runtime,
+                args[0],
+                start: Int32(truncatingIfNeeded: args[1].asInt64),
+                top: Int32(truncatingIfNeeded: args[2].asInt64),
+                end: Int32(truncatingIfNeeded: args[3].asInt64),
+                bottom: Int32(truncatingIfNeeded: args[4].asInt64)
+            )
+            return .zero
+        }
+        view.method("setPaddingRelative", "(IIII)V") { runtime, args, _ in
+            setPadding(
+                runtime,
+                args[0],
+                start: Int32(truncatingIfNeeded: args[1].asInt64),
+                top: Int32(truncatingIfNeeded: args[2].asInt64),
+                end: Int32(truncatingIfNeeded: args[3].asInt64),
+                bottom: Int32(truncatingIfNeeded: args[4].asInt64)
+            )
+            return .zero
+        }
+        view.method("getPaddingStart", "()I") { runtime, args, _ in
+            .int32(buildScope(runtime, args[0])?.paddingStart ?? 0)
+        }
+        view.method("getPaddingLeft", "()I") { runtime, args, _ in
+            .int32(buildScope(runtime, args[0])?.paddingStart ?? 0)
+        }
+        view.method("getPaddingTop", "()I") { runtime, args, _ in
+            .int32(buildScope(runtime, args[0])?.paddingTop ?? 0)
+        }
+        view.method("getPaddingEnd", "()I") { runtime, args, _ in
+            .int32(buildScope(runtime, args[0])?.paddingEnd ?? 0)
+        }
+        view.method("getPaddingRight", "()I") { runtime, args, _ in
+            .int32(buildScope(runtime, args[0])?.paddingEnd ?? 0)
+        }
+        view.method("getPaddingBottom", "()I") { runtime, args, _ in
+            .int32(buildScope(runtime, args[0])?.paddingBottom ?? 0)
+        }
+        view.method("setContentDescription", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            buildScope(runtime, args[0])?.contentDescription = args[1]
+            return .zero
+        }
+        view.method("getContentDescription", "()Ljava/lang/CharSequence;") { runtime, args, _ in
+            buildScope(runtime, args[0])?.contentDescription ?? .null
+        }
+        // Nothing is ever drawn or clicked, so the listener is only stored and
+        // a touch is never dispatched to it.
+        view.method("setOnClickListener", "(Landroid/view/View$OnClickListener;)V") { runtime, args, _ in
+            buildScope(runtime, args[0])?.clickListener = args[1]
+            return .zero
+        }
+        view.method("getContext", "()Landroid/content/Context;") { runtime, args, _ in
+            buildScope(runtime, args[0])?.context ?? .null
+        }
+        view.method("getResources", "()Landroid/content/res/Resources;") { runtime, args, _ in
+            // `View` asks its context, exactly like the platform class.
+            if let context = buildScope(runtime, args[0])?.context, context.bits != 0,
+               let resources = runtime.callVirtual(context, "getResources()Landroid/content/res/Resources;", []) {
+                return resources
+            }
+            return runtime.makeNative("Landroid/content/res/Resources;", payload: VMResourcesPayload())
+        }
+        view.method("dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z") { _, _, _ in .boolean(false) }
         result.append(view)
 
         let viewParent = NativeClass(
@@ -604,15 +705,47 @@ enum WebKitRuntime {
 
         let group = NativeClass("Landroid/view/ViewGroup;", superclass: "Landroid/view/View;")
         group.method("addView", "(Landroid/view/View;)V") { runtime, args, _ in
+            groupScope(runtime, args[0])?.children.append(args[1])
             buildScope(runtime, args[1])?.parent = args[0]
             return .zero
         }
+        group.method("addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V") { runtime, args, _ in
+            groupScope(runtime, args[0])?.children.append(args[1])
+            let child = buildScope(runtime, args[1])
+            child?.parent = args[0]
+            child?.layoutParams = args[2]
+            return .zero
+        }
         group.method("removeView", "(Landroid/view/View;)V") { runtime, args, _ in
+            if let group = groupScope(runtime, args[0]),
+               let index = group.children.firstIndex(where: { $0.bits == args[1].bits }) {
+                group.children.remove(at: index)
+            }
             buildScope(runtime, args[1])?.parent = .null
             return .zero
         }
-        group.method("removeAllViews", "()V") { _, _, _ in .zero }
-        group.method("getChildCount", "()I") { _, _, _ in .int32(0) }
+        group.method("removeAllViews", "()V") { runtime, args, _ in
+            for child in groupScope(runtime, args[0])?.children ?? [] {
+                buildScope(runtime, child)?.parent = .null
+            }
+            groupScope(runtime, args[0])?.children.removeAll()
+            return .zero
+        }
+        group.method("getChildCount", "()I") { runtime, args, _ in
+            .int32(Int32(groupScope(runtime, args[0])?.children.count ?? 0))
+        }
+        // `ViewGroup.getChildAt` answers null for an index outside the list.
+        group.method("getChildAt", "(I)Landroid/view/View;") { runtime, args, _ in
+            let index = Int(Int32(truncatingIfNeeded: args[1].asInt64))
+            guard let children = groupScope(runtime, args[0])?.children,
+                  index >= 0, index < children.count else { return .null }
+            return children[index]
+        }
+        // No child is ever presented, so the callback is stored and never fired.
+        group.method("setOnHierarchyChangeListener", "(Landroid/view/ViewGroup$OnHierarchyChangeListener;)V") { runtime, args, _ in
+            buildScope(runtime, args[0])?.hierarchyListener = args[1]
+            return .zero
+        }
         result.append(group)
 
         let params = NativeClass("Landroid/view/ViewGroup$LayoutParams;", superclass: "Ljava/lang/Object;")
@@ -660,6 +793,28 @@ enum WebKitRuntime {
             .int32(Int32(truncatingIfNeeded: args[0].asInt64) & ~modeMask)
         }
         result.append(spec)
+
+        // Callback types the view methods above take. `View` owns them, so they
+        // are declared here; the extension supplies the implementations and no
+        // presentation ever invokes them.
+        let clickListener = NativeClass(
+            "Landroid/view/View$OnClickListener;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        clickListener.method("onClick", "(Landroid/view/View;)V") { _, _, _ in .zero }
+        result.append(clickListener)
+
+        let hierarchyListener = NativeClass(
+            "Landroid/view/ViewGroup$OnHierarchyChangeListener;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        hierarchyListener.method("onChildViewAdded", "(Landroid/view/View;Landroid/view/View;)V") { _, _, _ in .zero }
+        hierarchyListener.method("onChildViewRemoved", "(Landroid/view/View;Landroid/view/View;)V") { _, _, _ in .zero }
+        result.append(hierarchyListener)
         return result
     }
 
@@ -1056,7 +1211,7 @@ enum WebKitRuntime {
             "(Landroid/content/Context;Landroid/util/AttributeSet;II)V",
         ] {
             webView.method("<init>", signature) { runtime, args, _ in
-                try createWebView(runtime, into: args[0])
+                try createWebView(runtime, into: args[0], context: args[1])
                 return .zero
             }
         }
@@ -1197,10 +1352,11 @@ enum WebKitRuntime {
 
     // MARK: - WebView lifecycle
 
-    private static func createWebView(_ runtime: VMRuntime, into value: VMValue) throws {
+    private static func createWebView(_ runtime: VMRuntime, into value: VMValue, context: VMValue) throws {
         #if canImport(WebKit)
         let payload = VMWebViewPayload()
         payload.runtime = runtime
+        payload.context = context
         runtime.setPayload(value, payload)
         payload.selfValue = value
         let settingsValue = runtime.makeNative("Landroid/webkit/WebSettings;", payload: payload.settings)

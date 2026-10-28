@@ -188,6 +188,9 @@ final class MihonEngineHost: VMHost {
               url.host != nil else {
             throw VMJavaException("Ljava/io/IOException;", "unsupported URL: \(request.url)")
         }
+        if DoHConfiguration.current().enabled {
+            return try pinnedRequest(request, url: url)
+        }
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = request.method
         urlRequest.httpBody = request.body
@@ -227,6 +230,45 @@ final class MihonEngineHost: VMHost {
             message: HTTPURLResponse.localizedString(forStatusCode: response.statusCode),
             headers: headers,
             body: box.buffer.data
+        )
+    }
+
+    /// The same request over the pinned transport: resolve the host through the
+    /// configured DoH endpoint, connect to the address, keep the name as SNI and
+    /// `Host`, and use the host's cookie jar so a session started on either
+    /// path is visible to the other. Every failure is typed and surfaces as an
+    /// `IOException`; nothing falls back to the filtered resolver.
+    private func pinnedRequest(_ request: VMHTTPRequest, url: URL) throws -> VMHTTPResponse {
+        var headers: [(String, String)] = []
+        for (name, value) in request.headers
+        where !name.isEmpty && name.caseInsensitiveCompare(MihonChallengeUserAgent.headerName) != .orderedSame {
+            headers.append((name, value))
+        }
+        headers.append((
+            MihonChallengeUserAgent.headerName,
+            MihonChallengeUserAgent.forRequest(request, default: Self.defaultUserAgent)
+        ))
+        let pinned = PinnedHTTPRequest(
+            url: url,
+            method: request.method,
+            headers: headers,
+            body: request.body
+        )
+        let client = PinnedHTTPClient(resolver: .shared, cookieStorage: cookieStorage())
+        let response: PinnedHTTPResponse
+        do {
+            response = try client.send(pinned)
+        } catch let error as PinnedHTTPError {
+            throw VMJavaException("Ljava/io/IOException;", "encrypted DNS transport: \(error.description)")
+        } catch let error as DoHError {
+            throw VMJavaException("Ljava/io/IOException;", "encrypted DNS transport: \(error.description)")
+        }
+        return VMHTTPResponse(
+            url: response.url.absoluteString,
+            code: response.statusCode,
+            message: HTTPURLResponse.localizedString(forStatusCode: response.statusCode),
+            headers: response.headers,
+            body: response.body
         )
     }
 

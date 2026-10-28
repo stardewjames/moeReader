@@ -36,13 +36,16 @@ enum NativeLibrary {
         result += PlatformRuntime.classes()
         result += JavaTimeRuntime.classes()
         result += JavaTextRuntime.classes()
+        result += JavaMathRuntime.classes()
         result += CryptoRuntime.classes()
+        result += JavaSecurityRuntime.classes()
         result += JavaShared.classes()
         result += FileRuntime.classes()
         result += ZstdRuntime.classes()
         result += WebKitRuntime.classes()
         result += GraphicsRuntime.classes()
         result += QuickJSRuntime.classes()
+        JavaMathRuntime.extendSharedClasses(result)
         return result
     }
 }

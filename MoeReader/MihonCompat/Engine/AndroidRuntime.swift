@@ -44,10 +44,22 @@ final class VMLruCachePayload {
     /// Least recently used first, so eviction takes from the front and a hit
     /// moves the entry to the back.
     var entries: [(key: VMValue, value: VMValue)] = []
+    var hits = 0
+    var misses = 0
     init(maxSize: Int) { self.maxSize = max(0, maxSize) }
 }
 
 final class VMLooperPayload {}
+
+/// `android.os.HandlerThread` has no real thread behind it; `getLooper`
+/// answers a looper whose work runs inline, like every other `Handler` here.
+final class VMHandlerThreadPayload {
+    let name: String
+    var started = false
+    var looper: VMValue = .null
+
+    init(name: String) { self.name = name }
+}
 
 final class VMHandlerPayload {
     let looper: VMValue
@@ -78,6 +90,13 @@ final class VMDisplayMetricsPayload {
 
 final class VMResourcesPayload {}
 
+/// Activity-lifecycle callbacks an extension registers on `Application`. They
+/// are stored and never fired: the engine has no activity lifecycle to report,
+/// so this only keeps `register`/`unregister` consistent with each other.
+final class VMActivityLifecycleCallbacks {
+    var callbacks: [VMValue] = []
+}
+
 enum AndroidRuntime {
     static func classes() -> [NativeClass] {
         var result: [NativeClass] = []
@@ -103,29 +122,43 @@ enum AndroidRuntime {
         }
         cache.method("get", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
             let cache = try payload(runtime, args[0])
-            guard let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else { return .null }
-            let entry = cache.entries.remove(at: index)
-            cache.entries.append(entry)
-            return entry.value
+            if let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) {
+                let entry = cache.entries.remove(at: index)
+                cache.entries.append(entry)
+                cache.hits += 1
+                return entry.value
+            }
+            cache.misses += 1
+            // Android asks the subclass to create a missing entry.
+            guard let created = runtime.callVirtual(args[0], "create(Ljava/lang/Object;)Ljava/lang/Object;", [args[1]]),
+                  created.bits != 0 else { return .null }
+            cache.entries.append((args[1], created))
+            Self.trim(runtime, cache: cache, owner: args[0])
+            return created
         }
         cache.method("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
             let cache = try payload(runtime, args[0])
-            let previous: VMValue
+            var previous: VMValue = .null
             if let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) {
                 previous = cache.entries.remove(at: index).value
-            } else {
-                previous = .null
+            }
+            if previous.bits != 0 {
+                _ = runtime.callVirtual(
+                    args[0],
+                    "entryRemoved(ZLjava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+                    [.int32(0), args[1], previous, args[2]]
+                )
             }
             if args[2].bits != 0 { cache.entries.append((args[1], args[2])) }
-            while cache.entries.count > cache.maxSize, !cache.entries.isEmpty {
-                cache.entries.removeFirst()
-            }
+            Self.trim(runtime, cache: cache, owner: args[0])
             return previous
         }
         cache.method("remove", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
             let cache = try payload(runtime, args[0])
             guard let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else { return .null }
-            return cache.entries.remove(at: index).value
+            let removed = cache.entries.remove(at: index)
+            Self.entryRemoved(runtime, owner: args[0], evicted: false, key: removed.key, previous: removed.value)
+            return removed.value
         }
         cache.method("size", "()I") { runtime, args, _ in
             .int32(Int32(runtime.payload(args[0], as: VMLruCachePayload.self)?.entries.count ?? 0))
@@ -134,22 +167,62 @@ enum AndroidRuntime {
             .int32(Int32(runtime.payload(args[0], as: VMLruCachePayload.self)?.maxSize ?? 0))
         }
         cache.method("evictAll", "()V") { runtime, args, _ in
-            runtime.payload(args[0], as: VMLruCachePayload.self)?.entries.removeAll()
+            guard let cache = runtime.payload(args[0], as: VMLruCachePayload.self) else { return .zero }
+            while !cache.entries.isEmpty {
+                let removed = cache.entries.removeFirst()
+                Self.entryRemoved(runtime, owner: args[0], evicted: true, key: removed.key, previous: removed.value)
+            }
             return .zero
         }
         cache.method("resize", "(I)V") { runtime, args, _ in
             guard let cache = runtime.payload(args[0], as: VMLruCachePayload.self) else { return .zero }
             cache.maxSize = max(0, Int(args[1].asInt32))
-            while cache.entries.count > cache.maxSize, !cache.entries.isEmpty { cache.entries.removeFirst() }
+            while cache.entries.count > cache.maxSize, !cache.entries.isEmpty {
+                let removed = cache.entries.removeFirst()
+                Self.entryRemoved(runtime, owner: args[0], evicted: true, key: removed.key, previous: removed.value)
+            }
             return .zero
         }
+        /// Hooks a subclass may override; the base implementations match
+        /// Android's: no creation, no notification, one unit of size.
+        cache.method("create", "(Ljava/lang/Object;)Ljava/lang/Object;") { _, _, _ in .null }
+        cache.method("entryRemoved", "(ZLjava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V") { _, _, _ in .zero }
+        cache.method("sizeOf", "(Ljava/lang/Object;)I") { _, _, _ in .int32(1) }
         cache.method("snapshot", "()Ljava/util/Map;") { runtime, args, _ in
             guard let cache = runtime.payload(args[0], as: VMLruCachePayload.self) else { return .null }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(cache.entries.map { ($0.key, $0.value) }))
         }
-        cache.method("hitCount", "()I") { _, _, _ in .int32(0) }
-        cache.method("missCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("hitCount", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMLruCachePayload.self)?.hits ?? 0))
+        }
+        cache.method("missCount", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMLruCachePayload.self)?.misses ?? 0))
+        }
         return [cache]
+    }
+
+    /// `LruCache.trimToSize`: drops least-recently-used entries and reports
+    /// each one through `entryRemoved`.
+    private static func trim(_ runtime: VMRuntime, cache: VMLruCachePayload, owner: VMValue) {
+        while cache.entries.count > cache.maxSize, !cache.entries.isEmpty {
+            let removed = cache.entries.removeFirst()
+            entryRemoved(runtime, owner: owner, evicted: true, key: removed.key, previous: removed.value)
+        }
+    }
+
+    private static func entryRemoved(
+        _ runtime: VMRuntime,
+        owner: VMValue,
+        evicted: Bool,
+        key: VMValue,
+        previous: VMValue
+    ) {
+        guard previous.bits != 0 else { return }
+        _ = runtime.callVirtual(
+            owner,
+            "entryRemoved(ZLjava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+            [.int32(evicted ? 1 : 0), key, previous, .null]
+        )
     }
 
     /// `android.os.Handler`, `Looper` and `Message`. The engine has no separate
@@ -235,6 +308,40 @@ enum AndroidRuntime {
         }
         message.method("recycle", "()V") { _, _, _ in .zero }
         result.append(message)
+
+        let handlerThread = NativeClass("Landroid/os/HandlerThread;", superclass: "Ljava/lang/Thread;")
+        handlerThread.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHandlerThreadPayload(name: runtime.stringValue(args[1]) ?? ""))
+            return .zero
+        }
+        handlerThread.method("<init>", "(Ljava/lang/String;I)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHandlerThreadPayload(name: runtime.stringValue(args[1]) ?? ""))
+            return .zero
+        }
+        handlerThread.method("start", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHandlerThreadPayload.self)?.started = true
+            return .zero
+        }
+        handlerThread.method("getLooper", "()Landroid/os/Looper;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMHandlerThreadPayload.self), payload.started else { return .null }
+            if payload.looper.bits == 0 {
+                payload.looper = runtime.makeNative("Landroid/os/Looper;", payload: VMLooperPayload())
+            }
+            return payload.looper
+        }
+        handlerThread.method("getThreadId", "()I") { _, _, _ in .int32(0) }
+        handlerThread.method("quit", "()Z") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHandlerThreadPayload.self)?.started = false
+            return .boolean(true)
+        }
+        handlerThread.method("quitSafely", "()Z") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHandlerThreadPayload.self)?.started = false
+            return .boolean(true)
+        }
+        // Thread.join: there is no thread to wait for.
+        handlerThread.method("join", "()V") { _, _, _ in .zero }
+        handlerThread.method("join", "(J)V") { _, _, _ in .zero }
+        result.append(handlerThread)
 
         let handler = NativeClass("Landroid/os/Handler;", superclass: "Ljava/lang/Object;")
         handler.method("<init>", "()V") { runtime, args, _ in
@@ -376,7 +483,9 @@ enum AndroidRuntime {
         resources.method("getDimension", "(I)F") { _, _, _ in .float(0) }
         resources.method("getDimensionPixelSize", "(I)I") { _, _, _ in .int32(0) }
         resources.method("getConfiguration", "()Landroid/content/res/Configuration;") { runtime, _, _ in
-            runtime.makeNative("Landroid/content/res/Configuration;", payload: NSNull())
+            let value = runtime.makeNative("Landroid/content/res/Configuration;", payload: NSNull())
+            AndroidRuntime.applyConfiguration(runtime, value)
+            return value
         }
         result.append(resources)
 
@@ -385,7 +494,11 @@ enum AndroidRuntime {
         configuration.field("screenWidthDp", "I")
         configuration.field("screenHeightDp", "I")
         configuration.field("densityDpi", "I")
-        configuration.method("<init>", "()V") { _, _, _ in .zero }
+        configuration.field("uiMode", "I")
+        configuration.method("<init>", "()V") { runtime, args, _ in
+            AndroidRuntime.applyConfiguration(runtime, args[0])
+            return .zero
+        }
         result.append(configuration)
         return result
     }
@@ -413,6 +526,51 @@ enum AndroidRuntime {
             guard let field = cls.resolveField(key: name + ":F") else { continue }
             VMObjectLayout.slot(pointer, field.offset).pointee = .int32(Int32(bitPattern: number.bitPattern))
         }
+    }
+
+    /// The host has no system UI mode: a light-mode device with a normal
+    /// screen (`UI_MODE_TYPE_NORMAL | UI_MODE_NIGHT_NO`).
+    private static let uiMode: Int32 = 0x11
+
+    /// `ApplicationInfo` for the installed extension: its data lives under the
+    /// extension's files root, which is the only app-private directory the host
+    /// has.
+    private static func applicationInfo(_ runtime: VMRuntime) -> VMValue {
+        let value = runtime.makeNative("Landroid/content/pm/ApplicationInfo;", payload: NSNull())
+        let root = runtime.extensionFileRoot()
+        let strings: [(String, String)] = [
+            ("packageName", "com.moereader.MoeReader"),
+            ("dataDir", root),
+            ("sourceDir", root),
+            ("nativeLibraryDir", FileRuntime.join(root, "lib")),
+        ]
+        guard let pointer = value.object else { return value }
+        let cls = VMObjectLayout.cls(pointer)
+        for (name, text) in strings {
+            guard let field = cls.resolveField(key: name + ":Ljava/lang/String;") else { continue }
+            VMObjectLayout.slot(pointer, field.offset).pointee = runtime.newString(text)
+        }
+        return value
+    }
+
+    /// The activity-lifecycle registry for this runtime instance, created on
+    /// first use and parked on the `Application` class so every `Application`
+    /// instance the engine hands out shares one list.
+    static func lifecycleCallbacks(_ runtime: VMRuntime) throws -> VMActivityLifecycleCallbacks {
+        let cls = try runtime.linkClass("Landroid/app/Application;")
+        if let existing = runtime.payload(cls.staticValues[0], as: VMActivityLifecycleCallbacks.self) {
+            return existing
+        }
+        let created = VMActivityLifecycleCallbacks()
+        cls.staticValues[0] = runtime.makeNative("Lmihoncompat/ActivityLifecycleCallbacks;", payload: created)
+        return created
+    }
+
+    private static func applyConfiguration(_ runtime: VMRuntime, _ value: VMValue) {
+        guard let pointer = value.object else { return }
+        let cls = VMObjectLayout.cls(pointer)
+        guard let field = cls.resolveField(key: "uiMode:I") else { return }
+        VMObjectLayout.slot(pointer, field.offset).pointee = .int32(uiMode)
     }
 
     /// `android.util.Base64` with the Android flag semantics extensions rely on
@@ -592,12 +750,40 @@ enum AndroidRuntime {
         }
         context.method("startActivity", "(Landroid/content/Intent;)V") { _, _, _ in .zero }
         context.method("getApplicationContext", "()Landroid/content/Context;") { runtime, args, _ in args[0] }
+        context.method("getResources", "()Landroid/content/res/Resources;") { runtime, _, _ in
+            runtime.makeNative("Landroid/content/res/Resources;", payload: VMResourcesPayload())
+        }
+        // No Android system services are backed by the host; an unknown service
+        // name returns null, as it does on a device without that service.
+        context.method("getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") { _, _, _ in .null }
+        context.method("getSystemService", "(Ljava/lang/Class;)Ljava/lang/Object;") { _, _, _ in .null }
+        context.method("getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;") { runtime, _, _ in
+            AndroidRuntime.applicationInfo(runtime)
+        }
+        context.method("getExternalCacheDir", "()Ljava/io/File;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/io/File;",
+                payload: VMFilePayload(path: FileRuntime.join(runtime.extensionFileRoot(), "cache/external"))
+            )
+        }
+        context.method("getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;") { runtime, args, _ in
+            var path = FileRuntime.join(runtime.extensionFileRoot(), "files/external")
+            if let kind = runtime.stringValue(args[1]) { path = FileRuntime.join(path, kind) }
+            return runtime.makeNative("Ljava/io/File;", payload: VMFilePayload(path: path))
+        }
         context.method("getAssets", "()Landroid/content/res/AssetManager;") { runtime, _, _ in
             runtime.makeNative("Landroid/content/res/AssetManager;", payload: NSNull())
         }
         result.append(context)
 
-        let application = NativeClass("Landroid/app/Application;", superclass: "Landroid/content/Context;", interfaces: ["Landroid/content/SharedPreferences;", "Lkotlinx/serialization/json/Json;"])
+        // `Application` is a `ContextWrapper` on Android, and extensions reach
+        // the wrapper-only members (`getExternalCacheDir`, `getResources`)
+        // through the application instance Injekt hands them.
+        let application = NativeClass(
+            "Landroid/app/Application;",
+            superclass: "Landroid/content/ContextWrapper;",
+            interfaces: ["Landroid/content/SharedPreferences;", "Lkotlinx/serialization/json/Json;"]
+        )
         application.method("<init>", "()V") { _, _, _ in .zero }
         application.method("onCreate", "()V") { _, _, _ in .zero }
         application.method("getApplicationContext", "()Landroid/content/Context;") { _, args, _ in args[0] }
@@ -649,7 +835,52 @@ enum AndroidRuntime {
             let entries = prefs.allKeys().map { (runtime.newString($0), runtime.newString(prefs.string(forKey: $0) ?? "")) }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
         }
+        // The engine drives no activity lifecycle, so listeners are only kept:
+        // registration and removal answer each other and nothing is ever
+        // dispatched. The registry lives on the class, so every `Application`
+        // instance the engine hands out shares it.
+        application.staticField("compatActivityLifecycleCallbacks", "Lmihoncompat/ActivityLifecycleCallbacks;")
+        application.method("registerActivityLifecycleCallbacks", "(Landroid/app/Application$ActivityLifecycleCallbacks;)V") {
+            runtime, args, _ in
+            guard args[1].bits != 0 else { return .zero }
+            let store = try AndroidRuntime.lifecycleCallbacks(runtime)
+            store.callbacks.append(args[1])
+            return .zero
+        }
+        application.method(
+            "unregisterActivityLifecycleCallbacks",
+            "(Landroid/app/Application$ActivityLifecycleCallbacks;)V"
+        ) { runtime, args, _ in
+            let store = try AndroidRuntime.lifecycleCallbacks(runtime)
+            if let index = store.callbacks.firstIndex(where: { $0.bits == args[1].bits }) {
+                store.callbacks.remove(at: index)
+            }
+            return .zero
+        }
         result.append(application)
+
+        // `Application.ActivityLifecycleCallbacks`: a dex class that implements
+        // it must resolve, even though the engine never calls the methods.
+        let lifecycle = NativeClass(
+            "Landroid/app/Application$ActivityLifecycleCallbacks;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        let lifecycleMethods: [(String, String)] = [
+            ("onActivityCreated", "(Landroid/app/Activity;Landroid/os/Bundle;)V"),
+            ("onActivityStarted", "(Landroid/app/Activity;)V"),
+            ("onActivityResumed", "(Landroid/app/Activity;)V"),
+            ("onActivityPaused", "(Landroid/app/Activity;)V"),
+            ("onActivityStopped", "(Landroid/app/Activity;)V"),
+            ("onActivitySaveInstanceState", "(Landroid/app/Activity;Landroid/os/Bundle;)V"),
+            ("onActivityDestroyed", "(Landroid/app/Activity;)V"),
+        ]
+        for (name, signature) in lifecycleMethods {
+            lifecycle.method(name, signature) { _, _, _ in .zero }
+        }
+        result.append(lifecycle)
+        result.append(NativeClass("Lmihoncompat/ActivityLifecycleCallbacks;", superclass: "Ljava/lang/Object;"))
 
         let wrapper = NativeClass("Landroid/content/ContextWrapper;", superclass: "Landroid/content/Context;")
         wrapper.method("<init>", "(Landroid/content/Context;)V") { _, _, _ in .zero }
@@ -673,7 +904,34 @@ enum AndroidRuntime {
             )
         }
         wrapper.method("startActivity", "(Landroid/content/Intent;)V") { _, _, _ in .zero }
+        wrapper.method("getResources", "()Landroid/content/res/Resources;") { runtime, _, _ in
+            runtime.makeNative("Landroid/content/res/Resources;", payload: VMResourcesPayload())
+        }
+        wrapper.method("getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") { _, _, _ in .null }
+        wrapper.method("getSystemService", "(Ljava/lang/Class;)Ljava/lang/Object;") { _, _, _ in .null }
+        wrapper.method("getExternalCacheDir", "()Ljava/io/File;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/io/File;",
+                payload: VMFilePayload(path: FileRuntime.join(runtime.extensionFileRoot(), "cache/external"))
+            )
+        }
+        wrapper.method("getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;") { runtime, args, _ in
+            var path = FileRuntime.join(runtime.extensionFileRoot(), "files/external")
+            if let kind = runtime.stringValue(args[1]) { path = FileRuntime.join(path, kind) }
+            return runtime.makeNative("Ljava/io/File;", payload: VMFilePayload(path: path))
+        }
+        wrapper.method("getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;") { runtime, _, _ in
+            AndroidRuntime.applicationInfo(runtime)
+        }
         result.append(wrapper)
+
+        let applicationInfo = NativeClass("Landroid/content/pm/ApplicationInfo;", superclass: "Ljava/lang/Object;")
+        for field in ["packageName", "dataDir", "sourceDir", "nativeLibraryDir"] {
+            applicationInfo.field(field, "Ljava/lang/String;")
+        }
+        applicationInfo.field("flags", "I")
+        applicationInfo.method("<init>", "()V") { _, _, _ in .zero }
+        result.append(applicationInfo)
 
         let assetManager = NativeClass("Landroid/content/res/AssetManager;", superclass: "Ljava/lang/Object;")
         assetManager.method("open", "(Ljava/lang/String;)Ljava/io/InputStream;") { runtime, args, _ in
@@ -777,14 +1035,27 @@ extension VMRuntime {
 /// Android `Base64` flag handling shared by both overload families.
 enum VMBase64 {
     static func decode(_ text: String, flags: Int32, runtime: VMRuntime) throws -> VMValue {
-        var input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Android's decoder skips line breaks (its own encoder wraps at 76
+        // characters) but rejects anything outside the alphabet.
+        var input = String(text.filter { $0 != "\n" && $0 != "\r" })
         if flags & 8 != 0 {
             input = input.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         }
-        if flags & 1 == 0, input.count % 4 != 0 {
+        let body = String(input.prefix { $0 != "=" })
+        let padding = input.dropFirst(body.count)
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        guard body.allSatisfy({ alphabet.contains($0) }),
+              padding.allSatisfy({ $0 == "=" }),
+              padding.count <= 2 else {
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;", "bad base64")
+        }
+        // The decoder accepts padded and unpadded input alike, as Android's
+        // does; a lone trailing character is still invalid.
+        input = body
+        if !input.isEmpty, input.count % 4 != 0 {
             input += String(repeating: "=", count: 4 - input.count % 4)
         }
-        guard let data = Data(base64Encoded: input, options: .ignoreUnknownCharacters) else {
+        guard let data = Data(base64Encoded: input) else {
             throw VMJavaException("Ljava/lang/IllegalArgumentException;", "bad base64")
         }
         let array = runtime.newArray(component: "B", count: data.count)

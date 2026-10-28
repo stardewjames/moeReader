@@ -194,7 +194,80 @@ enum ConcurrencyRuntime {
                 concurrentMap.method(name, signature, inherited)
             }
         }
+        concurrentMap.method("computeIfAbsent", "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;") { runtime, args, _ in
+            let map = try runtime.mutableMap(args[0])
+            if let existing = map.entries.first(where: { runtime.javaEquals($0.key, args[1]) }) {
+                return existing.value
+            }
+            guard args[2].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let computed: VMValue
+            if let method = runtime.classOf(args[2])?.lookupVirtual(key: "apply(Ljava/lang/Object;)Ljava/lang/Object;") {
+                computed = try runtime.invoke(method, [args[2], args[1]])
+            } else {
+                computed = .null
+            }
+            if computed.bits != 0 {
+                map.entries.append((args[1], computed))
+            }
+            return computed
+        }
+        concurrentMap.method("computeIfPresent", "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;") { runtime, args, _ in
+            let map = try runtime.mutableMap(args[0])
+            guard let index = map.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else {
+                return .null
+            }
+            guard args[2].bits != 0, let method = runtime.classOf(args[2])?.lookupVirtual(key: "apply(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            let computed = try runtime.invoke(method, [args[2], args[1], map.entries[index].value])
+            if computed.bits == 0 {
+                map.entries.remove(at: index)
+                return .null
+            }
+            map.entries[index].value = computed
+            return computed
+        }
+        concurrentMap.staticMethod("newKeySet", "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;") { runtime, _, _ in
+            runtime.makeNative(
+                "Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+                payload: VMKeySetViewPayload(map: VMMapPayload())
+            )
+        }
         result.append(concurrentMap)
+        let keySetView = NativeClass(
+            "Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Ljava/util/Set;"]
+        )
+        keySetView.method("add", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let view = runtime.payload(args[0], as: VMKeySetViewPayload.self) else { return .boolean(false) }
+            if view.map.entries.contains(where: { runtime.javaEquals($0.key, args[1]) }) { return .boolean(false) }
+            view.map.entries.append((args[1], .null))
+            return .boolean(true)
+        }
+        keySetView.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let view = runtime.payload(args[0], as: VMKeySetViewPayload.self) else { return .boolean(false) }
+            return .boolean(view.map.entries.contains { runtime.javaEquals($0.key, args[1]) })
+        }
+        keySetView.method("remove", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let view = runtime.payload(args[0], as: VMKeySetViewPayload.self) else { return .boolean(false) }
+            guard let index = view.map.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else {
+                return .boolean(false)
+            }
+            view.map.entries.remove(at: index)
+            return .boolean(true)
+        }
+        keySetView.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMKeySetViewPayload.self)?.map.entries.count ?? 0))
+        }
+        keySetView.method("isEmpty", "()Z") { runtime, args, _ in
+            .boolean((runtime.payload(args[0], as: VMKeySetViewPayload.self)?.map.entries.count ?? 0) == 0)
+        }
+        keySetView.method("clear", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMKeySetViewPayload.self)?.map.entries.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        result.append(keySetView)
         result.append(NativeClass("Ljava/util/concurrent/ConcurrentMap;", superclass: nil, interfaces: ["Ljava/util/Map;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
 
         let lock = NativeClass("Ljava/util/concurrent/locks/ReentrantLock;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/concurrent/locks/Lock;"])
@@ -313,8 +386,98 @@ enum ConcurrencyRuntime {
             result.append(lockView)
         }
 
+        let latch = NativeClass("Ljava/util/concurrent/CountDownLatch;", superclass: "Ljava/lang/Object;")
+        latch.method("<init>", "(I)V") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "count < 0") }
+            runtime.setPayload(args[0], VMCountDownLatchPayload(count: count))
+            return .zero
+        }
+        latch.method("await", "()V") { runtime, args, _ in
+            guard runtime.payload(args[0], as: VMCountDownLatchPayload.self) != nil else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            return .zero
+        }
+        latch.method("await", "(JLjava/util/concurrent/TimeUnit;)Z") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMCountDownLatchPayload.self) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            return .boolean(payload.count == 0)
+        }
+        latch.method("countDown", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMCountDownLatchPayload.self)?.countDown()
+            return .zero
+        }
+        latch.method("getCount", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMCountDownLatchPayload.self)?.count ?? 0))
+        }
+        latch.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(String(runtime.payload(args[0], as: VMCountDownLatchPayload.self)?.count ?? 0))
+        }
+        result.append(latch)
+
+        let referenceArray = NativeClass("Ljava/util/concurrent/atomic/AtomicReferenceArray;", superclass: "Ljava/lang/Object;")
+        referenceArray.method("<init>", "(I)V") { runtime, args, _ in
+            let length = Int(args[1].asInt32)
+            guard length >= 0 else { throw VMJavaException("Ljava/lang/NegativeArraySizeException;", "\(length)") }
+            runtime.setPayload(args[0], VMAtomicReferenceArrayPayload(items: Array(repeating: .null, count: length)))
+            return .zero
+        }
+        referenceArray.method("length", "()I") { runtime, args, _ in
+            .int32(Int32(try ConcurrencyRuntime.mutableReferenceArray(runtime, args[0]).items.count))
+        }
+        referenceArray.method("get", "(I)Ljava/lang/Object;") { runtime, args, _ in
+            let payload = try ConcurrencyRuntime.mutableReferenceArray(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < payload.items.count else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            return payload.items[index]
+        }
+        referenceArray.method("set", "(ILjava/lang/Object;)V") { runtime, args, _ in
+            let payload = try ConcurrencyRuntime.mutableReferenceArray(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < payload.items.count else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            payload.items[index] = args[2]
+            return .zero
+        }
+        referenceArray.method("getAndSet", "(ILjava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let payload = try ConcurrencyRuntime.mutableReferenceArray(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < payload.items.count else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            let previous = payload.items[index]
+            payload.items[index] = args[2]
+            return previous
+        }
+        referenceArray.method("compareAndSet", "(ILjava/lang/Object;Ljava/lang/Object;)Z") { runtime, args, _ in
+            let payload = try ConcurrencyRuntime.mutableReferenceArray(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < payload.items.count else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            guard runtime.javaEquals(payload.items[index], args[2]) else { return .boolean(false) }
+            payload.items[index] = args[3]
+            return .boolean(true)
+        }
+        result.append(referenceArray)
+
         return result
     }
+
+    static func mutableReferenceArray(_ runtime: VMRuntime, _ value: VMValue) throws -> VMAtomicReferenceArrayPayload {
+        guard let payload = runtime.payload(value, as: VMAtomicReferenceArrayPayload.self) else {
+            throw VMJavaException("Ljava/lang/NullPointerException;")
+        }
+        return payload
+    }
+}
+
+final class VMCountDownLatchPayload {
+    var count: Int
+    init(count: Int) { self.count = count }
+    func countDown() { count = max(0, count - 1) }
+}
+
+final class VMAtomicReferenceArrayPayload {
+    var items: [VMValue]
+    init(items: [VMValue]) { self.items = items }
 }
 
 extension VMRuntime {

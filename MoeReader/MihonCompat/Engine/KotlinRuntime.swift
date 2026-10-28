@@ -90,6 +90,21 @@ final class VMLazyPayload {
     }
 }
 
+/// Comparator produced by `ComparisonsKt.compareBy`/`reverseOrder` and the
+/// case-insensitive `String` order. The native class dispatches on the payload
+/// instead of a subtype per ordering.
+final class VMComparatorPayload {
+    enum Kind {
+        case natural
+        case reverse
+        case caseInsensitive
+        case selectors([VMValue])
+    }
+
+    let kind: Kind
+    init(kind: Kind) { self.kind = kind }
+}
+
 final class VMRegexPayload {
     let pattern: String
     let options: UInt32
@@ -105,8 +120,31 @@ final class VMRegexPayload {
         if options & 0x04 != 0 { nsOptions.insert(.allowCommentsAndWhitespace) }
         if options & 0x08 != 0 { nsOptions.insert(.anchorsMatchLines) }
         if options & 0x20 != 0 { nsOptions.insert(.dotMatchesLineSeparators) }
-        let source = options & 0x10 != 0 ? NSRegularExpression.escapedPattern(for: pattern) : pattern
+        let source = options & 0x10 != 0
+            ? NSRegularExpression.escapedPattern(for: pattern)
+            : VMRegexPayload.expandQuotedSpans(pattern)
         self.expression = try? NSRegularExpression(pattern: source, options: nsOptions)
+    }
+
+    /// `Regex.Companion.escape` emits `\Q...\E` (the JDK's `Pattern.quote`),
+    /// which ICU does not understand; translate each span up front.
+    static func expandQuotedSpans(_ pattern: String) -> String {
+        guard pattern.contains("\\Q") else { return pattern }
+        var output = ""
+        var rest = Substring(pattern)
+        while let start = rest.range(of: "\\Q") {
+            output += rest[rest.startIndex..<start.lowerBound]
+            let tail = rest[start.upperBound...]
+            if let end = tail.range(of: "\\E") {
+                output += NSRegularExpression.escapedPattern(for: String(tail[tail.startIndex..<end.lowerBound]))
+                rest = tail[end.upperBound...]
+            } else {
+                output += NSRegularExpression.escapedPattern(for: String(tail))
+                rest = tail[tail.endIndex...]
+            }
+        }
+        output += rest
+        return output
     }
 }
 
@@ -152,9 +190,24 @@ final class VMIntRangePayload {
     }
 }
 
+final class VMLongRangePayload {
+    let first: Int64
+    let last: Int64
+    init(first: Int64, last: Int64) {
+        self.first = first
+        self.last = last
+    }
+}
+
 final class VMSequencePayload {
     let values: [VMValue]
     init(_ values: [VMValue]) { self.values = values }
+}
+
+/// Sink behind `kotlin.sequences.SequenceScope`: `yield`/`yieldAll` append in
+/// call order and `sequence { }` reads the result back.
+final class VMSequenceCollectorPayload {
+    var values: [VMValue] = []
 }
 
 final class VMContinuationPayload {
@@ -233,6 +286,50 @@ final class VMMutexPayload {
     var locked = false
 }
 
+/// State behind `kotlinx.coroutines.CancellableContinuationImpl`, the object
+/// the inlined body of `suspendCancellableCoroutine` creates. The engine drives
+/// suspend functions on one thread, so a callback that resumes the continuation
+/// runs inside the same call; `getResult()` either observes that resume or the
+/// operation genuinely suspends and fails with a typed exception.
+final class VMCancellableContinuationPayload {
+    let completion: VMValue
+    var result: VMValue = .null
+    var failure: VMValue = .null
+    var completed = false
+    var cancelled = false
+    var cancellationHandler: VMValue = .null
+
+    init(completion: VMValue) { self.completion = completion }
+
+    var isActive: Bool { !completed && !cancelled }
+
+    @discardableResult
+    func complete(value: VMValue) -> Bool {
+        guard isActive else { return false }
+        result = value
+        completed = true
+        return true
+    }
+
+    @discardableResult
+    func complete(exception: VMValue) -> Bool {
+        guard isActive else { return false }
+        failure = exception
+        completed = true
+        return true
+    }
+}
+
+final class VMSemaphorePayload {
+    var permits: Int
+    init(permits: Int) { self.permits = permits }
+}
+
+final class VMCoroutineScopePayload {
+    let context: VMValue
+    init(context: VMValue) { self.context = context }
+}
+
 final class VMCoroutineContextPayload {
     let elements: [String: VMValue]
     init(elements: [String: VMValue] = [:]) { self.elements = elements }
@@ -293,6 +390,17 @@ enum KotlinRuntime {
         }
         intrinsics.staticMethod("areEqual", "(Ljava/lang/Object;Ljava/lang/Object;)Z") { runtime, args, _ in
             .boolean(runtime.javaEquals(args[0], args[1]))
+        }
+        // Nullable `Double`/`Float` comparisons reach `areEqual` with the boxed
+        // value first and the primitive second.
+        intrinsics.staticMethod("areEqual", "(Ljava/lang/Double;D)Z") { runtime, args, _ in
+            guard args[0].bits != 0 else { return .boolean(false) }
+            let boxed = runtime.payload(args[0], as: NSNumber.self)?.doubleValue ?? args[0].asDoubleBox()
+            return .boolean(boxed == args[1].asDouble)
+        }
+        intrinsics.staticMethod("areEqual", "(Ljava/lang/Float;F)Z") { runtime, args, _ in
+            guard args[0].bits != 0 else { return .boolean(false) }
+            return .boolean(args[0].asFloatBox() == args[1].asFloat)
         }
         intrinsics.staticMethod("checkNotNull", "(Ljava/lang/Object;)V") { _, args, _ in
             guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
@@ -412,6 +520,9 @@ enum KotlinRuntime {
         boxing.staticMethod("boxLong", "(J)Ljava/lang/Long;") { runtime, args, _ in runtime.boxLong(args[0].asInt64) }
         boxing.staticMethod("boxDouble", "(D)Ljava/lang/Double;") { runtime, args, _ in runtime.boxDouble(args[0].asDouble) }
         boxing.staticMethod("boxFloat", "(F)Ljava/lang/Float;") { runtime, args, _ in runtime.boxFloat(args[0].asFloat) }
+        boxing.staticMethod("boxChar", "(C)Ljava/lang/Character;") { runtime, args, _ in
+            runtime.boxChar(UInt16(truncatingIfNeeded: args[0].asInt32))
+        }
         result.append(boxing)
 
         let spilling = NativeClass("Lkotlin/coroutines/jvm/internal/SpillingKt;")
@@ -499,6 +610,8 @@ enum KotlinRuntime {
 
         let intrinsics = NativeClass("Lkotlin/coroutines/intrinsics/IntrinsicsKt;")
         intrinsics.staticMethod("getCOROUTINE_SUSPENDED", "()Ljava/lang/Object;") { runtime, _, _ in runtime.coroutineSuspended }
+        // Continuations complete inline, so an interception has nothing to add.
+        intrinsics.staticMethod("intercepted", "(Lkotlin/coroutines/Continuation;)Lkotlin/coroutines/Continuation;") { _, args, _ in args[0] }
         result.append(intrinsics)
 
         let singletons = NativeClass("Lkotlin/coroutines/intrinsics/CoroutineSingletons;", superclass: "Ljava/lang/Enum;")
@@ -616,6 +729,11 @@ enum KotlinRuntime {
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
             return try runtime.callSuspend(args[1], scope)
         }
+        // Kotlin 2.x mangles the blocking entry point's name in this facade.
+        buildScope.staticMethod("runBlockingK", "(Lkotlin/coroutines/CoroutineContext;Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;") { runtime, args, _ in
+            let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
+            return try runtime.callSuspend(args[1], scope)
+        }
         buildScope.staticMethod("runBlockingK$default", "(Lkotlin/coroutines/CoroutineContext;Lkotlin/jvm/functions/Function2;ILjava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
             return try runtime.callSuspend(args[1], scope)
@@ -646,6 +764,9 @@ enum KotlinRuntime {
         }
         scopeKt.staticMethod("cancel$default", "(Lkotlinx/coroutines/CoroutineScope;Ljava/lang/String;Ljava/lang/Throwable;ILjava/lang/Object;)V") { _, _, _ in .zero }
         scopeKt.staticMethod("isActive", "(Lkotlinx/coroutines/CoroutineScope;)Z") { _, _, _ in .boolean(true) }
+        scopeKt.staticMethod("CoroutineScope", "(Lkotlin/coroutines/CoroutineContext;)Lkotlinx/coroutines/CoroutineScope;") { runtime, args, _ in
+            runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: VMCoroutineScopePayload(context: args[0]))
+        }
         result.append(scopeKt)
 
         let deferred = NativeClass("Lkotlinx/coroutines/DeferredCoroutine;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/coroutines/Deferred;"])
@@ -659,8 +780,9 @@ enum KotlinRuntime {
         result.append(deferred)
 
         let scopeImpl = NativeClass("Lkotlinx/coroutines/CoroutineScopeImpl;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/coroutines/CoroutineScope;"])
-        scopeImpl.method("getCoroutineContext", "()Lkotlin/coroutines/CoroutineContext;") { runtime, _, _ in
-            runtime.findClass("Lkotlin/coroutines/EmptyCoroutineContext;").map { $0.staticValues[0] } ?? .null
+        scopeImpl.method("getCoroutineContext", "()Lkotlin/coroutines/CoroutineContext;") { runtime, args, _ in
+            if let payload = runtime.payload(args[0], as: VMCoroutineScopePayload.self) { return payload.context }
+            return runtime.findClass("Lkotlin/coroutines/EmptyCoroutineContext;").map { $0.staticValues[0] } ?? .null
         }
         result.append(scopeImpl)
 
@@ -710,6 +832,16 @@ enum KotlinRuntime {
         }
         completableDeferredKt.staticMethod("CompletableDeferred", "(Lkotlinx/coroutines/Job;)Lkotlinx/coroutines/CompletableDeferred;") { runtime, _, _ in
             runtime.makeNative("Lkotlinx/coroutines/CompletableDeferredImpl;", payload: VMCompletableDeferredPayload())
+        }
+        completableDeferredKt.staticMethod("CompletableDeferred", "(Ljava/lang/Object;)Lkotlinx/coroutines/CompletableDeferred;") { runtime, args, _ in
+            let payload = VMCompletableDeferredPayload()
+            payload.complete(args[0])
+            return runtime.makeNative("Lkotlinx/coroutines/CompletableDeferredImpl;", payload: payload)
+        }
+        completableDeferredKt.staticMethod("CompletableDeferred$default", "(Ljava/lang/Object;ILjava/lang/Object;)Lkotlinx/coroutines/CompletableDeferred;") { runtime, args, _ in
+            let payload = VMCompletableDeferredPayload()
+            if args[1].asInt32 & 1 == 0 { payload.complete(args[0]) }
+            return runtime.makeNative("Lkotlinx/coroutines/CompletableDeferredImpl;", payload: payload)
         }
         result.append(completableDeferredKt)
 
@@ -790,6 +922,185 @@ enum KotlinRuntime {
             runtime.makeNative("Lkotlinx/coroutines/sync/MutexImpl;", payload: VMMutexPayload())
         }
         result.append(mutexKt)
+
+        // Supervisor builders and jobs.
+        let supervisorKt = NativeClass("Lkotlinx/coroutines/SupervisorKt;")
+        supervisorKt.staticMethod("supervisorScope", "(Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
+            return try runtime.callSuspend(args[0], scope)
+        }
+        supervisorKt.staticMethod("SupervisorJob$default", "(Lkotlinx/coroutines/Job;ILjava/lang/Object;)Lkotlinx/coroutines/CompletableJob;") { runtime, _, _ in
+            runtime.makeNative("Lkotlinx/coroutines/SupervisorJobImpl;", payload: NSNull())
+        }
+        supervisorKt.staticMethod("SupervisorJob", "(Lkotlinx/coroutines/Job;)Lkotlinx/coroutines/CompletableJob;") { runtime, _, _ in
+            runtime.makeNative("Lkotlinx/coroutines/SupervisorJobImpl;", payload: NSNull())
+        }
+        result.append(supervisorKt)
+
+        let completableJob = NativeClass(
+            "Lkotlinx/coroutines/CompletableJob;",
+            superclass: nil,
+            interfaces: ["Lkotlinx/coroutines/Job;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        completableJob.method("plus", "(Lkotlin/coroutines/CoroutineContext;)Lkotlin/coroutines/CoroutineContext;") { _, args, _ in
+            args[1].bits == 0 ? args[0] : args[1]
+        }
+        result.append(completableJob)
+        result.append(NativeClass("Lkotlinx/coroutines/SupervisorJobImpl;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/coroutines/CompletableJob;"]))
+
+        // Job cancellation helpers: nothing in the engine ever cancels a job.
+        let jobKt = NativeClass("Lkotlinx/coroutines/JobKt;")
+        jobKt.staticMethod("ensureActive", "(Lkotlin/coroutines/CoroutineContext;)V") { _, _, _ in .zero }
+        jobKt.staticMethod("cancelChildren$default", "(Lkotlin/coroutines/CoroutineContext;Ljava/util/concurrent/CancellationException;ILjava/lang/Object;)V") { _, _, _ in .zero }
+        jobKt.staticMethod("cancelChildren", "(Lkotlin/coroutines/CoroutineContext;Ljava/util/concurrent/CancellationException;)V") { _, _, _ in .zero }
+        result.append(jobKt)
+
+        // Counting semaphore. A waiter would block the only engine thread, so a
+        // missing permit is reported instead of suspending forever.
+        let semaphore = NativeClass(
+            "Lkotlinx/coroutines/sync/Semaphore;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: []
+        )
+        semaphore.method("acquire", "(Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            guard let payload: VMSemaphorePayload = runtime.payload(args[0], as: VMSemaphorePayload.self) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "invalid semaphore")
+            }
+            guard payload.permits > 0 else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "Semaphore.acquire would suspend; coroutine suspension is not supported")
+            }
+            payload.permits -= 1
+            return runtime.unitValue
+        }
+        semaphore.method("tryAcquire", "()Z") { runtime, args, _ in
+            guard let payload: VMSemaphorePayload = runtime.payload(args[0], as: VMSemaphorePayload.self), payload.permits > 0 else {
+                return .boolean(false)
+            }
+            payload.permits -= 1
+            return .boolean(true)
+        }
+        semaphore.method("release", "()V") { runtime, args, _ in
+            guard let payload: VMSemaphorePayload = runtime.payload(args[0], as: VMSemaphorePayload.self) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "invalid semaphore")
+            }
+            payload.permits += 1
+            return .zero
+        }
+        result.append(semaphore)
+
+        let semaphoreKt = NativeClass("Lkotlinx/coroutines/sync/SemaphoreKt;")
+        semaphoreKt.staticMethod("Semaphore$default", "(IIILjava/lang/Object;)Lkotlinx/coroutines/sync/Semaphore;") { runtime, args, _ in
+            let mask = args[2].asInt32
+            let permits = (mask & 1) != 0 ? 1 : Int(args[0].asInt32)
+            let acquired = (mask & 2) != 0 ? 0 : Int(args[1].asInt32)
+            guard permits >= 0, acquired >= 0, acquired <= permits else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Semaphore requires 0 <= acquiredPermits <= permits")
+            }
+            return runtime.makeNative("Lkotlinx/coroutines/sync/Semaphore;", payload: VMSemaphorePayload(permits: permits - acquired))
+        }
+        semaphoreKt.staticMethod("Semaphore", "(II)Lkotlinx/coroutines/sync/Semaphore;") { runtime, args, _ in
+            let permits = Int(args[0].asInt32)
+            let acquired = Int(args[1].asInt32)
+            guard permits >= 0, acquired >= 0, acquired <= permits else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Semaphore requires 0 <= acquiredPermits <= permits")
+            }
+            return runtime.makeNative("Lkotlinx/coroutines/sync/Semaphore;", payload: VMSemaphorePayload(permits: permits - acquired))
+        }
+        semaphoreKt.staticMethod("Semaphore", "(I)Lkotlinx/coroutines/sync/Semaphore;") { runtime, args, _ in
+            let permits = Int(args[0].asInt32)
+            guard permits >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Semaphore requires non-negative permits")
+            }
+            return runtime.makeNative("Lkotlinx/coroutines/sync/Semaphore;", payload: VMSemaphorePayload(permits: permits))
+        }
+        result.append(semaphoreKt)
+
+        // The object behind the inlined `suspendCancellableCoroutine` body.
+        let cancellableContinuation = NativeClass(
+            "Lkotlinx/coroutines/CancellableContinuationImpl;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/coroutines/Continuation;"]
+        )
+        cancellableContinuation.method("<init>", "(Lkotlin/coroutines/Continuation;I)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMCancellableContinuationPayload(completion: args[1]))
+            return .zero
+        }
+        cancellableContinuation.method("initCancellability", "()V") { _, _, _ in .zero }
+        cancellableContinuation.method("isActive", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCancellableContinuationPayload.self)?.isActive ?? false)
+        }
+        cancellableContinuation.method("isCompleted", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCancellableContinuationPayload.self)?.completed ?? false)
+        }
+        cancellableContinuation.method("isCancelled", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCancellableContinuationPayload.self)?.cancelled ?? false)
+        }
+        cancellableContinuation.method("getContext", "()Lkotlin/coroutines/CoroutineContext;") { runtime, args, _ in
+            guard let completion = runtime.payload(args[0], as: VMCancellableContinuationPayload.self)?.completion,
+                  let cls = runtime.classOf(completion),
+                  let method = cls.lookupVirtual(key: "getContext()Lkotlin/coroutines/CoroutineContext;") else {
+                return runtime.findClass("Lkotlin/coroutines/EmptyCoroutineContext;").map { $0.staticValues[0] } ?? .null
+            }
+            return (try? runtime.invoke(method, [completion])) ?? .null
+        }
+        cancellableContinuation.method("invokeOnCancellation", "(Lkotlin/jvm/functions/Function1;)V") { runtime, args, _ in
+            let payload = runtime.mutableCancellableContinuation(args[0])
+            payload.cancellationHandler = args[1]
+            if payload.cancelled, args[1].object != nil {
+                _ = try? runtime.callFunction(args[1], [payload.failure])
+            }
+            return .zero
+        }
+        cancellableContinuation.method("resumeWith", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            let payload = runtime.mutableCancellableContinuation(args[0])
+            if runtime.classOf(args[1])?.descriptor == "Lkotlin/Result$Failure;" {
+                let failure = runtime.payload(args[1], as: VMResultPayload.self)?.value ?? .null
+                guard payload.complete(exception: failure) else {
+                    throw VMJavaException("Ljava/lang/IllegalStateException;", "Already resumed")
+                }
+            } else {
+                guard payload.complete(value: args[1]) else {
+                    throw VMJavaException("Ljava/lang/IllegalStateException;", "Already resumed")
+                }
+            }
+            return .zero
+        }
+        cancellableContinuation.method("resume", "(Ljava/lang/Object;Lkotlin/jvm/functions/Function1;)V") { runtime, args, _ in
+            let payload = runtime.mutableCancellableContinuation(args[0])
+            guard payload.complete(value: args[1]) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "Already resumed")
+            }
+            return .zero
+        }
+        cancellableContinuation.method("cancel", "(Ljava/util/concurrent/CancellationException;)Z") { runtime, args, _ in
+            let payload = runtime.mutableCancellableContinuation(args[0])
+            guard payload.isActive else { return .boolean(false) }
+            payload.failure = args[1]
+            payload.cancelled = true
+            if payload.cancellationHandler.object != nil {
+                _ = try? runtime.callFunction(payload.cancellationHandler, [args[1]])
+            }
+            return .boolean(true)
+        }
+        cancellableContinuation.method("getResult", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMCancellableContinuationPayload.self) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "invalid continuation")
+            }
+            if payload.failure.bits != 0 {
+                let value = payload.failure
+                let descriptor = runtime.classOf(value)?.descriptor ?? "Ljava/util/concurrent/CancellationException;"
+                var exception = VMJavaException(descriptor, runtime.stringValue(runtime.javaToString(value)))
+                exception.object = value
+                throw exception
+            }
+            if payload.cancelled {
+                throw VMJavaException("Ljava/util/concurrent/CancellationException;", "Continuation was cancelled")
+            }
+            if payload.completed { return payload.result }
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "coroutine suspension is not supported")
+        }
+        result.append(cancellableContinuation)
 
         return result
     }
@@ -1417,6 +1728,230 @@ enum KotlinRuntime {
             runtime.appendString(args[1], kind: "string", value: runtime.newString(total))
             return args[1]
         }
+        // `take` copies at most `count` leading elements. A negative count is a
+        // programming error on the JVM and the request past the end copies all.
+        collections.staticMethod("take", "(Ljava/lang/Iterable;I)Ljava/util/List;") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested element count \(count) is less than zero.")
+            }
+            let items = runtime.kotlinIterableItems(args[0])
+            return runtime.makeNative(
+                "Ljava/util/ArrayList;",
+                payload: VMListPayload(count >= items.count ? items : Array(items.prefix(count)), immutable: true)
+            )
+        }
+        collections.staticMethod("withIndex", "(Ljava/lang/Iterable;)Ljava/lang/Iterable;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for (index, item) in runtime.kotlinIterableItems(args[0]).enumerated() {
+                output.append(runtime.makeNative(
+                    "Lkotlin/collections/IndexedValue;",
+                    payload: VMIndexedValuePayload(index: Int32(index), value: item)
+                ))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output, immutable: true))
+        }
+        // The primitive-collection conversions unbox each `java.lang.Number`
+        // (or `Character`) element into a raw array slot.
+        let collectionToArray: [(String, String)] = [
+            ("toByteArray", "B"),
+            ("toCharArray", "C"),
+            ("toIntArray", "I"),
+        ]
+        for (name, component) in collectionToArray {
+            collections.staticMethod(name, "(Ljava/util/Collection;)[\(component)") { runtime, args, _ in
+                let items = runtime.listItems(args[0]) ?? []
+                let array = runtime.newArray(component: component, count: items.count)
+                for (index, item) in items.enumerated() {
+                    runtime.setArrayElement(array, index: index, value: runtime.unboxedPrimitive(item))
+                }
+                return array
+            }
+        }
+        collections.staticMethod("throwCountOverflow", "()V") { _, _, _ in
+            throw VMJavaException("Ljava/lang/ArithmeticException;", "Count overflow has happened.")
+        }
+        collections.staticMethod("minus", "(Ljava/lang/Iterable;Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
+            var items = runtime.kotlinIterableItems(args[0])
+            if let index = items.firstIndex(where: { runtime.javaEquals($0, args[1]) }) {
+                items.remove(at: index)
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+        }
+        collections.staticMethod("minus", "(Ljava/lang/Iterable;Ljava/lang/Iterable;)Ljava/util/List;") { runtime, args, _ in
+            let removed = runtime.kotlinIterableItems(args[1])
+            let items = runtime.kotlinIterableItems(args[0]).filter { item in
+                !removed.contains(where: { runtime.javaEquals($0, item) })
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+        }
+        collections.staticMethod("shuffled", "(Ljava/lang/Iterable;)Ljava/util/List;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(runtime.kotlinIterableItems(args[0]).shuffled()))
+        }
+        collections.staticMethod("single", "(Ljava/lang/Iterable;)Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.kotlinIterableItems(args[0])
+            guard let only = items.first else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Collection is empty.")
+            }
+            guard items.count == 1 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Collection has more than one element.")
+            }
+            return only
+        }
+        collections.staticMethod("toSortedSet", "(Ljava/lang/Iterable;)Ljava/util/SortedSet;") { runtime, args, _ in
+            // Linked-hash iteration order does not sort, so order the copy here;
+            // the payload type only has to behave like a `Set`.
+            let items = runtime.kotlinIterableItems(args[0])
+                .sorted { runtime.naturalCompare($0, $1) < 0 }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
+        }
+        collections.staticMethod("asReversedMutable", "(Ljava/util/List;)Ljava/util/List;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload((runtime.listPayload(args[0])?.items ?? []).reversed()))
+        }
+        collections.staticMethod("sortWith", "(Ljava/util/List;Ljava/util/Comparator;)V") { runtime, args, _ in
+            try runtime.sortList(args[0], comparator: args[1])
+            return .zero
+        }
+        collections.staticMethod("maxOrNull", "(Ljava/lang/Iterable;)Ljava/lang/Comparable;") { runtime, args, _ in
+            var best: VMValue?
+            for item in runtime.kotlinIterableItems(args[0]) {
+                if let current = best {
+                    if runtime.naturalCompare(item, current) > 0 { best = item }
+                } else {
+                    best = item
+                }
+            }
+            return best ?? .null
+        }
+        collections.staticMethod("randomOrNull", "(Ljava/util/Collection;Lkotlin/random/Random;)Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listItems(args[0]) ?? []
+            guard !items.isEmpty else { return .null }
+            return items[Int.random(in: 0..<items.count)]
+        }
+        collections.staticMethod("removeAll", "(Ljava/util/List;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            var removed = false
+            var kept: [VMValue] = []
+            kept.reserveCapacity(list.items.count)
+            for item in list.items {
+                if predicateTruth(try runtime.callFunction(args[1], [item])) {
+                    removed = true
+                } else {
+                    kept.append(item)
+                }
+            }
+            list.items = kept
+            return .boolean(removed)
+        }
+        collections.staticMethod("indexOf", "(Ljava/util/List;Ljava/lang/Object;)I") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            return .int32(Int32(items.firstIndex(where: { runtime.javaEquals($0, args[1]) }) ?? -1))
+        }
+        collections.staticMethod("toMutableList", "(Ljava/lang/Iterable;)Ljava/util/List;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(runtime.kotlinIterableItems(args[0])))
+        }
+        collections.staticMethod("toHashSet", "(Ljava/lang/Iterable;)Ljava/util/HashSet;") { runtime, args, _ in
+            var items: [VMValue] = []
+            for item in runtime.kotlinIterableItems(args[0]) where !items.contains(where: { runtime.javaEquals($0, item) }) {
+                items.append(item)
+            }
+            return runtime.makeNative("Ljava/util/HashSet;", payload: VMSetPayload(items))
+        }
+        collections.staticMethod("intersect", "(Ljava/lang/Iterable;Ljava/lang/Iterable;)Ljava/util/Set;") { runtime, args, _ in
+            let other = runtime.kotlinIterableItems(args[1])
+            var items: [VMValue] = []
+            for item in runtime.kotlinIterableItems(args[0])
+            where other.contains(where: { runtime.javaEquals($0, item) }) && !items.contains(where: { runtime.javaEquals($0, item) }) {
+                items.append(item)
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
+        }
+        collections.staticMethod("union", "(Ljava/lang/Iterable;Ljava/lang/Iterable;)Ljava/util/Set;") { runtime, args, _ in
+            var items: [VMValue] = []
+            for item in runtime.kotlinIterableItems(args[0]) + runtime.kotlinIterableItems(args[1])
+            where !items.contains(where: { runtime.javaEquals($0, item) }) {
+                items.append(item)
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
+        }
+        collections.staticMethod("any", "(Ljava/lang/Iterable;)Z") { runtime, args, _ in
+            .boolean(!runtime.kotlinIterableItems(args[0]).isEmpty)
+        }
+        collections.staticMethod("averageOfInt", "(Ljava/lang/Iterable;)D") { runtime, args, _ in
+            let items = runtime.kotlinIterableItems(args[0])
+            guard !items.isEmpty else { return .double(Double.nan) }
+            let total = items.reduce(0.0) { $0 + Double($1.asBoxedInt(runtime)) }
+            return .double(total / Double(items.count))
+        }
+        collections.staticMethod("elementAtOrNull", "(Ljava/lang/Iterable;I)Ljava/lang/Object;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            let items = runtime.kotlinIterableItems(args[0])
+            return index >= 0 && index < items.count ? items[index] : .null
+        }
+        collections.staticMethod("getIndices", "(Ljava/util/Collection;)Lkotlin/ranges/IntRange;") { runtime, args, _ in
+            let size = (runtime.listItems(args[0]) ?? []).count
+            return runtime.makeNative("Lkotlin/ranges/IntRange;", payload: VMIntRangePayload(first: 0, last: size - 1))
+        }
+        collections.staticMethod("minOrThrow", "(Ljava/lang/Iterable;)Ljava/lang/Comparable;") { runtime, args, _ in
+            var best: VMValue?
+            for item in runtime.kotlinIterableItems(args[0]) {
+                if let current = best {
+                    if runtime.naturalCompare(item, current) < 0 { best = item }
+                } else {
+                    best = item
+                }
+            }
+            guard let best else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Collection is empty.")
+            }
+            return best
+        }
+        collections.staticMethod("binarySearch$default", "(Ljava/util/List;Ljava/lang/Comparable;IIILjava/lang/Object;)I") { runtime, args, _ in
+            let mask = args[4].asInt32
+            let items = runtime.listPayload(args[0])?.items ?? []
+            let from = mask & 4 != 0 ? 0 : Int(args[2].asInt32)
+            let to = mask & 8 != 0 ? items.count : Int(args[3].asInt32)
+            var low = max(0, from)
+            var high = min(items.count, to) - 1
+            while low <= high {
+                let middle = (low + high) / 2
+                let order = runtime.naturalCompare(items[middle], args[1])
+                if order < 0 {
+                    low = middle + 1
+                } else if order > 0 {
+                    high = middle - 1
+                } else {
+                    return .int32(Int32(middle))
+                }
+            }
+            return .int32(Int32(-(low + 1)))
+        }
+        collections.staticMethod("addAll", "(Ljava/util/Collection;Lkotlin/sequences/Sequence;)Z") { runtime, args, _ in
+            let incoming = runtime.sequenceValues(args[1])
+            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
+            return .boolean(!incoming.isEmpty)
+        }
+        collections.staticMethod("removeAll", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
+            let target = try runtime.mutableList(args[0])
+            var removed = false
+            var kept: [VMValue] = []
+            for item in target.items {
+                if predicateTruth(try runtime.callFunction(args[1], [item])) {
+                    removed = true
+                } else {
+                    kept.append(item)
+                }
+            }
+            target.items = kept
+            return .boolean(removed)
+        }
+        collections.staticMethod("retainAll", "(Ljava/util/List;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
+            let target = try runtime.mutableList(args[0])
+            let kept = try target.items.filter { predicateTruth(try runtime.callFunction(args[1], [$0])) }
+            let changed = kept.count != target.items.count
+            target.items = kept
+            return .boolean(changed)
+        }
         result.append(collections)
 
         let setsKt = NativeClass("Lkotlin/collections/SetsKt;")
@@ -1452,6 +1987,39 @@ enum KotlinRuntime {
         setsKt.staticMethod("plus", "(Ljava/util/Set;Ljava/lang/Object;)Ljava/util/Set;") { runtime, args, _ in
             var items = runtime.kotlinIterableItems(args[0])
             if !items.contains(where: { runtime.javaEquals($0, args[1]) }) { items.append(args[1]) }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
+        }
+        setsKt.staticMethod("build", "(Ljava/util/Set;)Ljava/util/Set;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(runtime.listItems(args[0]) ?? [], immutable: true))
+        }
+        setsKt.staticMethod("createSetBuilder", "()Ljava/util/Set;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload())
+        }
+        setsKt.staticMethod("hashSetOf", "([Ljava/lang/Object;)Ljava/util/HashSet;") { runtime, args, _ in
+            var items: [VMValue] = []
+            for index in 0..<runtime.arrayLength(args[0]) {
+                let item = runtime.arrayElement(args[0], index)
+                if !items.contains(where: { runtime.javaEquals($0, item) }) { items.append(item) }
+            }
+            return runtime.makeNative("Ljava/util/HashSet;", payload: VMSetPayload(items))
+        }
+        setsKt.staticMethod("mutableSetOf", "([Ljava/lang/Object;)Ljava/util/Set;") { runtime, args, _ in
+            var items: [VMValue] = []
+            for index in 0..<runtime.arrayLength(args[0]) {
+                let item = runtime.arrayElement(args[0], index)
+                if !items.contains(where: { runtime.javaEquals($0, item) }) { items.append(item) }
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
+        }
+        setsKt.staticMethod("minus", "(Ljava/util/Set;Ljava/lang/Object;)Ljava/util/Set;") { runtime, args, _ in
+            let items = runtime.kotlinIterableItems(args[0]).filter { !runtime.javaEquals($0, args[1]) }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
+        }
+        setsKt.staticMethod("minus", "(Ljava/util/Set;Ljava/lang/Iterable;)Ljava/util/Set;") { runtime, args, _ in
+            let removed = runtime.kotlinIterableItems(args[1])
+            let items = runtime.kotlinIterableItems(args[0]).filter { item in
+                !removed.contains(where: { runtime.javaEquals($0, item) })
+            }
             return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(items))
         }
         result.append(setsKt)
@@ -1540,6 +2108,9 @@ enum KotlinRuntime {
             for entry in runtime.mapPayload(args[0])?.entries ?? [] where runtime.javaEquals(entry.key, args[1]) {
                 return entry.value
             }
+            if let factory = runtime.mapPayload(args[0])?.defaultFactory {
+                return try runtime.callFunction(factory, [args[1]])
+            }
             throw VMJavaException("Ljava/util/NoSuchElementException;", "Key \(runtime.stringValue(runtime.javaToString(args[1])) ?? "?") is missing in the map.")
         }
         maps.staticMethod("hashMapOf", "([Lkotlin/Pair;)Ljava/util/HashMap;") { runtime, args, _ in
@@ -1582,6 +2153,78 @@ enum KotlinRuntime {
         maps.staticMethod("toMutableMap", "(Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
             runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(runtime.mapPayload(args[0])?.entries ?? []))
         }
+        maps.staticMethod("toSortedMap", "(Ljava/util/Map;)Ljava/util/SortedMap;") { runtime, args, _ in
+            // `SortedMap` iteration is key-ordered; keep insertion order only
+            // for equal keys, mirroring TreeMap's stable comparator.
+            let entries = (runtime.mapPayload(args[0])?.entries ?? []).sorted { left, right in
+                runtime.naturalCompare(left.key, right.key) < 0
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        maps.staticMethod("build", "(Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(runtime.mapPayload(args[0])?.entries ?? [], immutable: true))
+        }
+        maps.staticMethod("createMapBuilder", "()Ljava/util/Map;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload())
+        }
+        maps.staticMethod("plus", "(Ljava/util/Map;Lkotlin/Pair;)Ljava/util/Map;") { runtime, args, _ in
+            var entries = runtime.mapPayload(args[0])?.entries ?? []
+            guard let pair: VMPairPayload = runtime.payload(args[1], as: VMPairPayload.self) else {
+                return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+            }
+            if let index = entries.firstIndex(where: { runtime.javaEquals($0.key, pair.first) }) {
+                entries[index].value = pair.second
+            } else {
+                entries.append((pair.first, pair.second))
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        maps.staticMethod("plus", "(Ljava/util/Map;Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
+            var entries = runtime.mapPayload(args[0])?.entries ?? []
+            for entry in runtime.mapPayload(args[1])?.entries ?? [] {
+                if let index = entries.firstIndex(where: { runtime.javaEquals($0.key, entry.key) }) {
+                    entries[index].value = entry.value
+                } else {
+                    entries.append(entry)
+                }
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        maps.staticMethod("asSequence", "(Ljava/util/Map;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            let pairs = (runtime.mapPayload(args[0])?.entries ?? []).map { entry in
+                runtime.makeNative("Lkotlin/Pair;", payload: VMPairPayload(first: entry.key, second: entry.value))
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(pairs))
+        }
+        maps.staticMethod("toMap", "(Ljava/lang/Iterable;Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
+            var entries = runtime.mapPayload(args[1])?.entries ?? []
+            for item in runtime.kotlinIterableItems(args[0]) {
+                guard let pair: VMPairPayload = runtime.payload(item, as: VMPairPayload.self) else { continue }
+                entries.append((pair.first, pair.second))
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        maps.staticMethod("toMap", "(Ljava/util/Map;Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
+            var entries = runtime.mapPayload(args[1])?.entries ?? []
+            entries.append(contentsOf: runtime.mapPayload(args[0])?.entries ?? [])
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        maps.staticMethod("withDefault", "(Ljava/util/Map;Lkotlin/jvm/functions/Function1;)Ljava/util/Map;") { runtime, args, _ in
+            // The observable part of `withDefault` is `getValue` on a missing
+            // key; carry the factory alongside the entries.
+            let copy = VMMapPayload(runtime.mapPayload(args[0])?.entries ?? [])
+            copy.defaultFactory = args[1]
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: copy)
+        }
+        maps.staticMethod("linkedMapOf", "([Lkotlin/Pair;)Ljava/util/LinkedHashMap;") { runtime, args, _ in
+            var entries: [(key: VMValue, value: VMValue)] = []
+            for index in 0..<runtime.arrayLength(args[0]) {
+                if let pair: VMPairPayload = runtime.payload(runtime.arrayElement(args[0], index), as: VMPairPayload.self) {
+                    entries.append((pair.first, pair.second))
+                }
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
         result.append(maps)
 
         let comparisons = NativeClass("Lkotlin/comparisons/ComparisonsKt;")
@@ -1618,7 +2261,283 @@ enum KotlinRuntime {
             }
             return .int32(Int32.random(in: Int32(first)...Int32(last)))
         }
+        ranges.staticMethod("step", "(Lkotlin/ranges/IntProgression;I)Lkotlin/ranges/IntProgression;") { runtime, args, _ in
+            let requested = args[1].asInt32
+            guard requested > 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Step must be positive, was: \(requested).")
+            }
+            let range = runtime.payload(args[0], as: VMIntRangePayload.self)
+            let baseStep = Int32(truncatingIfNeeded: range?.step ?? 1)
+            let step = baseStep.multipliedReportingOverflow(by: requested).partialValue
+            return runtime.makeNative(
+                "Lkotlin/ranges/IntProgression;",
+                payload: VMIntRangePayload(
+                    first: range?.first ?? 0,
+                    last: range?.last ?? 0,
+                    step: Int(step == 0 ? 1 : step)
+                )
+            )
+        }
+        ranges.staticMethod("reversed", "(Lkotlin/ranges/IntProgression;)Lkotlin/ranges/IntProgression;") { runtime, args, _ in
+            let range = runtime.payload(args[0], as: VMIntRangePayload.self)
+            let step = range?.step ?? 1
+            return runtime.makeNative(
+                "Lkotlin/ranges/IntProgression;",
+                payload: VMIntRangePayload(
+                    first: range?.last ?? 0,
+                    last: range?.first ?? 0,
+                    step: -(step > 0 ? step : -step)
+                )
+            )
+        }
+        ranges.staticMethod("until", "(JJ)Lkotlin/ranges/LongRange;") { runtime, args, _ in
+            let first = args[0].asInt64
+            let until = args[1].asInt64
+            guard until > Int64.min else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Cannot form range with maximum value equal to MIN_VALUE")
+            }
+            return runtime.makeNative(
+                "Lkotlin/ranges/LongRange;",
+                payload: VMLongRangePayload(first: first, last: until - 1)
+            )
+        }
+        ranges.staticMethod("coerceAtMost", "(FF)F") { _, args, _ in .float(min(args[0].asFloat, args[1].asFloat)) }
+        ranges.staticMethod("coerceAtMost", "(JJ)J") { _, args, _ in .int64(min(args[0].asInt64, args[1].asInt64)) }
+        ranges.staticMethod("coerceAtLeast", "(FF)F") { _, args, _ in .float(max(args[0].asFloat, args[1].asFloat)) }
+        ranges.staticMethod("coerceAtLeast", "(JJ)J") { _, args, _ in .int64(max(args[0].asInt64, args[1].asInt64)) }
+        ranges.staticMethod("coerceIn", "(FFF)F") { _, args, _ in
+            let value = args[0].asFloat
+            let minimum = args[1].asFloat
+            let maximum = args[2].asFloat
+            guard minimum <= maximum else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Cannot coerce value to an empty range: maximum \(maximum) is less than minimum \(minimum).")
+            }
+            return .float(min(max(value, minimum), maximum))
+        }
+        ranges.staticMethod("coerceIn", "(DDD)D") { _, args, _ in
+            let value = args[0].asDouble
+            let minimum = args[1].asDouble
+            let maximum = args[2].asDouble
+            guard minimum <= maximum else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Cannot coerce value to an empty range: maximum \(maximum) is less than minimum \(minimum).")
+            }
+            return .double(min(max(value, minimum), maximum))
+        }
+        ranges.staticMethod("coerceIn", "(ILkotlin/ranges/ClosedRange;)I") { runtime, args, _ in
+            // A `ClosedRange<Int>` built by the extension exposes fixed getters.
+            guard let cls = runtime.classOf(args[1]),
+                  let start = cls.lookupVirtual(key: "getStart()I") ?? cls.lookupVirtual(key: "getFirst()I"),
+                  let end = cls.lookupVirtual(key: "getEndInclusive()I") ?? cls.lookupVirtual(key: "getLast()I") else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "invalid range")
+            }
+            let minimum = try runtime.invoke(start, [args[1]]).asInt32
+            let maximum = try runtime.invoke(end, [args[1]]).asInt32
+            guard minimum <= maximum else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Cannot coerce value to an empty range: maximum \(maximum) is less than minimum \(minimum).")
+            }
+            return .int32(min(max(args[0].asInt32, minimum), maximum))
+        }
+        ranges.staticMethod("rangeUntil", "(Ljava/lang/Comparable;Ljava/lang/Comparable;)Lkotlin/ranges/OpenEndRange;") { runtime, args, _ in
+            runtime.makeNative(
+                "Lkotlin/ranges/ComparableOpenEndRange;",
+                payload: VMPairPayload(first: args[0], second: args[1])
+            )
+        }
+        ranges.staticMethod("random", "(Lkotlin/ranges/CharRange;Lkotlin/random/Random;)C") { runtime, args, _ in
+            let range = runtime.payload(args[0], as: VMIntRangePayload.self)
+            let first = range?.first ?? 0
+            let last = range?.last ?? -1
+            guard first <= last else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Cannot get random in empty range: \(first)..\(last)")
+            }
+            return .int32(Int32.random(in: Int32(first)...Int32(last)))
+        }
         result.append(ranges)
+
+        let longRange = NativeClass("Lkotlin/ranges/LongRange;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Iterable;"])
+        longRange.method("<init>", "(JJ)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMLongRangePayload(first: args[1].asInt64, last: args[2].asInt64))
+            return .zero
+        }
+        longRange.method("getFirst", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMLongRangePayload.self)?.first ?? 0)
+        }
+        longRange.method("getLast", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMLongRangePayload.self)?.last ?? 0)
+        }
+        longRange.method("getStart", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMLongRangePayload.self)?.first ?? 0)
+        }
+        longRange.method("getEndInclusive", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMLongRangePayload.self)?.last ?? 0)
+        }
+        longRange.method("isEmpty", "()Z") { runtime, args, _ in
+            let range = runtime.payload(args[0], as: VMLongRangePayload.self)
+            return .boolean((range?.first ?? 0) > (range?.last ?? -1))
+        }
+        longRange.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let range = runtime.payload(args[0], as: VMLongRangePayload.self)
+            return runtime.newString("\(range?.first ?? 0)..\(range?.last ?? 0)")
+        }
+        result.append(longRange)
+
+        let openEndRange = NativeClass(
+            "Lkotlin/ranges/OpenEndRange;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        openEndRange.method("getStart", "()Ljava/lang/Comparable;") { _, _, _ in .null }
+        openEndRange.method("getEndExclusive", "()Ljava/lang/Comparable;") { _, _, _ in .null }
+        openEndRange.method("contains", "(Ljava/lang/Comparable;)Z") { _, _, _ in .boolean(false) }
+        openEndRange.method("isEmpty", "()Z") { _, _, _ in .boolean(true) }
+        result.append(openEndRange)
+
+        let comparableRange = NativeClass(
+            "Lkotlin/ranges/ComparableOpenEndRange;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/ranges/OpenEndRange;"]
+        )
+        comparableRange.method("getStart", "()Ljava/lang/Comparable;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMPairPayload.self)?.first ?? .null
+        }
+        comparableRange.method("getEndExclusive", "()Ljava/lang/Comparable;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMPairPayload.self)?.second ?? .null
+        }
+        comparableRange.method("contains", "(Ljava/lang/Comparable;)Z") { runtime, args, _ in
+            guard let payload: VMPairPayload = runtime.payload(args[0], as: VMPairPayload.self) else {
+                return .boolean(false)
+            }
+            return .boolean(
+                runtime.naturalCompare(args[1], payload.first) >= 0
+                    && runtime.naturalCompare(args[1], payload.second) < 0
+            )
+        }
+        comparableRange.method("isEmpty", "()Z") { runtime, args, _ in
+            guard let payload: VMPairPayload = runtime.payload(args[0], as: VMPairPayload.self) else {
+                return .boolean(true)
+            }
+            return .boolean(runtime.naturalCompare(payload.first, payload.second) >= 0)
+        }
+        result.append(comparableRange)
+
+        // `kotlin.collections.ArrayDeque` is a mutable Kotlin list with
+        // index-0 = first element; a list payload gives the JDK's ordering.
+        let arrayDeque = NativeClass(
+            "Lkotlin/collections/ArrayDeque;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Ljava/util/Collection;", "Ljava/lang/Iterable;"]
+        )
+        arrayDeque.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload())
+            return .zero
+        }
+        arrayDeque.method("<init>", "(Ljava/util/Collection;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload(runtime.listItems(args[1]) ?? []))
+            return .zero
+        }
+        arrayDeque.method("isEmpty", "()Z") { runtime, args, _ in
+            .boolean((runtime.listPayload(args[0])?.items ?? []).isEmpty)
+        }
+        arrayDeque.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.listPayload(args[0])?.items.count ?? 0))
+        }
+        arrayDeque.method("add", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            try runtime.mutableList(args[0]).items.append(args[1])
+            return .boolean(true)
+        }
+        arrayDeque.method("addFirst", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            try runtime.mutableList(args[0]).items.insert(args[1], at: 0)
+            return .zero
+        }
+        arrayDeque.method("addLast", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            try runtime.mutableList(args[0]).items.append(args[1])
+            return .zero
+        }
+        arrayDeque.method("addAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            let incoming = runtime.listItems(args[1]) ?? []
+            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
+            return .boolean(!incoming.isEmpty)
+        }
+        arrayDeque.method("removeFirst", "()Ljava/lang/Object;") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            guard !list.items.isEmpty else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "ArrayDeque is empty.")
+            }
+            return list.items.removeFirst()
+        }
+        arrayDeque.method("removeLast", "()Ljava/lang/Object;") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            guard !list.items.isEmpty else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "ArrayDeque is empty.")
+            }
+            return list.items.removeLast()
+        }
+        arrayDeque.method("firstOrNull", "()Ljava/lang/Object;") { runtime, args, _ in
+            runtime.listPayload(args[0])?.items.first ?? .null
+        }
+        arrayDeque.method("lastOrNull", "()Ljava/lang/Object;") { runtime, args, _ in
+            runtime.listPayload(args[0])?.items.last ?? .null
+        }
+        arrayDeque.method("set", "(ILjava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < list.items.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index: \(index), size: \(list.items.count)")
+            }
+            let previous = list.items[index]
+            list.items[index] = args[2]
+            return previous
+        }
+        arrayDeque.method("clear", "()V") { runtime, args, _ in
+            try runtime.mutableList(args[0]).items.removeAll()
+            return .zero
+        }
+        arrayDeque.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            runtime.makeNative(
+                "Ljava/util/ListItr;",
+                payload: VMListIteratorPayload(runtime.listPayload(args[0])?.items ?? [])
+            )
+        }
+        arrayDeque.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.collectionToString(args[0])
+        }
+        result.append(arrayDeque)
+
+        let grouping = NativeClass(
+            "Lkotlin/collections/Grouping;",
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        grouping.method("keyOf", "(Ljava/lang/Object;)Ljava/lang/Object;") { _, _, _ in .null }
+        grouping.method("sourceIterator", "()Ljava/util/Iterator;") { _, _, _ in .null }
+        result.append(grouping)
+
+        let groupingKt = NativeClass("Lkotlin/collections/GroupingKt;")
+        groupingKt.staticMethod("eachCount", "(Lkotlin/collections/Grouping;)Ljava/util/Map;") { runtime, args, _ in
+            guard let cls = runtime.classOf(args[0]),
+                  let keyOf = cls.lookupVirtual(key: "keyOf(Ljava/lang/Object;)Ljava/lang/Object;"),
+                  let sourceIterator = cls.lookupVirtual(key: "sourceIterator()Ljava/util/Iterator;") else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "invalid grouping")
+            }
+            var entries: [(key: VMValue, value: VMValue)] = []
+            let iterator = try runtime.invoke(sourceIterator, [args[0]])
+            guard let iteratorClass = runtime.classOf(iterator),
+                  let hasNext = iteratorClass.lookupVirtual(key: "hasNext()Z"),
+                  let next = iteratorClass.lookupVirtual(key: "next()Ljava/lang/Object;") else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "grouping source has no iterator")
+            }
+            while try runtime.invoke(hasNext, [iterator]).asBoolean {
+                let item = try runtime.invoke(next, [iterator])
+                let key = try runtime.invoke(keyOf, [args[0], item])
+                if let index = entries.firstIndex(where: { runtime.javaEquals($0.key, key) }) {
+                    entries[index].value = runtime.boxInt(entries[index].value.asBoxedInt(runtime) + 1)
+                } else {
+                    entries.append((key, runtime.boxInt(1)))
+                }
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        result.append(groupingKt)
 
         comparisons.staticMethod("maxOf", "(II)I") { _, args, _ in .int32(max(args[0].asInt32, args[1].asInt32)) }
         comparisons.staticMethod("maxOf", "(JJ)J") { _, args, _ in .int64(max(args[0].asInt64, args[1].asInt64)) }
@@ -1642,7 +2561,57 @@ enum KotlinRuntime {
         comparisons.staticMethod("compareValues", "(Ljava/lang/Comparable;Ljava/lang/Comparable;)I") { runtime, args, _ in
             .int32(runtime.naturalCompare(args[0], args[1]))
         }
+        comparisons.staticMethod("compareBy", "([Lkotlin/jvm/functions/Function1;)Ljava/util/Comparator;") { runtime, args, _ in
+            var selectors: [VMValue] = []
+            for index in 0..<runtime.arrayLength(args[0]) {
+                selectors.append(runtime.arrayElement(args[0], index))
+            }
+            return runtime.makeNative("Lkotlin/comparisons/KotlinComparator;", payload: VMComparatorPayload(kind: .selectors(selectors)))
+        }
+        comparisons.staticMethod("reverseOrder", "()Ljava/util/Comparator;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/comparisons/KotlinComparator;", payload: VMComparatorPayload(kind: .reverse))
+        }
+        comparisons.staticMethod("naturalOrder", "()Ljava/util/Comparator;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/comparisons/KotlinComparator;", payload: VMComparatorPayload(kind: .natural))
+        }
+        comparisons.staticMethod("minOf", "(Ljava/lang/Comparable;Ljava/lang/Comparable;)Ljava/lang/Comparable;") { runtime, args, _ in
+            runtime.naturalCompare(args[0], args[1]) <= 0 ? args[0] : args[1]
+        }
         result.append(comparisons)
+
+        let comparator = NativeClass(
+            "Lkotlin/comparisons/KotlinComparator;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Ljava/util/Comparator;"]
+        )
+        comparator.method("compare", "(Ljava/lang/Object;Ljava/lang/Object;)I") { runtime, args, _ in
+            guard let payload: VMComparatorPayload = runtime.payload(args[0], as: VMComparatorPayload.self) else {
+                return .int32(0)
+            }
+            switch payload.kind {
+            case .natural:
+                return .int32(runtime.naturalCompare(args[1], args[2]))
+            case .reverse:
+                return .int32(-runtime.naturalCompare(args[1], args[2]))
+            case .caseInsensitive:
+                let left = (runtime.stringValue(runtime.javaToString(args[1])) ?? "").lowercased()
+                let right = (runtime.stringValue(runtime.javaToString(args[2])) ?? "").lowercased()
+                if left == right { return .int32(0) }
+                return .int32(left < right ? -1 : 1)
+            case .selectors(let selectors):
+                for selector in selectors {
+                    let left = try runtime.callFunction(selector, [args[1]])
+                    let right = try runtime.callFunction(selector, [args[2]])
+                    let order = runtime.naturalCompare(left, right)
+                    if order != 0 { return .int32(order) }
+                }
+                return .int32(0)
+            }
+        }
+        comparator.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            .boolean(runtime.javaEquals(args[0], args[1]))
+        }
+        result.append(comparator)
 
         let mathKt = NativeClass("Lkotlin/math/MathKt;")
         mathKt.staticMethod("abs", "(I)I") { _, args, _ in .int32(Swift.abs(args[0].asInt32)) }
@@ -1654,6 +2623,9 @@ enum KotlinRuntime {
         mathKt.staticMethod("floor", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.down)) }
         mathKt.staticMethod("sqrt", "(D)D") { _, args, _ in .double(args[0].asDouble.squareRoot()) }
         mathKt.staticMethod("pow", "(DD)D") { _, args, _ in .double(pow(args[0].asDouble, args[1].asDouble)) }
+        mathKt.staticMethod("roundToInt", "(D)I") { _, args, _ in .int32(Int32(truncatingIfNeeded: Int64(kotlinRound(args[0].asDouble)))) }
+        mathKt.staticMethod("roundToInt", "(F)I") { _, args, _ in .int32(Int32(truncatingIfNeeded: Int64(kotlinRound(Double(args[0].asFloat))))) }
+        mathKt.staticMethod("roundToLong", "(D)J") { _, args, _ in .int64(kotlinRound(args[0].asDouble)) }
         result.append(mathKt)
 
         let arrays = NativeClass("Lkotlin/collections/ArraysKt;")
@@ -1690,9 +2662,6 @@ enum KotlinRuntime {
             }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(pairs))
         }
-        arrays.staticMethod("plus", "([B[B)[B") { runtime, args, _ in
-            runtime.byteArrayValue(runtime.byteValues(args[0]) + runtime.byteValues(args[1]))
-        }
         arrays.staticMethod("toSet", "([Ljava/lang/Object;)Ljava/util/Set;") { runtime, args, _ in
             var items: [VMValue] = []
             for index in 0..<runtime.arrayLength(args[0]) {
@@ -1727,6 +2696,229 @@ enum KotlinRuntime {
             var text = parts.joined(separator: separator)
             if limit > 0, items.count > limit { text += truncated }
             return runtime.newString(prefix + text + postfix)
+        }
+        // MARK: primitive/reference array gaps
+        let primitiveArrayComponents = ["B", "C", "D", "F", "I", "J", "S", "Z"]
+        for component in primitiveArrayComponents + ["Ljava/lang/Object;"] {
+            let arrayType = "[\(component)"
+            arrays.staticMethod("copyOfRange", "(\(arrayType)II)\(arrayType)") { runtime, args, _ in
+                try copyOfRange(runtime, args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32))
+            }
+        }
+        for component in primitiveArrayComponents {
+            let arrayType = "[\(component)"
+            arrays.staticMethod("plus", "(\(arrayType)\(arrayType))\(arrayType)") { runtime, args, _ in
+                let values = arraySlots(runtime, args[0]) + arraySlots(runtime, args[1])
+                return arrayOfSlots(runtime, values, component: component, unbox: false)
+            }
+            // `plus(T[], Array<out T>)` reaches the array through `Object[]`,
+            // so every element arrives boxed.
+            arrays.staticMethod("plus", "(\(arrayType)[Ljava/lang/Object;)\(arrayType)") { runtime, args, _ in
+                let values = arraySlots(runtime, args[0]) + arraySlots(runtime, args[1])
+                return arrayOfSlots(runtime, values, component: component, unbox: true)
+            }
+        }
+        arrays.staticMethod("plus", "([Ljava/lang/Object;[Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            let values = arraySlots(runtime, args[0]) + arraySlots(runtime, args[1])
+            return arrayOfSlots(runtime, values, component: "Ljava/lang/Object;", unbox: false)
+        }
+        arrays.staticMethod("plus", "([Ljava/lang/Object;Ljava/util/Collection;)[Ljava/lang/Object;") { runtime, args, _ in
+            let values = arraySlots(runtime, args[0]) + (runtime.listItems(args[1]) ?? [])
+            return arrayOfSlots(runtime, values, component: "Ljava/lang/Object;", unbox: false)
+        }
+        arrays.staticMethod("contains", "([Ljava/lang/Object;Ljava/lang/Object;)Z") { runtime, args, _ in
+            .boolean(arraySlots(runtime, args[0]).contains { runtime.javaEquals($0, args[1]) })
+        }
+        arrays.staticMethod("toList", "([I)Ljava/util/List;") { runtime, args, _ in
+            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items, immutable: true))
+        }
+        arrays.staticMethod("toList", "([Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(arraySlots(runtime, args[0]), immutable: true))
+        }
+        arrays.staticMethod("joinToString$default", "([BLjava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;ILjava/lang/CharSequence;Lkotlin/jvm/functions/Function1;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let separator = runtime.stringValue(args[1]) ?? ", "
+            let prefix = runtime.stringValue(args[2]) ?? ""
+            let postfix = runtime.stringValue(args[3]) ?? ""
+            let limit = Int(args[4].asInt32)
+            let truncated = runtime.stringValue(args[5]) ?? "..."
+            let transform = args[6]
+            let all = arraySlots(runtime, args[0])
+            let effective = limit <= 0 ? all : Array(all.prefix(limit))
+            var parts: [String] = []
+            for slot in effective {
+                let boxed = runtime.boxInt(slot.asInt32)
+                let value = transform.bits == 0 ? boxed : try runtime.callFunction(transform, [boxed])
+                parts.append(runtime.stringValue(runtime.javaToString(value)) ?? "null")
+            }
+            var text = parts.joined(separator: separator)
+            if limit > 0, all.count > limit { text += truncated }
+            return runtime.newString(prefix + text + postfix)
+        }
+        arrays.staticMethod("reversedArray", "([B)[B") { runtime, args, _ in
+            arrayOfSlots(runtime, arraySlots(runtime, args[0]).reversed(), component: "B", unbox: false)
+        }
+        arrays.staticMethod("sum", "([I)I") { runtime, args, _ in
+            .int32(arraySlots(runtime, args[0]).reduce(Int32(0)) { $0 &+ $1.asInt32 })
+        }
+        arrays.staticMethod("first", "([B)B") { runtime, args, _ in
+            guard runtime.arrayLength(args[0]) > 0 else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Array is empty.")
+            }
+            return runtime.arrayElement(args[0], 0)
+        }
+        for letter in ["I", "J", "D", "F", "S", "C"] {
+            arrays.staticMethod("first", "([\(letter))\(letter)") { runtime, args, _ in
+                guard runtime.arrayLength(args[0]) > 0 else {
+                    throw VMJavaException("Ljava/util/NoSuchElementException;", "Array is empty.")
+                }
+                return runtime.arrayElement(args[0], 0)
+            }
+        }
+        for letter in ["B", "I", "J", "D", "F", "S", "C"] {
+            arrays.staticMethod("last", "([\(letter))\(letter)") { runtime, args, _ in
+                let size = runtime.arrayLength(args[0])
+                guard size > 0 else {
+                    throw VMJavaException("Ljava/util/NoSuchElementException;", "Array is empty.")
+                }
+                return runtime.arrayElement(args[0], size - 1)
+            }
+        }
+        arrays.staticMethod("first", "([Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            guard runtime.arrayLength(args[0]) > 0 else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Array is empty.")
+            }
+            return runtime.arrayElement(args[0], 0)
+        }
+        arrays.staticMethod("last", "([Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let size = runtime.arrayLength(args[0])
+            guard size > 0 else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Array is empty.")
+            }
+            return runtime.arrayElement(args[0], size - 1)
+        }
+        arrays.staticMethod("indexOf", "([Ljava/lang/Object;Ljava/lang/Object;)I") { runtime, args, _ in
+            let items = arraySlots(runtime, args[0])
+            return .int32(Int32(items.firstIndex(where: { runtime.javaEquals($0, args[1]) }) ?? -1))
+        }
+        arrays.staticMethod("reverse", "([B)V") { runtime, args, _ in
+            let count = runtime.arrayLength(args[0])
+            guard count > 1 else { return .zero }
+            var index = 0
+            while index < count / 2 {
+                let low = runtime.arrayElement(args[0], index)
+                let high = runtime.arrayElement(args[0], count - 1 - index)
+                runtime.setArrayElement(args[0], index: index, value: high)
+                runtime.setArrayElement(args[0], index: count - 1 - index, value: low)
+                index += 1
+            }
+            return .zero
+        }
+        arrays.staticMethod("take", "([BI)Ljava/util/List;") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested element count \(count) is less than zero.")
+            }
+            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            return runtime.makeNative(
+                "Ljava/util/ArrayList;",
+                payload: VMListPayload(count >= items.count ? items : Array(items.prefix(count)), immutable: true)
+            )
+        }
+        arrays.staticMethod("drop", "([BI)Ljava/util/List;") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested element count \(count) is less than zero.")
+            }
+            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            return runtime.makeNative(
+                "Ljava/util/ArrayList;",
+                payload: VMListPayload(count >= items.count ? [] : Array(items.dropFirst(count)), immutable: true)
+            )
+        }
+        arrays.staticMethod("toList", "([B)Ljava/util/List;") { runtime, args, _ in
+            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items, immutable: true))
+        }
+        arrays.staticMethod("getIndices", "([B)Lkotlin/ranges/IntRange;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/ranges/IntRange;", payload: VMIntRangePayload(first: 0, last: runtime.arrayLength(args[0]) - 1))
+        }
+        arrays.staticMethod("getLastIndex", "([I)I") { runtime, args, _ in
+            .int32(Int32(runtime.arrayLength(args[0]) - 1))
+        }
+        arrays.staticMethod("slice", "([BLkotlin/ranges/IntRange;)Ljava/util/List;") { runtime, args, _ in
+            let items = try rangeSlots(runtime, args[0], args[1]).map { runtime.boxInt($0.asInt32) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+        }
+        arrays.staticMethod("slice", "([Ljava/lang/Object;Lkotlin/ranges/IntRange;)Ljava/util/List;") { runtime, args, _ in
+            let items = try rangeSlots(runtime, args[0], args[1])
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
+        }
+        arrays.staticMethod("sliceArray", "([BLkotlin/ranges/IntRange;)[B") { runtime, args, _ in
+            let items = try rangeSlots(runtime, args[0], args[1])
+            return arrayOfSlots(runtime, items, component: "B", unbox: false)
+        }
+        arrays.staticMethod("plus", "([BB)[B") { runtime, args, _ in
+            var values = arraySlots(runtime, args[0])
+            values.append(args[1])
+            return arrayOfSlots(runtime, values, component: "B", unbox: false)
+        }
+        arrays.staticMethod("plus", "([Ljava/lang/Object;Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            var values = arraySlots(runtime, args[0])
+            values.append(args[1])
+            return arrayOfSlots(runtime, values, component: "Ljava/lang/Object;", unbox: false)
+        }
+        arrays.staticMethod("asList", "([Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
+            runtime.makeNative(
+                "Ljava/util/Arrays$ArrayList;",
+                payload: VMArrayViewList(array: args[0], offset: 0, count: runtime.arrayLength(args[0]))
+            )
+        }
+        arrays.staticMethod("asSequence", "([Ljava/lang/Object;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(arraySlots(runtime, args[0])))
+        }
+        for letter in ["B", "I", "J", "S", "C", "F", "D", "Z"] {
+            let arrayType = "[\(letter)"
+            arrays.staticMethod("copyInto", "(\(arrayType)\(arrayType)III)\(arrayType)") { runtime, args, _ in
+                try copyIntoArray(
+                    runtime,
+                    source: args[0],
+                    destination: args[1],
+                    destinationOffset: Int(args[2].asInt32),
+                    startIndex: Int(args[3].asInt32),
+                    endIndex: Int(args[4].asInt32)
+                )
+            }
+            arrays.staticMethod("copyInto$default", "(\(arrayType)\(arrayType)IIIILjava/lang/Object;)\(arrayType)") { runtime, args, _ in
+                let mask = args[5].asInt32
+                let size = runtime.arrayLength(args[0])
+                return try copyIntoArray(
+                    runtime,
+                    source: args[0],
+                    destination: args[1],
+                    destinationOffset: mask & 2 != 0 ? 0 : Int(args[2].asInt32),
+                    startIndex: mask & 4 != 0 ? 0 : Int(args[3].asInt32),
+                    endIndex: mask & 8 != 0 ? size : Int(args[4].asInt32)
+                )
+            }
+            arrays.staticMethod("fill$default", "(\(arrayType)\(letter)IIILjava/lang/Object;)V") { runtime, args, _ in
+                let mask = args[4].asInt32
+                let size = runtime.arrayLength(args[0])
+                // The defaulted element is 0/false in the JVM bridge.
+                let element: VMValue = mask & 1 != 0 ? .zero : args[1]
+                let from = mask & 2 != 0 ? 0 : Int(args[2].asInt32)
+                let to = mask & 4 != 0 ? size : Int(args[3].asInt32)
+                guard from <= to else {
+                    throw VMJavaException("Ljava/lang/IllegalArgumentException;", "fromIndex(\(from)) > toIndex(\(to))")
+                }
+                guard from >= 0, to <= size else {
+                    throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "fromIndex: \(from), toIndex: \(to), size: \(size)")
+                }
+                for index in from..<to {
+                    runtime.setArrayElement(args[0], index: index, value: element)
+                }
+                return .zero
+            }
         }
         result.append(arrays)
 
@@ -2224,6 +3416,358 @@ enum KotlinRuntime {
             while end > 0, chars.contains(text[end - 1]) { end -= 1 }
             return runtime.newString(units: Array(text[0..<end]))
         }
+        // MARK: text gaps
+        // Delimited substrings: the plumbing bridges (`$default`) only forward
+        // `missingDelimiterValue`; the real work lives in these overloads.
+        strings.staticMethod("substringBefore", "(Ljava/lang/String;CLjava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            if let index = indexOfChar(units, char, from: 0, ignoreCase: false) {
+                return runtime.newString(units: Array(units[0..<index]))
+            }
+            return args[2].bits == 0 ? args[0] : args[2]
+        }
+        strings.staticMethod("substringAfter", "(Ljava/lang/String;CLjava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            if let index = indexOfChar(units, char, from: 0, ignoreCase: false) {
+                return runtime.newString(units: Array(units[(index + 1)...]))
+            }
+            return args[2].bits == 0 ? args[0] : args[2]
+        }
+        strings.staticMethod("substringBeforeLast", "(Ljava/lang/String;CLjava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            if let index = lastIndexOfChar(units, char, from: units.count - 1) {
+                return runtime.newString(units: Array(units[0..<index]))
+            }
+            return args[2].bits == 0 ? args[0] : args[2]
+        }
+        strings.staticMethod("substringAfterLast", "(Ljava/lang/String;CLjava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            if let index = lastIndexOfChar(units, char, from: units.count - 1) {
+                return runtime.newString(units: Array(units[(index + 1)...]))
+            }
+            return args[2].bits == 0 ? args[0] : args[2]
+        }
+        strings.staticMethod("substringBeforeLast$default", "(Ljava/lang/String;CLjava/lang/String;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            if let index = lastIndexOfChar(units, char, from: units.count - 1) {
+                return runtime.newString(units: Array(units[0..<index]))
+            }
+            return args[2].bits == 0 ? args[0] : args[2]
+        }
+        strings.staticMethod("substringBeforeLast", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            let delimiter = runtime.stringValue(args[1]) ?? ""
+            // An empty delimiter sits at the end, so everything is "before it".
+            if delimiter.isEmpty { return args[0] }
+            let ns = text as NSString
+            let range = ns.range(of: delimiter, options: .backwards)
+            guard range.location != NSNotFound else { return args[2].bits == 0 ? args[0] : args[2] }
+            return runtime.newString(ns.substring(to: range.location))
+        }
+        strings.staticMethod("substringAfterLast", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            let delimiter = runtime.stringValue(args[1]) ?? ""
+            // ...and nothing is after it.
+            if delimiter.isEmpty { return runtime.newString("") }
+            let ns = text as NSString
+            let range = ns.range(of: delimiter, options: .backwards)
+            guard range.location != NSNotFound else { return args[2].bits == 0 ? args[0] : args[2] }
+            return runtime.newString(ns.substring(from: range.location + range.length))
+        }
+        strings.staticMethod("repeat", "(Ljava/lang/CharSequence;I)Ljava/lang/String;") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Count 'n' must be non-negative, but was \(count).")
+            }
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard !text.isEmpty else { return runtime.newString("") }
+            return runtime.newString(String(repeating: text, count: count))
+        }
+        strings.staticMethod("trimStart", "(Ljava/lang/String;[C)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            var characters: Set<UInt16> = []
+            for index in 0..<runtime.arrayLength(args[1]) {
+                characters.insert(UInt16(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
+            }
+            var start = 0
+            while start < units.count, characters.contains(units[start]) { start += 1 }
+            return runtime.newString(units: Array(units[start...]))
+        }
+        strings.staticMethod("trimStart", "(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            var start = 0
+            while start < units.count, isWhitespaceUnit(units[start]) { start += 1 }
+            return runtime.newString(units: Array(units[start...]))
+        }
+        strings.staticMethod("encodeToByteArray", "(Ljava/lang/String;)[B") { runtime, args, _ in
+            runtime.byteArrayValue(utf8Bytes(runtime.stringUnits(args[0]) ?? []))
+        }
+        strings.staticMethod("padStart", "(Ljava/lang/String;IC)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let width = Int(args[1].asInt32)
+            guard units.count < width else { return args[0] }
+            let pad = UInt16(truncatingIfNeeded: args[2].asInt32)
+            return runtime.newString(units: Array(repeating: pad, count: width - units.count) + units)
+        }
+        strings.staticMethod("startsWith$default", "(Ljava/lang/CharSequence;CZILjava/lang/Object;)Z") { runtime, args, _ in
+            guard let first = runtime.stringUnits(args[0])?.first else { return .boolean(false) }
+            return .boolean(charsEqual(first, UInt16(truncatingIfNeeded: args[1].asInt32), ignoreCase: args[2].asBoolean))
+        }
+        strings.staticMethod("endsWith$default", "(Ljava/lang/CharSequence;CZILjava/lang/Object;)Z") { runtime, args, _ in
+            guard let last = runtime.stringUnits(args[0])?.last else { return .boolean(false) }
+            return .boolean(charsEqual(last, UInt16(truncatingIfNeeded: args[1].asInt32), ignoreCase: args[2].asBoolean))
+        }
+        strings.staticMethod("reversed", "(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;") { runtime, args, _ in
+            // `reversed()` on a String/CharSequence reverses UTF-16 units, which
+            // keeps surrogate pairs intact only because they are reversed back.
+            runtime.newString(units: Array((runtime.stringUnits(args[0]) ?? []).reversed()))
+        }
+        strings.staticMethod("lines", "(Ljava/lang/CharSequence;)Ljava/util/List;") { runtime, args, _ in
+            // Kotlin splits on CRLF, LF and lone CR.
+            let units = runtime.stringUnits(args[0]) ?? []
+            var output: [VMValue] = []
+            var start = 0
+            var index = 0
+            while index < units.count {
+                let unit = units[index]
+                if unit == 0x0A || unit == 0x0D {
+                    output.append(runtime.newString(units: Array(units[start..<index])))
+                    if unit == 0x0D, index + 1 < units.count, units[index + 1] == 0x0A { index += 1 }
+                    start = index + 1
+                }
+                index += 1
+            }
+            output.append(runtime.newString(units: Array(units[start...])))
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output))
+        }
+        strings.staticMethod("random", "(Ljava/lang/CharSequence;Lkotlin/random/Random;)C") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            guard !units.isEmpty else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Char sequence is empty.")
+            }
+            return .int32(Int32(units[Int.random(in: 0..<units.count)]))
+        }
+        strings.staticMethod("first", "(Ljava/lang/CharSequence;)C") { runtime, args, _ in
+            guard let first = runtime.stringUnits(args[0])?.first else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Char sequence is empty.")
+            }
+            return .int32(Int32(first))
+        }
+        strings.staticMethod("dropLast", "(Ljava/lang/String;I)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested character count \(count) is less than zero.")
+            }
+            guard count < units.count else { return runtime.newString("") }
+            return runtime.newString(units: Array(units[0..<(units.count - count)]))
+        }
+        strings.staticMethod("indexOf", "(Ljava/lang/CharSequence;Ljava/lang/String;IZ)I") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            let needle = runtime.stringValue(args[1]) ?? ""
+            return .int32(Int32(searchString(
+                text,
+                needle,
+                from: Int(args[2].asInt32),
+                ignoreCase: args[3].asBoolean,
+                backwards: false
+            )))
+        }
+        strings.staticMethod("equals$default", "(Ljava/lang/String;Ljava/lang/String;ZILjava/lang/Object;)Z") { runtime, args, _ in
+            let left = runtime.stringValue(args[0]) ?? ""
+            let right = runtime.stringValue(args[1]) ?? ""
+            return .boolean(args[2].asBoolean ? left.lowercased() == right.lowercased() : left == right)
+        }
+        strings.staticMethod("concatToString", "([C)Ljava/lang/String;") { runtime, args, _ in
+            var units: [UInt16] = []
+            for index in 0..<runtime.arrayLength(args[0]) {
+                units.append(UInt16(truncatingIfNeeded: runtime.arrayElement(args[0], index).asInt32))
+            }
+            return runtime.newString(units: units)
+        }
+        strings.staticMethod("concatToString", "([CII)Ljava/lang/String;") { runtime, args, _ in
+            let size = runtime.arrayLength(args[0])
+            let start = Int(args[1].asInt32)
+            let end = Int(args[2].asInt32)
+            guard start >= 0, start <= end, end <= size else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "start: \(start), end: \(end), size: \(size)")
+            }
+            var units: [UInt16] = []
+            for index in start..<end {
+                units.append(UInt16(truncatingIfNeeded: runtime.arrayElement(args[0], index).asInt32))
+            }
+            return runtime.newString(units: units)
+        }
+        strings.staticMethod("removeRange", "(Ljava/lang/CharSequence;Lkotlin/ranges/IntRange;)Ljava/lang/CharSequence;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            guard let range: VMIntRangePayload = runtime.payload(args[1], as: VMIntRangePayload.self) else {
+                return args[0]
+            }
+            guard range.first >= 0, range.last < units.count, range.first <= range.last + 1 else {
+                throw VMJavaException(
+                    "Ljava/lang/IndexOutOfBoundsException;",
+                    "Start index (\(range.first)) is out of range or end index (\(range.last)) is out of range."
+                )
+            }
+            let start = min(range.first, units.count)
+            let end = min(range.last + 1, units.count)
+            return runtime.newString(units: Array(units[0..<start]) + Array(units[end...]))
+        }
+        strings.staticMethod("replaceAfterLast$default", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            let delimiter = runtime.stringValue(args[1]) ?? ""
+            let replacement = runtime.stringValue(args[2]) ?? ""
+            let ns = text as NSString
+            let range = delimiter.isEmpty ? NSRange(location: 0, length: 0) : ns.range(of: delimiter, options: .backwards)
+            guard range.location != NSNotFound else {
+                return args[3].bits == 0 ? args[0] : args[3]
+            }
+            let head = ns.substring(to: range.location + range.length)
+            return runtime.newString(head + replacement)
+        }
+        strings.staticMethod("slice", "(Ljava/lang/String;Lkotlin/ranges/IntRange;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            guard let range: VMIntRangePayload = runtime.payload(args[1], as: VMIntRangePayload.self) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested range is empty.")
+            }
+            guard range.first <= range.last else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested range is empty.")
+            }
+            guard range.first >= 0, range.last < units.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(range.first)..\(range.last) is out of bounds")
+            }
+            return runtime.newString(units: Array(units[range.first...(range.last)]))
+        }
+        strings.staticMethod("toList", "(Ljava/lang/CharSequence;)Ljava/util/List;") { runtime, args, _ in
+            let output = (runtime.stringUnits(args[0]) ?? []).map { runtime.boxChar($0) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output))
+        }
+        strings.staticMethod("withIndex", "(Ljava/lang/CharSequence;)Ljava/lang/Iterable;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for (index, unit) in (runtime.stringUnits(args[0]) ?? []).enumerated() {
+                output.append(runtime.makeNative(
+                    "Lkotlin/collections/IndexedValue;",
+                    payload: VMIndexedValuePayload(index: Int32(index), value: runtime.boxChar(unit))
+                ))
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output, immutable: true))
+        }
+        strings.staticMethod("findAnyOf$default", "(Ljava/lang/CharSequence;Ljava/util/Collection;IZILjava/lang/Object;)Lkotlin/Pair;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            let candidates = (runtime.listItems(args[1]) ?? []).compactMap { runtime.stringValue($0) }
+            let ignoreCase = args[3].asBoolean
+            let ns = text as NSString
+            var start = max(0, Int(args[2].asInt32))
+            while start <= ns.length {
+                for candidate in candidates {
+                    let remaining = NSRange(location: start, length: ns.length - start)
+                    let range = candidate.isEmpty
+                        ? NSRange(location: start, length: 0)
+                        : ns.range(of: candidate, options: ignoreCase ? .caseInsensitive : [], range: remaining)
+                    if range.location == start {
+                        return runtime.makeNative(
+                            "Lkotlin/Pair;",
+                            payload: VMPairPayload(first: runtime.boxInt(Int32(start)), second: runtime.newString(candidate))
+                        )
+                    }
+                }
+                start += 1
+            }
+            return .null
+        }
+        strings.staticMethod("clear", "(Ljava/lang/StringBuilder;)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            runtime.mutatingString(args[0]).units.removeAll(keepingCapacity: false)
+            return args[0]
+        }
+        strings.staticMethod("capitalize", "(Ljava/lang/String;Ljava/util/Locale;)Ljava/lang/String;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let first = text.first else { return runtime.newString("") }
+            return runtime.newString(String(first).uppercased() + String(text.dropFirst()))
+        }
+        strings.staticMethod("append", "(Ljava/lang/StringBuilder;[Ljava/lang/Object;)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            for index in 0..<runtime.arrayLength(args[1]) {
+                runtime.appendString(args[0], kind: "object", value: runtime.arrayElement(args[1], index))
+            }
+            return args[0]
+        }
+        strings.staticMethod("padEnd", "(Ljava/lang/String;IC)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let width = Int(args[1].asInt32)
+            guard units.count < width else { return args[0] }
+            let pad = UInt16(truncatingIfNeeded: args[2].asInt32)
+            return runtime.newString(units: units + Array(repeating: pad, count: width - units.count))
+        }
+        strings.staticMethod("getOrNull", "(Ljava/lang/CharSequence;I)Ljava/lang/Character;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < units.count else { return .null }
+            return runtime.boxChar(units[index])
+        }
+        strings.staticMethod("last", "(Ljava/lang/CharSequence;)C") { runtime, args, _ in
+            guard let last = runtime.stringUnits(args[0])?.last else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Char sequence is empty.")
+            }
+            return .int32(Int32(last))
+        }
+        strings.staticMethod("lastIndexOf$default", "(Ljava/lang/CharSequence;CIZILjava/lang/Object;)I") { runtime, args, _ in
+            let mask = args[4].asInt32
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            let from = mask & 4 != 0 ? units.count - 1 : Int(args[2].asInt32)
+            let ignoreCase = mask & 8 == 0 && args[3].asBoolean
+            var index = min(from, units.count - 1)
+            while index >= 0 {
+                if charsEqual(units[index], char, ignoreCase: ignoreCase) { return .int32(Int32(index)) }
+                index -= 1
+            }
+            return .int32(-1)
+        }
+        strings.staticMethod("replaceBefore$default", "(Ljava/lang/String;CLjava/lang/String;Ljava/lang/String;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let char = UInt16(truncatingIfNeeded: args[1].asInt32)
+            let replacement = runtime.stringValue(args[2]) ?? ""
+            guard let index = indexOfChar(units, char, from: 0, ignoreCase: false) else {
+                return args[3].bits == 0 ? args[0] : args[3]
+            }
+            return runtime.newString(replacement + String(decoding: Array(units[index...]), as: UTF16.self))
+        }
+        strings.staticMethod("replaceRange", "(Ljava/lang/CharSequence;Lkotlin/ranges/IntRange;Ljava/lang/CharSequence;)Ljava/lang/CharSequence;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            guard let range: VMIntRangePayload = runtime.payload(args[1], as: VMIntRangePayload.self) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "invalid range")
+            }
+            guard range.first >= 0, range.last < units.count, range.first <= range.last + 1 else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(range.first)..\(range.last) is out of bounds")
+            }
+            let replacement = runtime.stringUnits(args[2]) ?? []
+            let end = min(range.last + 1, units.count)
+            return runtime.newString(units: Array(units[0..<range.first]) + replacement + Array(units[end...]))
+        }
+        strings.staticMethod("lineSequence", "(Ljava/lang/CharSequence;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            var lines: [VMValue] = []
+            var start = 0
+            var index = 0
+            while index < units.count {
+                let unit = units[index]
+                if unit == 0x0A || unit == 0x0D {
+                    lines.append(runtime.newString(units: Array(units[start..<index])))
+                    if unit == 0x0D, index + 1 < units.count, units[index + 1] == 0x0A { index += 1 }
+                    start = index + 1
+                }
+                index += 1
+            }
+            lines.append(runtime.newString(units: Array(units[start...])))
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(lines))
+        }
+        strings.staticMethod("getCASE_INSENSITIVE_ORDER", "(Lkotlin/jvm/internal/StringCompanionObject;)Ljava/util/Comparator;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/comparisons/KotlinComparator;", payload: VMComparatorPayload(kind: .caseInsensitive))
+        }
         result.append(strings)
 
         let chars = NativeClass("Lkotlin/text/CharsKt;")
@@ -2254,7 +3798,80 @@ enum KotlinRuntime {
             let text = String(UnicodeScalar(UInt16(truncatingIfNeeded: args[0].asInt32)) ?? " ")
             return runtime.newString(text.uppercased())
         }
+        chars.staticMethod("checkRadix", "(I)I") { _, args, _ in
+            .int32(try checkRadix(args[0].asInt32))
+        }
+        chars.staticMethod("digitToInt", "(C)I") { runtime, args, _ in
+            guard let value = charDigit(args[0].asInt32, radix: 10) else {
+                throw VMJavaException(
+                    "Ljava/lang/IllegalArgumentException;",
+                    "Char \(charText(runtime, args[0].asInt32)) is not a digit in the given radix 10"
+                )
+            }
+            return .int32(value)
+        }
+        chars.staticMethod("digitToInt", "(CI)I") { runtime, args, _ in
+            let radix = try checkRadix(args[1].asInt32)
+            guard let value = charDigit(args[0].asInt32, radix: radix) else {
+                throw VMJavaException(
+                    "Ljava/lang/IllegalArgumentException;",
+                    "Char \(charText(runtime, args[0].asInt32)) is not a digit in the given radix \(radix)"
+                )
+            }
+            return .int32(value)
+        }
+        chars.staticMethod("digitOf", "(C)I") { runtime, args, _ in
+            guard let value = charDigit(args[0].asInt32, radix: 10) else {
+                throw VMJavaException(
+                    "Ljava/lang/IllegalArgumentException;",
+                    "Char \(charText(runtime, args[0].asInt32)) is not a decimal digit"
+                )
+            }
+            return .int32(value)
+        }
+        chars.staticMethod("digitOf", "(CI)I") { runtime, args, _ in
+            let radix = try checkRadix(args[1].asInt32)
+            guard let value = charDigit(args[0].asInt32, radix: radix) else {
+                throw VMJavaException(
+                    "Ljava/lang/IllegalArgumentException;",
+                    "Char \(charText(runtime, args[0].asInt32)) is not a digit in the given radix \(radix)"
+                )
+            }
+            return .int32(value)
+        }
+        chars.staticMethod("titlecase", "(C)Ljava/lang/String;") { runtime, args, _ in
+            let text = charText(runtime, args[0].asInt32)
+            return runtime.newString(text.capitalized)
+        }
+        chars.staticMethod("getCategory", "(C)Lkotlin/text/CharCategory;") { runtime, args, _ in
+            let name = charCategoryName(args[0].asInt32)
+            guard let cls = runtime.findClass("Lkotlin/text/CharCategory;") else { return .null }
+            return cls.staticField(named: name).map { cls.staticValues[$0.offset] } ?? .null
+        }
         result.append(chars)
+
+        let charCategory = NativeClass("Lkotlin/text/CharCategory;", superclass: "Ljava/lang/Enum;")
+        charCategory.field("name", "Ljava/lang/String;")
+        charCategory.field("ordinal", "I")
+        for name in charCategoryNames { charCategory.staticField(name, "Lkotlin/text/CharCategory;") }
+        charCategory.prepare = { runtime, cls in
+            for (index, name) in charCategoryNames.enumerated() {
+                let value = runtime.makeNative("Lkotlin/text/CharCategory;", payload: NSNumber(value: index))
+                if let pointer = value.object {
+                    VMObjectLayout.slot(pointer, 0).pointee = runtime.newString(name)
+                    VMObjectLayout.slot(pointer, 1).pointee = .int32(Int32(index))
+                }
+                cls.staticValues[index] = value
+            }
+        }
+        charCategory.method("getCode", "()I") { runtime, args, _ in
+            .int32((runtime.payload(args[0], as: NSNumber.self)?.int32Value ?? 0) + 1)
+        }
+        charCategory.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let pointer = args[0].object else { return runtime.newString("UNASSIGNED") }
+            return VMObjectLayout.slot(pointer, 0).pointee
+        }
+        result.append(charCategory)
 
         let charSequences = NativeClass("Lkotlin/text/CharSequenceKt;")
         charSequences.staticMethod("isBlank", "(Ljava/lang/CharSequence;)Z") { runtime, args, _ in
@@ -2417,7 +4034,46 @@ enum KotlinRuntime {
             }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(parts.map { runtime.newString($0) }))
         }
+        regex.staticField("Companion", "Lkotlin/text/Regex$Companion;")
+        regex.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lkotlin/text/Regex$Companion;", payload: NSNull())
+        }
+        regex.method("getCompanion", "()Lkotlin/text/Regex$Companion;") { runtime, _, _ in
+            runtime.cachedClass("Lkotlin/text/Regex;").staticValues.first ?? .null
+        }
+        regex.staticMethod("findAll$default", "(Lkotlin/text/Regex;Ljava/lang/CharSequence;IILjava/lang/Object;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            let mask = args[3].asInt32
+            let payload: VMRegexPayload? = runtime.payload(args[0], as: VMRegexPayload.self)
+            let text = runtime.stringValue(args[1]) ?? ""
+            // `startIndex` is the third declared parameter, so defaulting it
+            // sets bit 2 of the mask.
+            let start = mask & 4 != 0 ? 0 : max(0, Int(args[2].asInt32))
+            var values: [VMValue] = []
+            if let payload, let expression = payload.expression, start <= text.utf16.count {
+                let index = text.utf16.index(text.utf16.startIndex, offsetBy: start)
+                let range = NSRange(index..<text.endIndex, in: text)
+                for match in expression.matches(in: text, range: range) {
+                    values.append(makeMatchResultValue(runtime, match: match, text: text, expression: expression))
+                }
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(values))
+        }
         result.append(regex)
+
+        let regexCompanion = NativeClass("Lkotlin/text/Regex$Companion;", superclass: "Ljava/lang/Object;")
+        regexCompanion.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], NSNull())
+            return .zero
+        }
+        // `Regex.escape` is `java.util.regex.Pattern.quote`: the surrounding
+        // `\Q...\E` is expanded when the escaped text becomes a pattern.
+        regexCompanion.method("escape", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString("\\Q" + (runtime.stringValue(args[1]) ?? "") + "\\E")
+        }
+        regexCompanion.staticMethod("escape", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString("\\Q" + (runtime.stringValue(args[0]) ?? "") + "\\E")
+        }
+        result.append(regexCompanion)
 
         let matchResult = NativeClass("Lkotlin/text/MatchResult;", superclass: "Ljava/lang/Object;")
         matchResult.method("getValue", "()Ljava/lang/String;") { runtime, args, _ in
@@ -2448,6 +4104,11 @@ enum KotlinRuntime {
         }
         matchResult.method("next", "()Lkotlin/text/MatchResult;") { runtime, args, _ in
             nextMatchResultValue(runtime, value: args[0])
+        }
+        matchResult.method("getDestructured", "()Lkotlin/text/MatchResult$Destructured;") { runtime, args, _ in
+            // `Destructured` is a thin view over the MatchResult; the payload is
+            // the match value itself, exactly what its constructor stores.
+            runtime.makeNative("Lkotlin/text/MatchResult$Destructured;", payload: args[0])
         }
         result.append(matchResult)
 
@@ -2818,6 +4479,174 @@ enum KotlinRuntime {
             }
             return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
         }
+        sequences.staticMethod("emptySequence", "()Lkotlin/sequences/Sequence;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload([]))
+        }
+        sequences.staticMethod("mapNotNull", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for value in runtime.sequenceValues(args[0]) {
+                let mapped = try runtime.callFunction(args[1], [value])
+                if mapped.bits != 0 { output.append(mapped) }
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("filterNot", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for value in runtime.sequenceValues(args[0]) where !predicateTruth(try runtime.callFunction(args[1], [value])) {
+                output.append(value)
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("joinToString$default", "(Lkotlin/sequences/Sequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;ILjava/lang/CharSequence;Lkotlin/jvm/functions/Function1;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let items = runtime.sequenceValues(args[0])
+            let separator = runtime.stringValue(args[1]) ?? ", "
+            let prefix = runtime.stringValue(args[2]) ?? ""
+            let postfix = runtime.stringValue(args[3]) ?? ""
+            let limit = Int(args[4].asInt32)
+            let truncated = runtime.stringValue(args[5]) ?? "..."
+            let transform = args[6]
+            let effective = limit <= 0 ? items : Array(items.prefix(limit))
+            var parts: [String] = []
+            for item in effective {
+                let value = transform.bits == 0 ? item : try runtime.callFunction(transform, [item])
+                parts.append(runtime.stringValue(runtime.javaToString(value)) ?? "null")
+            }
+            var text = parts.joined(separator: separator)
+            if limit > 0, items.count > limit { text += truncated }
+            return runtime.newString(prefix + text + postfix)
+        }
+        sequences.staticMethod("lastOrNull", "(Lkotlin/sequences/Sequence;)Ljava/lang/Object;") { runtime, args, _ in
+            runtime.sequenceValues(args[0]).last ?? .null
+        }
+        sequences.staticMethod("last", "(Lkotlin/sequences/Sequence;)Ljava/lang/Object;") { runtime, args, _ in
+            guard let last = runtime.sequenceValues(args[0]).last else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;", "Sequence is empty.")
+            }
+            return last
+        }
+        sequences.staticMethod("firstOrNull", "(Lkotlin/sequences/Sequence;)Ljava/lang/Object;") { runtime, args, _ in
+            runtime.sequenceValues(args[0]).first ?? .null
+        }
+        sequences.staticMethod("count", "(Lkotlin/sequences/Sequence;)I") { runtime, args, _ in
+            .int32(Int32(runtime.sequenceValues(args[0]).count))
+        }
+        sequences.staticMethod("maxOrNull", "(Lkotlin/sequences/Sequence;)Ljava/lang/Comparable;") { runtime, args, _ in
+            var best: VMValue?
+            for value in runtime.sequenceValues(args[0]) {
+                if let current = best {
+                    if runtime.naturalCompare(value, current) > 0 { best = value }
+                } else {
+                    best = value
+                }
+            }
+            return best ?? .null
+        }
+        sequences.staticMethod("sortedWith", "(Lkotlin/sequences/Sequence;Ljava/util/Comparator;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            let list = runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(runtime.sequenceValues(args[0])))
+            try runtime.sortList(list, comparator: args[1])
+            return runtime.makeNative(
+                "Lkotlin/sequences/SequenceImpl;",
+                payload: VMSequencePayload(runtime.listPayload(list)?.items ?? [])
+            )
+        }
+        sequences.staticMethod("asIterable", "(Lkotlin/sequences/Sequence;)Ljava/lang/Iterable;") { runtime, args, _ in
+            runtime.makeNative(
+                "Ljava/util/ArrayList;",
+                payload: VMListPayload(runtime.sequenceValues(args[0]), immutable: true)
+            )
+        }
+        sequences.staticMethod("distinctBy", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var output: [VMValue] = []
+            var keys: [VMValue] = []
+            for value in runtime.sequenceValues(args[0]) {
+                let key = try runtime.callFunction(args[1], [value])
+                if !keys.contains(where: { runtime.javaEquals($0, key) }) {
+                    keys.append(key)
+                    output.append(value)
+                }
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("elementAt", "(Lkotlin/sequences/Sequence;I)Ljava/lang/Object;") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            let values = runtime.sequenceValues(args[0])
+            guard index >= 0 else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index: \(index)")
+            }
+            guard index < values.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index: \(index), size: \(values.count)")
+            }
+            return values[index]
+        }
+        sequences.staticMethod("flatMap", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for value in runtime.sequenceValues(args[0]) {
+                output.append(contentsOf: runtime.sequenceValues(try runtime.callFunction(args[1], [value])))
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("flatten", "(Lkotlin/sequences/Sequence;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for value in runtime.sequenceValues(args[0]) {
+                output.append(contentsOf: runtime.sequenceValues(value))
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("generateSequence", "(Lkotlin/jvm/functions/Function0;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            // `generateSequence(nextFunction)` never terminates on its own; a
+            // null answer ends it, which is the only safe stopping rule here.
+            var values: [VMValue] = []
+            while values.count < 10_000 {
+                let value = try runtime.callFunction(args[0], [])
+                if value.bits == 0 { break }
+                values.append(value)
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(values))
+        }
+        sequences.staticMethod("generateSequence", "(Ljava/lang/Object;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var values: [VMValue] = []
+            var current = args[0]
+            while current.bits != 0, values.count < 10_000 {
+                values.append(current)
+                current = try runtime.callFunction(args[1], [current])
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(values))
+        }
+        sequences.staticMethod("take", "(Lkotlin/sequences/Sequence;I)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested element count \(count) is less than zero.")
+            }
+            return runtime.makeNative(
+                "Lkotlin/sequences/SequenceImpl;",
+                payload: VMSequencePayload(Array(runtime.sequenceValues(args[0]).prefix(count)))
+            )
+        }
+        sequences.staticMethod("takeWhile", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            var output: [VMValue] = []
+            for value in runtime.sequenceValues(args[0]) {
+                if !predicateTruth(try runtime.callFunction(args[1], [value])) { break }
+                output.append(value)
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("zip", "(Lkotlin/sequences/Sequence;Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function2;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            let left = runtime.sequenceValues(args[0])
+            let right = runtime.sequenceValues(args[1])
+            var output: [VMValue] = []
+            for index in 0..<min(left.count, right.count) {
+                output.append(try runtime.callFunction(args[2], [left[index], right[index]]))
+            }
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
+        }
+        sequences.staticMethod("sequence", "(Lkotlin/jvm/functions/Function2;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
+            // The builder is a suspend lambda; the engine completes it inline,
+            // and every `yield` appends to the collector the scope carries.
+            let collector = VMSequenceCollectorPayload()
+            let scope = runtime.makeNative("Lkotlin/sequences/SequenceScope;", payload: collector)
+            _ = try runtime.callSuspend(args[0], scope)
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(collector.values))
+        }
         result.append(sequences)
         return result
     }
@@ -2854,6 +4683,16 @@ enum KotlinRuntime {
         }
         duration.staticMethod("isInfinite-impl", "(J)Z") { _, args, _ in .boolean(args[0].asInt64 == .max) }
         duration.staticMethod("isNegative-impl", "(J)Z") { _, args, _ in .boolean(args[0].asInt64 < 0) }
+        duration.staticMethod("times-UwyO8pc", "(JI)J") { _, args, _ in
+            .int64(args[0].asInt64 &* Int64(args[1].asInt32))
+        }
+        duration.staticMethod("div-UwyO8pc", "(JI)J") { _, args, _ in
+            let divisor = Int64(args[1].asInt32)
+            guard divisor != 0 else {
+                throw VMJavaException("Ljava/lang/ArithmeticException;", "Division by zero")
+            }
+            return .int64(args[0].asInt64 / divisor)
+        }
         duration.staticMethod("absoluteValue-UwyO8pc", "(J)J") { _, args, _ in .int64(args[0].asInt64 == .min ? .max : Swift.abs(args[0].asInt64)) }
         duration.staticMethod("unaryMinus-UwyO8pc", "(J)J") { _, args, _ in .int64(0 &- args[0].asInt64) }
         duration.staticMethod("toLong-impl", "(JLkotlin/time/DurationUnit;)J") { runtime, args, _ in
@@ -2938,7 +4777,21 @@ enum KotlinRuntime {
             let millis = runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0
             return runtime.newString(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(millis) / 1000)))
         }
+        instant.method("getEpochSeconds", "()J") { runtime, args, _ in
+            .int64((runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0) / 1000)
+        }
+        instant.method("compareTo", "(Lkotlin/time/Instant;)I") { runtime, args, _ in
+            let left = runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0
+            let right = runtime.payload(args[1], as: NSNumber.self)?.int64Value ?? 0
+            return .int32(left < right ? -1 : (left > right ? 1 : 0))
+        }
+        instant.method("minus-UwyO8pc", "(Lkotlin/time/Instant;)J") { runtime, args, _ in
+            let left = runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0
+            let right = runtime.payload(args[1], as: NSNumber.self)?.int64Value ?? 0
+            return .int64((left &- right) * 1_000_000)
+        }
         result.append(instant)
+
         let instantCompanion = NativeClass("Lkotlin/time/Instant$Companion;", superclass: "Ljava/lang/Object;")
         instantCompanion.method("fromEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
         instantCompanion.method("fromEpochMilliseconds", "(J)Lkotlin/time/Instant;") { runtime, args, _ in
@@ -2948,6 +4801,27 @@ enum KotlinRuntime {
             runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: Int64(Date().timeIntervalSince1970 * 1000)))
         }
         instantCompanion.method("getEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
+        instantCompanion.method("fromEpochSeconds$default", "(Lkotlin/time/Instant$Companion;JJILjava/lang/Object;)Lkotlin/time/Instant;") { runtime, args, _ in
+            let mask = args[3].asInt32
+            let seconds = args[1].asInt64
+            let adjustment = mask & 2 != 0 ? Int64(0) : args[2].asInt64
+            return runtime.makeNative(
+                "Lkotlin/time/Instant;",
+                payload: NSNumber(value: seconds &* 1000 &+ adjustment / 1_000_000)
+            )
+        }
+        instantCompanion.method("fromEpochSeconds", "(JJ)Lkotlin/time/Instant;") { runtime, args, _ in
+            runtime.makeNative(
+                "Lkotlin/time/Instant;",
+                payload: NSNumber(value: args[1].asInt64 &* 1000 &+ args[2].asInt64 / 1_000_000)
+            )
+        }
+        instantCompanion.method("getDISTANT_PAST", "()Lkotlin/time/Instant;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: Int64.min / 2))
+        }
+        instantCompanion.method("getDISTANT_FUTURE", "()Lkotlin/time/Instant;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: Int64.max / 2))
+        }
         instantCompanion.method("parse", "(Ljava/lang/CharSequence;)Lkotlin/time/Instant;") { runtime, args, _ in
             guard let millis = parseInstantMillis(runtime.stringValue(args[1]) ?? "") else {
                 throw VMJavaException("Ljava/time/format/DateTimeParseException;", "invalid instant")
@@ -3035,6 +4909,17 @@ extension VMRuntime {
         cachedClass("Lkotlin/Unit;").staticValues.first ?? .null
     }
 
+    /// The continuation's payload is created by `<init>`; a direct callback
+    /// resume on an object the extension failed to construct still stores state.
+    func mutableCancellableContinuation(_ value: VMValue) -> VMCancellableContinuationPayload {
+        if let existing: VMCancellableContinuationPayload = payload(value, as: VMCancellableContinuationPayload.self) {
+            return existing
+        }
+        let created = VMCancellableContinuationPayload(completion: .null)
+        setPayload(value, created)
+        return created
+    }
+
     func boxInt(_ value: Int32) -> VMValue {
         guard let cls = findClass("Ljava/lang/Integer;") else { return .null }
         let pointer = allocateObject(cls)
@@ -3116,6 +5001,148 @@ extension VMRuntime {
         }
         throw VMJavaException("Ljava/lang/NoSuchMethodError;", key)
     }
+}
+
+// MARK: - Kotlin numeric and text helpers
+
+/// `Math.round`: nearest integer with halves rounded towards positive
+/// infinity; NaN maps to 0 and overflow saturates, like the JDK.
+private func kotlinRound(_ value: Double) -> Int64 {
+    guard !value.isNaN else { return 0 }
+    guard value.isFinite else { return value > 0 ? Int64.max : Int64.min }
+    let floored = (value + 0.5).rounded(.down)
+    if floored >= Double(Int64.max) { return Int64.max }
+    if floored <= Double(Int64.min) { return Int64.min }
+    return Int64(floored)
+}
+
+/// UTF-8 encoding with Kotlin's replacement policy: a lone surrogate becomes
+/// `?` (0x3F) rather than the Unicode replacement character. Units are taken
+/// raw so decoding does not rewrite a lone surrogate before encoding.
+private func utf8Bytes(_ units: [UInt16]) -> [UInt8] {
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(units.count)
+    var index = 0
+    while index < units.count {
+        let unit = units[index]
+        let scalarValue: UInt32
+        if unit >= 0xD800, unit <= 0xDBFF, index + 1 < units.count,
+           units[index + 1] >= 0xDC00, units[index + 1] <= 0xDFFF {
+            scalarValue = 0x10000
+                + (UInt32(unit - 0xD800) << 10)
+                + UInt32(units[index + 1] - 0xDC00)
+            index += 2
+        } else if unit >= 0xD800, unit <= 0xDFFF {
+            bytes.append(0x3F)
+            index += 1
+            continue
+        } else {
+            scalarValue = UInt32(unit)
+            index += 1
+        }
+        guard let scalar = UnicodeScalar(scalarValue) else {
+            bytes.append(0x3F)
+            continue
+        }
+        bytes.append(contentsOf: Array(String(Character(scalar)).utf8))
+    }
+    return bytes
+}
+
+// MARK: - Kotlin array helpers
+
+private func arraySlots(_ runtime: VMRuntime, _ value: VMValue) -> [VMValue] {
+    let count = runtime.arrayLength(value)
+    guard count > 0 else { return [] }
+    var values: [VMValue] = []
+    values.reserveCapacity(count)
+    for index in 0..<count { values.append(runtime.arrayElement(value, index)) }
+    return values
+}
+
+private func arrayOfSlots(
+    _ runtime: VMRuntime,
+    _ values: [VMValue],
+    component: String,
+    unbox: Bool
+) -> VMValue {
+    let array = runtime.newArray(component: component, count: values.count)
+    for (index, value) in values.enumerated() {
+        runtime.setArrayElement(array, index: index, value: unbox ? runtime.unboxedPrimitive(value) : value)
+    }
+    return array
+}
+
+/// Elements of `array[range]` with Kotlin's `slice` validation: an empty
+/// range is an `IllegalArgumentException`, anything outside the array is an
+/// `IndexOutOfBoundsException`.
+private func rangeSlots(_ runtime: VMRuntime, _ array: VMValue, _ rangeValue: VMValue) throws -> [VMValue] {
+    guard let range: VMIntRangePayload = runtime.payload(rangeValue, as: VMIntRangePayload.self) else {
+        throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested range is empty.")
+    }
+    guard range.first <= range.last else {
+        throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested range is empty.")
+    }
+    let size = runtime.arrayLength(array)
+    guard range.first >= 0, range.last < size else {
+        throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "range \(range.first)..\(range.last) is out of bounds")
+    }
+    return Array(0..<(range.last - range.first + 1)).map { runtime.arrayElement(array, range.first + $0) }
+}
+
+/// `ArraysKt.copyOfRange`: copies `[from, to)` into a new array of the same
+/// component type. `IndexOutOfBoundsException` for a negative `from` or a `to`
+/// past the end, `IllegalArgumentException` when `from > to`.
+private func copyOfRange(_ runtime: VMRuntime, _ source: VMValue, from: Int, to: Int) throws -> VMValue {
+    guard from >= 0 else {
+        throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "fromIndex: \(from)")
+    }
+    guard from <= to else {
+        throw VMJavaException("Ljava/lang/IllegalArgumentException;", "fromIndex(\(from)) > toIndex(\(to))")
+    }
+    let size = runtime.arrayLength(source)
+    guard to <= size else {
+        throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "toIndex: \(to)")
+    }
+    let component = runtime.classOf(source)?.arrayComponent ?? "Ljava/lang/Object;"
+    let target = runtime.newArray(component: component, count: to - from)
+    for index in from..<to {
+        runtime.setArrayElement(target, index: index - from, value: runtime.arrayElement(source, index))
+    }
+    return target
+}
+
+/// `ArraysKt.copyInto`: the `System.arraycopy` contract over raw slots.
+@discardableResult
+private func copyIntoArray(
+    _ runtime: VMRuntime,
+    source: VMValue,
+    destination: VMValue,
+    destinationOffset: Int,
+    startIndex: Int,
+    endIndex: Int
+) throws -> VMValue {
+    let count = endIndex - startIndex
+    guard startIndex >= 0, endIndex <= runtime.arrayLength(source), count >= 0 else {
+        throw VMJavaException(
+            "Ljava/lang/IndexOutOfBoundsException;",
+            "startIndex: \(startIndex), endIndex: \(endIndex), size: \(runtime.arrayLength(source))"
+        )
+    }
+    guard destinationOffset >= 0, destinationOffset + count <= runtime.arrayLength(destination) else {
+        throw VMJavaException(
+            "Ljava/lang/IndexOutOfBoundsException;",
+            "destinationOffset: \(destinationOffset), length: \(count), size: \(runtime.arrayLength(destination))"
+        )
+    }
+    for offset in 0..<count {
+        runtime.setArrayElement(
+            destination,
+            index: destinationOffset + offset,
+            value: runtime.arrayElement(source, startIndex + offset)
+        )
+    }
+    return destination
 }
 
 private func parseInstantMillis(_ text: String) -> Int64? {
@@ -3214,6 +5241,87 @@ private func charsEqual(_ left: UInt16, _ right: UInt16, ignoreCase: Bool) -> Bo
 private func isWhitespaceUnit(_ unit: UInt16) -> Bool {
     guard let scalar = UnicodeScalar(unit) else { return false }
     return CharacterSet.whitespacesAndNewlines.contains(scalar) || scalar.properties.isWhitespace
+}
+
+/// `CharsKt.checkRadix`: the valid radix range for digit parsing.
+private func checkRadix(_ radix: Int32) throws -> Int32 {
+    guard radix >= 2, radix <= 36 else {
+        throw VMJavaException("Ljava/lang/IllegalArgumentException;", "radix \(radix) was not in valid range 2..36")
+    }
+    return radix
+}
+
+/// `Character.digit`: ASCII digits/letters plus Unicode decimal digits,
+/// answered as -1 when the value does not fit the radix.
+private func charDigit(_ unit: Int32, radix: Int32) -> Int32? {
+    let value = UInt32(truncatingIfNeeded: unit)
+    var digit: Int32
+    if value >= 0x30, value <= 0x39 {
+        digit = Int32(value - 0x30)
+    } else if value >= 0x41, value <= 0x5A {
+        digit = Int32(value - 0x41) + 10
+    } else if value >= 0x61, value <= 0x7A {
+        digit = Int32(value - 0x61) + 10
+    } else if let scalar = UnicodeScalar(value), scalar.properties.numericType == .decimal,
+              let numeric = scalar.properties.numericValue {
+        digit = Int32(numeric)
+    } else {
+        return nil
+    }
+    guard digit >= 0, digit < radix else { return nil }
+    return digit
+}
+
+private func charText(_ runtime: VMRuntime, _ unit: Int32) -> String {
+    String(UnicodeScalar(UInt32(truncatingIfNeeded: unit)) ?? " ")
+}
+
+/// `kotlin.text.CharCategory` constants in declaration order.
+private let charCategoryNames = [
+    "UPPERCASE_LETTER", "LOWERCASE_LETTER", "TITLECASE_LETTER", "MODIFIER_LETTER", "OTHER_LETTER",
+    "NON_SPACING_MARK", "ENCLOSING_MARK", "COMBINING_SPACING_MARK", "DECIMAL_DIGIT_NUMBER",
+    "LETTER_NUMBER", "OTHER_NUMBER", "SPACE_SEPARATOR", "LINE_SEPARATOR", "PARAGRAPH_SEPARATOR",
+    "CONTROL", "FORMAT", "SURROGATE", "PRIVATE_USE", "UNASSIGNED", "CONNECTOR_PUNCTUATION",
+    "DASH_PUNCTUATION", "START_PUNCTUATION", "END_PUNCTUATION", "INITIAL_QUOTE_PUNCTUATION",
+    "FINAL_QUOTE_PUNCTUATION", "OTHER_PUNCTUATION", "MATH_SYMBOL", "CURRENCY_SYMBOL",
+    "MODIFIER_SYMBOL", "OTHER_SYMBOL",
+]
+
+private func charCategoryName(_ unit: Int32) -> String {
+    guard let scalar = UnicodeScalar(UInt32(truncatingIfNeeded: unit)) else { return "SURROGATE" }
+    switch scalar.properties.generalCategory {
+    case .uppercaseLetter: return "UPPERCASE_LETTER"
+    case .lowercaseLetter: return "LOWERCASE_LETTER"
+    case .titlecaseLetter: return "TITLECASE_LETTER"
+    case .modifierLetter: return "MODIFIER_LETTER"
+    case .otherLetter: return "OTHER_LETTER"
+    case .nonspacingMark: return "NON_SPACING_MARK"
+    case .enclosingMark: return "ENCLOSING_MARK"
+    case .spacingMark: return "COMBINING_SPACING_MARK"
+    case .decimalNumber: return "DECIMAL_DIGIT_NUMBER"
+    case .letterNumber: return "LETTER_NUMBER"
+    case .otherNumber: return "OTHER_NUMBER"
+    case .spaceSeparator: return "SPACE_SEPARATOR"
+    case .lineSeparator: return "LINE_SEPARATOR"
+    case .paragraphSeparator: return "PARAGRAPH_SEPARATOR"
+    case .control: return "CONTROL"
+    case .format: return "FORMAT"
+    case .surrogate: return "SURROGATE"
+    case .privateUse: return "PRIVATE_USE"
+    case .unassigned: return "UNASSIGNED"
+    case .connectorPunctuation: return "CONNECTOR_PUNCTUATION"
+    case .dashPunctuation: return "DASH_PUNCTUATION"
+    case .openPunctuation: return "START_PUNCTUATION"
+    case .closePunctuation: return "END_PUNCTUATION"
+    case .initialPunctuation: return "INITIAL_QUOTE_PUNCTUATION"
+    case .finalPunctuation: return "FINAL_QUOTE_PUNCTUATION"
+    case .otherPunctuation: return "OTHER_PUNCTUATION"
+    case .mathSymbol: return "MATH_SYMBOL"
+    case .currencySymbol: return "CURRENCY_SYMBOL"
+    case .modifierSymbol: return "MODIFIER_SYMBOL"
+    case .otherSymbol: return "OTHER_SYMBOL"
+    @unknown default: return "UNASSIGNED"
+    }
 }
 
 private func indexOfChar(_ units: [UInt16], _ char: UInt16, from: Int, ignoreCase: Bool) -> Int? {

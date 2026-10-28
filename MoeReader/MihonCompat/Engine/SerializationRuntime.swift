@@ -224,9 +224,25 @@ final class VMJsonArrayBuilderPayload {
     var items: [VMJsonTree] = []
 }
 
+/// `kotlin.reflect.KTypeProjection`: a variance marker plus the projected type.
+/// `Reflection.typeOf` ignores projections (this engine's `KTypeImpl` carries
+/// only the raw class), but the projection object must exist and round-trip.
+final class VMKTypeProjectionPayload {
+    var variance: String
+    var type: VMValue?
+    init(variance: String, type: VMValue?) {
+        self.variance = variance
+        self.type = type
+    }
+}
+
 final class VMJsonConfigPayload {
     var module = VMSerializersModulePayload()
     var ignoreUnknownKeys = false
+    /// Mirrors `JsonBuilder.useArrayPolymorphism`. Encoding polymorphic values
+    /// is not reachable from the native encoder yet, but the builder must keep
+    /// the setting instead of dropping it.
+    var useArrayPolymorphism = false
 }
 
 final class VMEnumSerializerPayload {
@@ -378,6 +394,7 @@ struct SerializationRuntime {
         result += descriptors()
         result += builtins()
         result += jsonClasses()
+        result += legacySurface()
         return result
     }
 
@@ -395,6 +412,7 @@ struct SerializationRuntime {
             runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
         }
         descriptor.method("getKind", "()Lkotlinx/serialization/descriptors/SerialKind;") { _, _, _ in .null }
+        descriptor.method("isInline", "()Z") { _, _, _ in .boolean(false) }
         result.append(descriptor)
 
         let serializer = NativeClass("Lkotlinx/serialization/KSerializer;", superclass: nil, interfaces: ["Lkotlinx/serialization/DeserializationStrategy;", "Lkotlinx/serialization/SerializationStrategy;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
@@ -419,6 +437,7 @@ struct SerializationRuntime {
         decoder.method("decodeSerializableValue", "(Lkotlinx/serialization/DeserializationStrategy;)Ljava/lang/Object;") { _, _, _ in .null }
         decoder.method("decodeNotNullMark", "()Z") { _, _, _ in .boolean(true) }
         decoder.method("decodeNull", "()Ljava/lang/Object;") { _, _, _ in .null }
+        decoder.method("decodeInline", "(Lkotlinx/serialization/descriptors/SerialDescriptor;)Lkotlinx/serialization/encoding/Decoder;") { _, args, _ in args[0] }
         result.append(decoder)
 
         let composite = NativeClass("Lkotlinx/serialization/encoding/CompositeDecoder;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
@@ -434,10 +453,245 @@ struct SerializationRuntime {
         let encoder = NativeClass("Lkotlinx/serialization/encoding/Encoder;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         encoder.method("encodeString", "(Ljava/lang/String;)V") { _, _, _ in .zero }
         encoder.method("encodeInt", "(I)V") { _, _, _ in .zero }
+        encoder.method("encodeInline", "(Lkotlinx/serialization/descriptors/SerialDescriptor;)Lkotlinx/serialization/encoding/Encoder;") { _, args, _ in args[0] }
         result.append(encoder)
         result.append(NativeClass("Lkotlinx/serialization/encoding/CompositeEncoder;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
         result.append(NativeClass("Lkotlinx/serialization/DeserializationStrategy;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
         result.append(NativeClass("Lkotlinx/serialization/SerializationStrategy;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
+        return result
+    }
+
+    /// Serializer/format classes the whole index references but that no live
+    /// extension path exercises. Constructors and descriptors are real; the
+    /// formats we genuinely do not implement fail with a typed
+    /// `SerializationException` instead of inventing bytes.
+    private static func legacySurface() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let abstractDecoder = NativeClass(
+            "Lkotlinx/serialization/encoding/AbstractDecoder;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/serialization/encoding/Decoder;"]
+        )
+        abstractDecoder.method("<init>", "()V") { _, _, _ in .zero }
+        for signature in [
+            "(Lkotlinx/serialization/DeserializationStrategy;)Ljava/lang/Object;",
+            "(Lkotlinx/serialization/DeserializationStrategy;Ljava/lang/Object;)Ljava/lang/Object;",
+        ] {
+            abstractDecoder.method("decodeSerializableValue", signature) { runtime, args, _ in
+                runtime.callVirtual(
+                    args[1],
+                    "deserialize(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;",
+                    [args[0]]
+                ) ?? .null
+            }
+        }
+        result.append(abstractDecoder)
+
+        let abstractEncoder = NativeClass(
+            "Lkotlinx/serialization/encoding/AbstractEncoder;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/serialization/encoding/Encoder;"]
+        )
+        abstractEncoder.method("<init>", "()V") { _, _, _ in .zero }
+        abstractEncoder.method("encodeSerializableValue", "(Lkotlinx/serialization/SerializationStrategy;Ljava/lang/Object;)V") { runtime, args, _ in
+            _ = runtime.callVirtual(
+                args[1],
+                "serialize(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V",
+                [args[0], args[2]]
+            )
+            return .zero
+        }
+        result.append(abstractEncoder)
+
+        let collectionSerializer = NativeClass("Lkotlinx/serialization/internal/AbstractCollectionSerializer;", superclass: "Ljava/lang/Object;")
+        collectionSerializer.method("merge", "(Lkotlinx/serialization/encoding/Decoder;Ljava/lang/Object;)Ljava/lang/Object;") { _, args, _ in args[2] }
+        result.append(collectionSerializer)
+
+        let binaryFormat = NativeClass(
+            "Lkotlinx/serialization/BinaryFormat;",
+            superclass: nil,
+            interfaces: ["Lkotlinx/serialization/SerialFormat;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        binaryFormat.method("getSerializersModule", "()Lkotlinx/serialization/modules/SerializersModule;") { runtime, _, _ in
+            runtime.makeNative("Lkotlinx/serialization/modules/SerializersModule;", payload: VMSerializersModulePayload())
+        }
+        binaryFormat.method("encodeToByteArray", "(Lkotlinx/serialization/SerializationStrategy;Ljava/lang/Object;)[B") { _, _, _ in
+            throw VMJavaException(SerializationRuntime.serializationException, "binary serialization is unsupported")
+        }
+        binaryFormat.method("decodeFromByteArray", "(Lkotlinx/serialization/DeserializationStrategy;[B)Ljava/lang/Object;") { _, _, _ in
+            throw VMJavaException(SerializationRuntime.serializationException, "binary serialization is unsupported")
+        }
+        result.append(binaryFormat)
+
+        func unsupportedSerializer(_ descriptor: String, _ label: String) -> NativeClass {
+            let cls = NativeClass(descriptor, superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/KSerializer;"])
+            cls.staticField("INSTANCE", descriptor)
+            cls.prepare = { runtime, cls in
+                cls.staticValues[0] = runtime.makeNative(descriptor, payload: NSNull())
+            }
+            cls.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
+            cls.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { _, _, _ in
+                throw VMJavaException(SerializationRuntime.serializationException, "\(label) is not JSON-serializable")
+            }
+            cls.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { _, _, _ in
+                throw VMJavaException(SerializationRuntime.serializationException, "\(label) is not JSON-deserializable")
+            }
+            return cls
+        }
+        result.append(unsupportedSerializer("Lkotlinx/serialization/internal/ByteArraySerializer;", "ByteArraySerializer"))
+        result.append(unsupportedSerializer("Lkotlinx/serialization/internal/IntArraySerializer;", "IntArraySerializer"))
+        result.append(unsupportedSerializer("Lkotlinx/serialization/internal/InstantSerializer;", "InstantSerializer"))
+
+        let referenceArray = unsupportedSerializer("Lkotlinx/serialization/internal/ReferenceArraySerializer;", "ReferenceArraySerializer")
+        referenceArray.method("<init>", "(Lkotlin/reflect/KClass;Lkotlinx/serialization/KSerializer;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListSerializerPayload(element: args[2]))
+            return .zero
+        }
+        result.append(referenceArray)
+
+        let linkedHashSet = unsupportedSerializer("Lkotlinx/serialization/internal/LinkedHashSetSerializer;", "LinkedHashSetSerializer")
+        linkedHashSet.method("<init>", "(Lkotlinx/serialization/KSerializer;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListSerializerPayload(element: args[1]))
+            return .zero
+        }
+        result.append(linkedHashSet)
+
+        let objectSerializer = NativeClass(
+            "Lkotlinx/serialization/internal/ObjectSerializer;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/serialization/KSerializer;"]
+        )
+        objectSerializer.method("<init>", "(Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/annotation/Annotation;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMNullableSerializerPayload(inner: args[2]))
+            return .zero
+        }
+        objectSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
+        objectSerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { runtime, args, _ in
+            if let encoder: VMJsonEncoderPayload = runtime.payload(args[1], as: VMJsonEncoderPayload.self) {
+                encoder.tree = VMJsonTree(.object([:]))
+            }
+            return .zero
+        }
+        objectSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMNullableSerializerPayload.self)?.inner ?? .null
+        }
+        result.append(objectSerializer)
+
+        let sealedSerializer = NativeClass(
+            "Lkotlinx/serialization/SealedClassSerializer;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/serialization/KSerializer;"]
+        )
+        sealedSerializer.method(
+            "<init>",
+            "(Ljava/lang/String;Lkotlin/reflect/KClass;[Lkotlin/reflect/KClass;[Lkotlinx/serialization/KSerializer;[Ljava/lang/annotation/Annotation;)V"
+        ) { _, _, _ in .zero }
+        sealedSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
+        sealedSerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { _, _, _ in
+            throw VMJavaException(SerializationRuntime.serializationException, "sealed serialization is unsupported")
+        }
+        sealedSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { _, _, _ in
+            throw VMJavaException(SerializationRuntime.serializationException, "sealed serialization is unsupported")
+        }
+        result.append(sealedSerializer)
+
+        let contextualSerializer = NativeClass(
+            "Lkotlinx/serialization/ContextualSerializer;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/serialization/KSerializer;"]
+        )
+        contextualSerializer.method("<init>", "(Lkotlin/reflect/KClass;Lkotlinx/serialization/KSerializer;[Lkotlinx/serialization/KSerializer;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMNullableSerializerPayload(inner: args[2]))
+            return .zero
+        }
+        contextualSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            guard let payload: VMNullableSerializerPayload = runtime.payload(args[0], as: VMNullableSerializerPayload.self),
+                  payload.inner.bits != 0 else { return runtime.genericDescriptor() }
+            return runtime.callVirtual(payload.inner, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", []) ?? runtime.genericDescriptor()
+        }
+        contextualSerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { runtime, args, _ in
+            guard let payload: VMNullableSerializerPayload = runtime.payload(args[0], as: VMNullableSerializerPayload.self),
+                  payload.inner.bits != 0 else {
+                throw VMJavaException(SerializationRuntime.serializationException, "no contextual serializer registered")
+            }
+            _ = runtime.callVirtual(
+                payload.inner,
+                "serialize(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V",
+                [args[1], args[2]]
+            )
+            return .zero
+        }
+        contextualSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
+            guard let payload: VMNullableSerializerPayload = runtime.payload(args[0], as: VMNullableSerializerPayload.self),
+                  payload.inner.bits != 0 else {
+                throw VMJavaException(SerializationRuntime.serializationException, "no contextual serializer registered")
+            }
+            return runtime.callVirtual(
+                payload.inner,
+                "deserialize(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;",
+                [args[1]]
+            ) ?? .null
+        }
+        result.append(contextualSerializer)
+
+        let moduleBuilders = NativeClass("Lkotlinx/serialization/modules/SerializersModuleBuildersKt;")
+        moduleBuilders.staticMethod("EmptySerializersModule", "()Lkotlinx/serialization/modules/SerializersModule;") { runtime, _, _ in
+            runtime.makeNative("Lkotlinx/serialization/modules/SerializersModule;", payload: VMSerializersModulePayload())
+        }
+        result.append(moduleBuilders)
+
+        let protoIntegerType = NativeClass("Lkotlinx/serialization/protobuf/ProtoIntegerType;", superclass: "Ljava/lang/Object;")
+        for field in ["DEFAULT", "FIXED", "SIGNED"] {
+            protoIntegerType.staticField(field, "Lkotlinx/serialization/protobuf/ProtoIntegerType;")
+        }
+        protoIntegerType.prepare = { runtime, cls in
+            for (index, name) in ["DEFAULT", "FIXED", "SIGNED"].enumerated() {
+                cls.staticValues[index] = runtime.makeNative(
+                    "Lkotlinx/serialization/protobuf/ProtoIntegerType;",
+                    payload: name
+                )
+            }
+        }
+        protoIntegerType.staticMethod("values", "()[Lkotlinx/serialization/protobuf/ProtoIntegerType;") { runtime, _, _ in
+            let values = ["DEFAULT", "FIXED", "SIGNED"].map {
+                runtime.makeNative("Lkotlinx/serialization/protobuf/ProtoIntegerType;", payload: $0)
+            }
+            let array = runtime.newArray(component: "Lkotlinx/serialization/protobuf/ProtoIntegerType;", count: values.count)
+            for (index, value) in values.enumerated() { runtime.setArrayElement(array, index: index, value: value) }
+            return array
+        }
+        result.append(protoIntegerType)
+
+        let protoNumber = NativeClass(
+            "Lkotlinx/serialization/protobuf/ProtoNumber;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract | DexAccess.isAnnotation
+        )
+        // The real value lives on the annotated declaration's annotation
+        // instance; this default is only reached when one is fabricated.
+        protoNumber.method("number", "()I") { _, _, _ in .int32(0) }
+        result.append(protoNumber)
+
+        let protoType = NativeClass(
+            "Lkotlinx/serialization/protobuf/ProtoType;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract | DexAccess.isAnnotation
+        )
+        protoType.method("type", "()Lkotlinx/serialization/protobuf/ProtoIntegerType;") { runtime, _, _ in
+            runtime.makeNative("Lkotlinx/serialization/protobuf/ProtoIntegerType;", payload: "DEFAULT")
+        }
+        result.append(protoType)
+
+        result.append(NativeClass(
+            "Lkotlinx/serialization/protobuf/ProtoOneOf;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract | DexAccess.isAnnotation
+        ))
         return result
     }
 
@@ -477,6 +731,10 @@ struct SerializationRuntime {
             if !names.isEmpty { payload.aliases[payload.elements.count - 1] = names }
             return .zero
         }
+        // Class-level annotations (`@JsonClassDiscriminator`) do not change the
+        // descriptor's element list; the JSON decoder reads discriminators
+        // directly from the value.
+        descriptor.method("pushClassAnnotation", "(Ljava/lang/annotation/Annotation;)V") { _, _, _ in .zero }
         descriptor.method("getSerialName", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: VMSerialDescriptorPayload.self)?.serialName ?? "")
         }
@@ -575,6 +833,64 @@ struct SerializationRuntime {
         result.append(structureKind)
         let primitiveKind = NativeClass("Lkotlinx/serialization/descriptors/PrimitiveKind;", superclass: "Lkotlinx/serialization/descriptors/SerialKind;")
         result.append(primitiveKind)
+
+        // `SerialKind` hierarchy: each kind is a singleton object whose
+        // `INSTANCE` field the generated serializers read.
+        func kindSingleton(_ descriptor: String, superclass: String) -> NativeClass {
+            let cls = NativeClass(descriptor, superclass: superclass)
+            cls.staticField("INSTANCE", descriptor)
+            cls.prepare = { runtime, cls in
+                cls.staticValues[0] = runtime.makeNative(descriptor, payload: NSNull())
+            }
+            cls.method("toString", "()Ljava/lang/String;") { runtime, _, _ in
+                runtime.newString(descriptor.split(separator: "$").last.map(String.init) ?? descriptor)
+            }
+            return cls
+        }
+        for name in ["CLASS", "LIST", "MAP", "OBJECT"] {
+            result.append(kindSingleton(
+                "Lkotlinx/serialization/descriptors/StructureKind$\(name);",
+                superclass: "Lkotlinx/serialization/descriptors/StructureKind;"
+            ))
+        }
+        result.append(kindSingleton(
+            "Lkotlinx/serialization/descriptors/SerialKind$ENUM;",
+            superclass: "Lkotlinx/serialization/descriptors/SerialKind;"
+        ))
+        for name in ["BOOLEAN", "BYTE", "CHAR", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE", "STRING"] {
+            result.append(kindSingleton(
+                "Lkotlinx/serialization/descriptors/PrimitiveKind$\(name);",
+                superclass: "Lkotlinx/serialization/descriptors/PrimitiveKind;"
+            ))
+        }
+
+        builderKt.staticMethod("PrimitiveSerialDescriptor", "(Ljava/lang/String;Lkotlinx/serialization/descriptors/PrimitiveKind;)Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            runtime.makeNative(
+                "Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;",
+                payload: VMSerialDescriptorPayload(serialName: runtime.stringValue(args[0]) ?? "")
+            )
+        }
+        builderKt.staticMethod("SerialDescriptor", "(Ljava/lang/String;Lkotlinx/serialization/descriptors/SerialDescriptor;)Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            runtime.makeNative(
+                "Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;",
+                payload: VMSerialDescriptorPayload(serialName: runtime.stringValue(args[0]) ?? "")
+            )
+        }
+
+        let inlineDescriptor = NativeClass(
+            "Lkotlinx/serialization/internal/InlineClassDescriptor;",
+            superclass: "Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;"
+        )
+        inlineDescriptor.method("<init>", "(Ljava/lang/String;Lkotlinx/serialization/internal/GeneratedSerializer;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMSerialDescriptorPayload(serialName: runtime.stringValue(args[1]) ?? ""))
+            return .zero
+        }
+        inlineDescriptor.method("addElement", "(Ljava/lang/String;Z)V") { runtime, args, _ in
+            let payload: VMSerialDescriptorPayload = try runtime.payloadBox(args[0])
+            payload.elements.append((runtime.stringValue(args[1]) ?? "", args[2].asBoolean))
+            return .zero
+        }
+        result.append(inlineDescriptor)
         return result
     }
 
@@ -606,6 +922,9 @@ struct SerializationRuntime {
             builtins.staticMethod("getNullable", signature) { runtime, args, _ in
                 runtime.makeNative("Lmihoncompat/NullableSerializer;", payload: VMNullableSerializerPayload(inner: args[0]))
             }
+        }
+        builtins.staticMethod("ByteArraySerializer", "()Lkotlinx/serialization/KSerializer;") { runtime, _, _ in
+            runtime.makeNative("Lkotlinx/serialization/internal/ByteArraySerializer;", payload: NSNull())
         }
         result.append(builtins)
 
@@ -1243,26 +1562,73 @@ struct SerializationRuntime {
                   let text = tree.stringValue else { return .null }
             return runtime.newString(text)
         }
+        // `JsonPrimitive(value)` factories answer `JsonNull` for a null input:
+        // the Kotlin overloads take nullable parameters.
         jsonElementKt.staticMethod("JsonPrimitive", "(Ljava/lang/String;)Lkotlinx/serialization/json/JsonPrimitive;") { runtime, args, _ in
-            runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: VMJsonTree(.string(runtime.stringValue(args[0]) ?? "")))
+            guard args[0].bits != 0 else { return runtime.jsonElementValue(VMJsonTree(.null)) }
+            return runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: VMJsonTree(.string(runtime.stringValue(args[0]) ?? "")))
         }
         jsonElementKt.staticMethod("JsonPrimitive", "(Ljava/lang/Number;)Lkotlinx/serialization/json/JsonPrimitive;") { runtime, args, _ in
+            guard args[0].bits != 0 else { return runtime.jsonElementValue(VMJsonTree(.null)) }
             let text = runtime.stringValue(runtime.javaToString(args[0])) ?? "0"
             return runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: VMJsonTree(.number(text)))
         }
         jsonElementKt.staticMethod("JsonPrimitive", "(Ljava/lang/Boolean;)Lkotlinx/serialization/json/JsonPrimitive;") { runtime, args, _ in
+            guard args[0].bits != 0 else { return runtime.jsonElementValue(VMJsonTree(.null)) }
             let text = runtime.stringValue(runtime.javaToString(args[0])) ?? "false"
             return runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: VMJsonTree(.bool(text == "true")))
         }
+        // `content` is "null" for `JsonNull`, and every scalar accessor parses
+        // it exactly like the Kotlin extension property does.
+        func primitiveText(_ runtime: VMRuntime, _ value: VMValue) -> String {
+            guard let tree: VMJsonTree = runtime.payload(value, as: VMJsonTree.self) else { return "null" }
+            return tree.stringValue ?? "null"
+        }
+        for (name, signature, primitive) in [
+            ("getInt", "I", "int"), ("getLong", "J", "long"), ("getBoolean", "Z", "bool"),
+            ("getDouble", "D", "double"), ("getFloat", "F", "float"),
+        ] {
+            jsonElementKt.staticMethod(name, "(Lkotlinx/serialization/json/JsonPrimitive;)\(signature)") { runtime, args, _ in
+                let text = primitiveText(runtime, args[0])
+                switch primitive {
+                case "int":
+                    guard let parsed = Int64(text), parsed >= Int64(Int32.min), parsed <= Int64(Int32.max) else {
+                        throw VMJavaException("Ljava/lang/NumberFormatException;", "\(text) is not an Int")
+                    }
+                    return .int32(Int32(parsed))
+                case "long":
+                    guard let parsed = Int64(text) else {
+                        throw VMJavaException("Ljava/lang/NumberFormatException;", "For input string: \"\(text)\"")
+                    }
+                    return .int64(parsed)
+                case "bool":
+                    guard text == "true" || text == "false" else {
+                        throw VMJavaException("Ljava/lang/IllegalStateException;", "\(text) does not represent a Boolean")
+                    }
+                    return .boolean(text == "true")
+                case "double":
+                    guard let parsed = Double(text) else {
+                        throw VMJavaException("Ljava/lang/NumberFormatException;", "For input string: \"\(text)\"")
+                    }
+                    return .double(parsed)
+                default:
+                    guard let parsed = Float(text) else {
+                        throw VMJavaException("Ljava/lang/NumberFormatException;", "For input string: \"\(text)\"")
+                    }
+                    return .float(parsed)
+                }
+            }
+        }
         for (name, conversion) in [
-            ("getInt", "int"), ("getLong", "long"), ("getBoolean", "bool"), ("getDouble", "double"), ("getFloat", "float"),
             ("getIntOrNull", "int"), ("getLongOrNull", "long"), ("getBooleanOrNull", "bool"),
             ("getDoubleOrNull", "double"), ("getFloatOrNull", "float"),
         ] {
             jsonElementKt.staticMethod(name, "(Lkotlinx/serialization/json/JsonPrimitive;)L\(conversion == "int" ? "java/lang/Integer" : conversion == "long" ? "java/lang/Long" : conversion == "bool" ? "java/lang/Boolean" : conversion == "double" ? "java/lang/Double" : "java/lang/Float");") { runtime, args, _ in
                 guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self), let text = tree.stringValue else { return .null }
                 switch conversion {
-                case "int": return Int32(text).map { runtime.boxInt($0) } ?? .null
+                case "int":
+                    guard let parsed = Int64(text), parsed >= Int64(Int32.min), parsed <= Int64(Int32.max) else { return .null }
+                    return runtime.boxInt(Int32(parsed))
                 case "long": return Int64(text).map { runtime.boxLong($0) } ?? .null
                 case "bool": return (text == "true" || text == "false") ? (text == "true" ? .boolean(true) : .boolean(false)) : .null
                 case "double": return Double(text).map { runtime.boxDouble($0) } ?? .null
@@ -1276,10 +1642,41 @@ struct SerializationRuntime {
         }
         result.append(jsonElementKt)
 
+        // The DSL builders and the `JsonElementBuildersKt` helpers share this
+        // storage: helper calls mutate the same payload the instance methods do.
+        func jsonTree(_ runtime: VMRuntime, _ value: VMValue) -> VMJsonTree {
+            runtime.payload(value, as: VMJsonTree.self) ?? VMJsonTree(.null)
+        }
+        func numberTree(_ runtime: VMRuntime, _ value: VMValue) -> VMJsonTree {
+            guard value.bits != 0 else { return VMJsonTree(.null) }
+            return VMJsonTree(.number(runtime.stringValue(runtime.javaToString(value)) ?? "0"))
+        }
+        func booleanTree(_ value: VMValue) -> VMJsonTree {
+            guard value.bits != 0 else { return VMJsonTree(.null) }
+            return VMJsonTree(.bool(SerializationRuntime.booleanValue(value)))
+        }
+        @discardableResult
+        func addObject(_ runtime: VMRuntime, _ builderValue: VMValue, _ name: String, _ tree: VMJsonTree) -> VMJsonTree? {
+            guard let payload: VMJsonObjectBuilderPayload = runtime.payload(builderValue, as: VMJsonObjectBuilderPayload.self) else { return nil }
+            let previous = payload.fields[name]
+            payload.fields[name] = tree
+            return previous
+        }
+        @discardableResult
+        func addArray(_ runtime: VMRuntime, _ builderValue: VMValue, _ tree: VMJsonTree) -> Bool {
+            guard let payload: VMJsonArrayBuilderPayload = runtime.payload(builderValue, as: VMJsonArrayBuilderPayload.self) else { return false }
+            payload.items.append(tree)
+            return true
+        }
+
         let objectBuilder = NativeClass("Lkotlinx/serialization/json/JsonObjectBuilder;", superclass: "Ljava/lang/Object;")
         objectBuilder.method("<init>", "()V") { runtime, args, _ in
             runtime.setPayload(args[0], VMJsonObjectBuilderPayload())
             return .zero
+        }
+        objectBuilder.method("put", "(Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
+            let previous = addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", jsonTree(runtime, args[2]))
+            return previous.map { runtime.jsonElementValue($0) } ?? .null
         }
         objectBuilder.method("build", "()Lkotlinx/serialization/json/JsonObject;") { runtime, args, _ in
             let payload: VMJsonObjectBuilderPayload = runtime.payload(args[0], as: VMJsonObjectBuilderPayload.self) ?? VMJsonObjectBuilderPayload()
@@ -1292,26 +1689,21 @@ struct SerializationRuntime {
             runtime.setPayload(args[0], VMJsonArrayBuilderPayload())
             return .zero
         }
+        arrayBuilder.method("add", "(Lkotlinx/serialization/json/JsonElement;)Z") { runtime, args, _ in
+            .boolean(addArray(runtime, args[0], jsonTree(runtime, args[1])))
+        }
+        arrayBuilder.method("addAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            var added = false
+            for item in runtime.listItems(args[1]) ?? [] {
+                added = addArray(runtime, args[0], jsonTree(runtime, item)) || added
+            }
+            return .boolean(added)
+        }
         arrayBuilder.method("build", "()Lkotlinx/serialization/json/JsonArray;") { runtime, args, _ in
             let payload: VMJsonArrayBuilderPayload = runtime.payload(args[0], as: VMJsonArrayBuilderPayload.self) ?? VMJsonArrayBuilderPayload()
             return runtime.makeNative("Lkotlinx/serialization/json/JsonArray;", payload: VMJsonTree(.array(payload.items)))
         }
         result.append(arrayBuilder)
-
-        func jsonTree(_ runtime: VMRuntime, _ value: VMValue) -> VMJsonTree {
-            runtime.payload(value, as: VMJsonTree.self) ?? VMJsonTree(.null)
-        }
-        func numberTree(_ runtime: VMRuntime, _ value: VMValue) -> VMJsonTree {
-            VMJsonTree(.number(runtime.stringValue(runtime.javaToString(value)) ?? "0"))
-        }
-        func addObject(_ runtime: VMRuntime, _ builderValue: VMValue, _ name: String, _ tree: VMJsonTree) {
-            guard let payload: VMJsonObjectBuilderPayload = runtime.payload(builderValue, as: VMJsonObjectBuilderPayload.self) else { return }
-            payload.fields[name] = tree
-        }
-        func addArray(_ runtime: VMRuntime, _ builderValue: VMValue, _ tree: VMJsonTree) {
-            guard let payload: VMJsonArrayBuilderPayload = runtime.payload(builderValue, as: VMJsonArrayBuilderPayload.self) else { return }
-            payload.items.append(tree)
-        }
 
         let elementBuilders = NativeClass("Lkotlinx/serialization/json/JsonElementBuildersKt;")
         elementBuilders.staticMethod("buildJsonObject", "(Lkotlin/jvm/functions/Function1;)Lkotlinx/serialization/json/JsonObject;") { runtime, args, _ in
@@ -1332,23 +1724,29 @@ struct SerializationRuntime {
             }
             return runtime.makeNative("Lkotlinx/serialization/json/JsonArray;", payload: VMJsonTree(.array([])))
         }
-        for signature in ["(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;)Lkotlinx/serialization/json/JsonElement;"] {
+        elementBuilders.staticMethod("put", "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Lkotlinx/serialization/json/JsonElement;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
+            let tree = jsonTree(runtime, args[2])
+            addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", tree)
+            return runtime.jsonElementValue(tree)
+        }
+        for signature in [
+            "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/String;)Lkotlinx/serialization/json/JsonElement;",
+            "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/Number;)Lkotlinx/serialization/json/JsonElement;",
+            "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/Boolean;)Lkotlinx/serialization/json/JsonElement;",
+            "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/Void;)Lkotlinx/serialization/json/JsonElement;",
+        ] {
             elementBuilders.staticMethod("put", signature) { runtime, args, _ in
-                addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", jsonTree(runtime, args[2]))
-                return .null
+                let type = String(signature.split(separator: ";")[2])
+                let tree: VMJsonTree
+                switch type {
+                case "Ljava/lang/String": tree = args[2].bits == 0 ? VMJsonTree(.null) : VMJsonTree(.string(runtime.stringValue(args[2]) ?? ""))
+                case "Ljava/lang/Number": tree = numberTree(runtime, args[2])
+                case "Ljava/lang/Boolean": tree = booleanTree(args[2])
+                default: tree = VMJsonTree(.null)
+                }
+                addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", tree)
+                return runtime.jsonElementValue(tree)
             }
-        }
-        elementBuilders.staticMethod("put", "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/String;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", VMJsonTree(.string(runtime.stringValue(args[2]) ?? "")))
-            return .null
-        }
-        elementBuilders.staticMethod("put", "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/Number;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", numberTree(runtime, args[2]))
-            return .null
-        }
-        elementBuilders.staticMethod("put", "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Ljava/lang/Boolean;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", VMJsonTree(.bool(SerializationRuntime.booleanValue(args[2]))))
-            return .null
         }
         elementBuilders.staticMethod("putJsonObject", "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Lkotlin/jvm/functions/Function1;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
             let payload = VMJsonObjectBuilderPayload()
@@ -1356,7 +1754,7 @@ struct SerializationRuntime {
             _ = try runtime.callFunction(args[2], [child])
             let tree = VMJsonTree(.object(payload.fields))
             addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonObject;", payload: tree)
+            return runtime.jsonElementValue(tree)
         }
         elementBuilders.staticMethod("putJsonArray", "(Lkotlinx/serialization/json/JsonObjectBuilder;Ljava/lang/String;Lkotlin/jvm/functions/Function1;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
             let payload = VMJsonArrayBuilderPayload()
@@ -1364,43 +1762,50 @@ struct SerializationRuntime {
             _ = try runtime.callFunction(args[2], [child])
             let tree = VMJsonTree(.array(payload.items))
             addObject(runtime, args[0], runtime.stringValue(args[1]) ?? "", tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonArray;", payload: tree)
+            return runtime.jsonElementValue(tree)
         }
-        elementBuilders.staticMethod("add", "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/String;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            let tree = VMJsonTree(.string(runtime.stringValue(args[1]) ?? ""))
-            addArray(runtime, args[0], tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: tree)
+        for signature in [
+            "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/String;)Z",
+            "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/Number;)Z",
+            "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/Boolean;)Z",
+            "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/Void;)Z",
+            "(Lkotlinx/serialization/json/JsonArrayBuilder;Lkotlinx/serialization/json/JsonElement;)Z",
+        ] {
+            elementBuilders.staticMethod("add", signature) { runtime, args, _ in
+                let type = String(signature.split(separator: ";")[1])
+                let tree: VMJsonTree
+                switch type {
+                case "Ljava/lang/String": tree = args[1].bits == 0 ? VMJsonTree(.null) : VMJsonTree(.string(runtime.stringValue(args[1]) ?? ""))
+                case "Ljava/lang/Number": tree = numberTree(runtime, args[1])
+                case "Ljava/lang/Boolean": tree = booleanTree(args[1])
+                case "Lkotlinx/serialization/json/JsonElement": tree = jsonTree(runtime, args[1])
+                default: tree = VMJsonTree(.null)
+                }
+                addArray(runtime, args[0], tree)
+                return .boolean(true)
+            }
         }
-        elementBuilders.staticMethod("add", "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/Number;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            let tree = numberTree(runtime, args[1])
-            addArray(runtime, args[0], tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: tree)
+        elementBuilders.staticMethod("addAllStrings", "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/util/Collection;)Z") { runtime, args, _ in
+            let values = runtime.listItems(args[1]) ?? []
+            for value in values {
+                let tree = value.bits == 0 ? VMJsonTree(.null) : VMJsonTree(.string(runtime.stringValue(value) ?? ""))
+                addArray(runtime, args[0], tree)
+            }
+            return .boolean(!values.isEmpty)
         }
-        elementBuilders.staticMethod("add", "(Lkotlinx/serialization/json/JsonArrayBuilder;Ljava/lang/Boolean;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            let tree = VMJsonTree(.bool(SerializationRuntime.booleanValue(args[1])))
-            addArray(runtime, args[0], tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonPrimitive;", payload: tree)
-        }
-        elementBuilders.staticMethod("add", "(Lkotlinx/serialization/json/JsonArrayBuilder;Lkotlinx/serialization/json/JsonElement;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
-            let tree = jsonTree(runtime, args[1])
-            addArray(runtime, args[0], tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonElement;", payload: tree)
-        }
-        elementBuilders.staticMethod("addJsonObject", "(Lkotlinx/serialization/json/JsonArrayBuilder;Lkotlin/jvm/functions/Function1;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
+        elementBuilders.staticMethod("addJsonObject", "(Lkotlinx/serialization/json/JsonArrayBuilder;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
             let payload = VMJsonObjectBuilderPayload()
             let child = runtime.makeNative("Lkotlinx/serialization/json/JsonObjectBuilder;", payload: payload)
             _ = try runtime.callFunction(args[1], [child])
-            let tree = VMJsonTree(.object(payload.fields))
-            addArray(runtime, args[0], tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonObject;", payload: tree)
+            addArray(runtime, args[0], VMJsonTree(.object(payload.fields)))
+            return .boolean(true)
         }
-        elementBuilders.staticMethod("addJsonArray", "(Lkotlinx/serialization/json/JsonArrayBuilder;Lkotlin/jvm/functions/Function1;)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
+        elementBuilders.staticMethod("addJsonArray", "(Lkotlinx/serialization/json/JsonArrayBuilder;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
             let payload = VMJsonArrayBuilderPayload()
             let child = runtime.makeNative("Lkotlinx/serialization/json/JsonArrayBuilder;", payload: payload)
             _ = try runtime.callFunction(args[1], [child])
-            let tree = VMJsonTree(.array(payload.items))
-            addArray(runtime, args[0], tree)
-            return runtime.makeNative("Lkotlinx/serialization/json/JsonArray;", payload: tree)
+            addArray(runtime, args[0], VMJsonTree(.array(payload.items)))
+            return .boolean(true)
         }
         result.append(elementBuilders)
 
@@ -1455,10 +1860,70 @@ struct SerializationRuntime {
         }
         result.append(transforming)
 
-        let json = NativeClass("Lkotlinx/serialization/json/Json;", superclass: "Ljava/lang/Object;")
-        json.staticField("Default", "Lkotlinx/serialization/json/Json;")
+        // `SerialFormat`/`StringFormat` are the interfaces `Json` exposes; the
+        // engine resolves them when an extension declares or checks for one.
+        let serialFormat = NativeClass(
+            "Lkotlinx/serialization/SerialFormat;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        serialFormat.method("getSerializersModule", "()Lkotlinx/serialization/modules/SerializersModule;") { runtime, args, _ in
+            let config = runtime.payload(args[0], as: VMJsonConfigPayload.self)
+            return runtime.makeNative(
+                "Lkotlinx/serialization/modules/SerializersModule;",
+                payload: config?.module ?? VMSerializersModulePayload()
+            )
+        }
+        result.append(serialFormat)
+        let stringFormat = NativeClass(
+            "Lkotlinx/serialization/StringFormat;",
+            superclass: nil,
+            interfaces: ["Lkotlinx/serialization/SerialFormat;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        stringFormat.method("encodeToString", "(Lkotlinx/serialization/SerializationStrategy;Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let root = runtime.makeNative("Lmihoncompat/JsonEncoder;", payload: VMJsonEncoderPayload())
+            guard let cls = runtime.classOf(args[1]),
+                  let method = cls.lookupVirtual(key: "serialize(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") else {
+                throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid serializer")
+            }
+            _ = try runtime.invoke(method, [args[1], root, args[2]])
+            guard let payload: VMJsonEncoderPayload = runtime.payload(root, as: VMJsonEncoderPayload.self) else {
+                throw VMJavaException("Lkotlinx/serialization/SerializationException;", "serializer produced no value")
+            }
+            return runtime.newString(SerializationRuntime.jsonText(payload.result()))
+        }
+        stringFormat.method("decodeFromString", "(Lkotlinx/serialization/DeserializationStrategy;Ljava/lang/String;)Ljava/lang/Object;") { runtime, args, _ in
+            let tree = try VMJsonParser.parse(runtime.stringValue(args[2]) ?? "")
+            let module: VMSerializersModulePayload? = runtime.payload(args[0], as: VMJsonConfigPayload.self)?.module
+            let decoder = runtime.makeNative("Lkotlinx/serialization/json/JsonDecoder;", payload: VMJsonDecoderPayload(tree: tree, module: module))
+            return try runtime.deserializeWith(args[1], decoder: decoder)
+        }
+        result.append(stringFormat)
+
+        // The annotation interface is abstract in kotlinx; the concrete value
+        // lives on the annotated class's annotation instance, so this body is
+        // only a fallback and answers the library's default discriminator.
+        let classDiscriminator = NativeClass(
+            "Lkotlinx/serialization/json/JsonClassDiscriminator;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract | DexAccess.isAnnotation
+        )
+        classDiscriminator.method("discriminator", "()Ljava/lang/String;") { runtime, _, _ in
+            runtime.newString("type")
+        }
+        result.append(classDiscriminator)
+
+        let json = NativeClass(
+            "Lkotlinx/serialization/json/Json;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/serialization/StringFormat;"]
+        )
+        json.staticField("Default", "Lkotlinx/serialization/json/Json$Default;")
         json.prepare = { runtime, cls in
-            cls.staticValues[0] = runtime.makeNative("Lkotlinx/serialization/json/Json;", payload: NSNull())
+            cls.staticValues[0] = runtime.makeNative("Lkotlinx/serialization/json/Json$Default;", payload: VMJsonConfigPayload())
         }
         json.method("decodeFromString", "(Lkotlinx/serialization/DeserializationStrategy;Ljava/lang/String;)Ljava/lang/Object;") { runtime, args, _ in
             let tree = try VMJsonParser.parse(runtime.stringValue(args[2]) ?? "")
@@ -1514,6 +1979,15 @@ struct SerializationRuntime {
             return runtime.jsonElementValue(payload.result())
         }
         result.append(json)
+
+        // `Json.Default` is the `Json$Default` companion object, a `Json`
+        // subclass; it inherits every format method from `Json`.
+        let jsonDefault = NativeClass("Lkotlinx/serialization/json/Json$Default;", superclass: "Lkotlinx/serialization/json/Json;")
+        jsonDefault.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMJsonConfigPayload())
+            return .zero
+        }
+        result.append(jsonDefault)
 
         let jsonKt = NativeClass("Lkotlinx/serialization/json/JsonKt;")
         jsonKt.staticMethod("Json", "(Lkotlinx/serialization/json/Json;Lkotlin/jvm/functions/Function1;)Lkotlinx/serialization/json/Json;") { runtime, args, _ in
@@ -1578,10 +2052,16 @@ struct SerializationRuntime {
             if let module: VMSerializersModulePayload = runtime.payload(args[1], as: VMSerializersModulePayload.self) { config.module = module }
             return .zero
         }
+        builder.method("setUseArrayPolymorphism", "(Z)V") { runtime, args, _ in
+            let config: VMJsonConfigPayload = runtime.payload(args[0], as: VMJsonConfigPayload.self) ?? VMJsonConfigPayload()
+            config.useArrayPolymorphism = args[1].asBoolean
+            return .zero
+        }
         // Unknown decoding is tolerated by the decoder (it only walks descriptor
         // elements), so these flags are accepted for API compatibility. Only
-        // `setSerializersModule` carries state and is registered above; registering
-        // it here as a no-op would overwrite the working implementation.
+        // `setSerializersModule`/`setUseArrayPolymorphism` carry state and are
+        // registered above; registering them here as no-ops would overwrite the
+        // working implementations.
         for setter in ["setIgnoreUnknownKeys", "setIsLenient", "setLenient", "setAllowSpecialFloatingPointValues", "setEncodeDefaults", "setCoerceInputValues", "setAllowTrailingComma", "setExplicitNulls", "setUseAlternativeNames", "setPrettyPrint"] {
             builder.method(setter, "(Z)V") { _, _, _ in .zero }
         }
@@ -1765,10 +2245,44 @@ struct SerializationRuntime {
             let kclass = runtime.makeNative("Lkotlin/reflect/KClassImpl;", payload: cls)
             return runtime.makeNative("Lkotlin/reflect/KTypeImpl;", payload: kclass)
         }
+        reflection.staticMethod("typeOf", "(Ljava/lang/Class;Lkotlin/reflect/KTypeProjection;)Lkotlin/reflect/KType;") { runtime, args, _ in
+            guard let cls: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let kclass = runtime.makeNative("Lkotlin/reflect/KClassImpl;", payload: cls)
+            return runtime.makeNative("Lkotlin/reflect/KTypeImpl;", payload: kclass)
+        }
+        reflection.staticMethod("nullableTypeOf", "(Ljava/lang/Class;)Lkotlin/reflect/KType;") { runtime, args, _ in
+            guard let cls: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let kclass = runtime.makeNative("Lkotlin/reflect/KClassImpl;", payload: cls)
+            return runtime.makeNative("Lkotlin/reflect/KTypeImpl;", payload: kclass)
+        }
         reflection.staticMethod("getOrCreateKotlinPackage", "(Ljava/lang/Class;Ljava/lang/String;)Lkotlin/reflect/KPackage;") { runtime, _, _ in
             runtime.makeNative("Lkotlin/reflect/KPackage;", payload: NSNull())
         }
         result.append(reflection)
+
+        let projection = NativeClass("Lkotlin/reflect/KTypeProjection;", superclass: "Ljava/lang/Object;")
+        projection.staticField("Companion", "Lkotlin/reflect/KTypeProjection$Companion;")
+        projection.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lkotlin/reflect/KTypeProjection$Companion;", payload: NSNull())
+        }
+        projection.method("<init>", "(Lkotlin/reflect/KVariance;Lkotlin/reflect/KType;)V") { runtime, args, _ in
+            let variance = runtime.stringValue(runtime.callVirtual(args[1], "name()Ljava/lang/String;", []) ?? .null) ?? "INVARIANT"
+            runtime.setPayload(args[0], VMKTypeProjectionPayload(variance: variance, type: args[2].bits == 0 ? nil : args[2]))
+            return .zero
+        }
+        projection.method("getType", "()Lkotlin/reflect/KType;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMKTypeProjectionPayload.self)?.type ?? .null
+        }
+        result.append(projection)
+
+        let projectionCompanion = NativeClass("Lkotlin/reflect/KTypeProjection$Companion;", superclass: "Ljava/lang/Object;")
+        for (name, variance) in [("invariant", "INVARIANT"), ("contravariant", "IN"), ("out", "OUT")] {
+            projectionCompanion.method(name, "(Lkotlin/reflect/KType;)Lkotlin/reflect/KTypeProjection;") { runtime, args, _ in
+                let type = args[1].bits == 0 ? nil : args[1]
+                return runtime.makeNative("Lkotlin/reflect/KTypeProjection;", payload: VMKTypeProjectionPayload(variance: variance, type: type))
+            }
+        }
+        result.append(projectionCompanion)
         result.append(NativeClass("Lkotlinx/serialization/modules/SerializersModule;", superclass: "Ljava/lang/Object;"))
 
         let polySerializer = NativeClass("Lkotlinx/serialization/PolymorphicSerializer;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/KSerializer;"])
@@ -1804,6 +2318,7 @@ struct SerializationRuntime {
         result.append(polySerializer)
         let moduleBuilder = NativeClass("Lkotlinx/serialization/modules/SerializersModuleBuilder;", superclass: "Ljava/lang/Object;")
         moduleBuilder.method("contextual", "(Lkotlin/reflect/KClass;Lkotlinx/serialization/KSerializer;)V") { _, _, _ in .zero }
+        moduleBuilder.method("contextual", "(Lkotlin/reflect/KClass;Lkotlin/jvm/functions/Function1;)V") { _, _, _ in .zero }
         moduleBuilder.method("polymorphic", "(Lkotlin/reflect/KClass;Lkotlin/reflect/KClass;Lkotlinx/serialization/KSerializer;)V") { _, _, _ in .zero }
         moduleBuilder.method("polymorphicDefault", "(Lkotlin/reflect/KClass;Lkotlin/jvm/functions/Function1;)V") { _, _, _ in .zero }
         moduleBuilder.method("<init>", "()V") { runtime, args, _ in

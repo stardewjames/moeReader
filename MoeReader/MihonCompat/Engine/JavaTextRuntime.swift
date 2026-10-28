@@ -540,6 +540,10 @@ enum JavaTextRuntime {
             return runtime.makeNative("Ljava/util/TimeZone;", payload: resolveZone(id))
         }
         zone.staticMethod("setDefault", "(Ljava/util/TimeZone;)V") { _, _, _ in .zero }
+        zone.method("toZoneId", "()Ljava/time/ZoneId;") { runtime, args, _ in
+            let id = runtime.timeZonePayload(args[0])?.id ?? "UTC"
+            return runtime.makeNative("Ljava/time/ZoneId;", payload: JavaTimeRuntime.parseZoneId(id))
+        }
         return [zone]
     }
 
@@ -598,6 +602,13 @@ enum JavaTextRuntime {
         calendar.staticMethod("getInstance", "(Ljava/util/Locale;)Ljava/util/Calendar;") { runtime, _, _ in
             runtime.makeNative("Ljava/util/GregorianCalendar;", payload: VMCalendarPayload(
                 millis: Int64(Date().timeIntervalSince1970 * 1000), zone: defaultZone()
+            ))
+        }
+        calendar.staticMethod("getInstance", "(Ljava/util/TimeZone;Ljava/util/Locale;)Ljava/util/Calendar;") { runtime, args, _ in
+            let zone = runtime.timeZonePayload(args[0]) ?? defaultZone()
+            return runtime.makeNative("Ljava/util/GregorianCalendar;", payload: VMCalendarPayload(
+                millis: Int64(Date().timeIntervalSince1970 * 1000),
+                zone: VMTimeZonePayload(id: zone.id, secondsFromGMT: zone.secondsFromGMT)
             ))
         }
         calendar.method("get", "(I)I") { runtime, args, _ in

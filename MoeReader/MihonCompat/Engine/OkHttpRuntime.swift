@@ -357,6 +357,68 @@ final class VMCacheControlPayload {
     }
 }
 
+/// `okhttp3.Cache` settings. The host performs requests without a disk cache,
+/// so the instance records where the extension asked the cache to live and
+/// reports the same empty-cache counters OkHttp would after a cold start.
+final class VMCachePayload {
+    var directory: String
+    var maxSize: Int64
+    init(directory: String, maxSize: Int64) {
+        self.directory = directory
+        self.maxSize = maxSize
+    }
+}
+
+/// One `MultipartBody.Part`: the form field name plus the raw value bytes
+/// (already encoded as requested) and optional filename/content type.
+final class VMMultipartPartPayload {
+    var name: String
+    var filename: String?
+    var contentType: String?
+    var data: Data
+    init(name: String, filename: String? = nil, contentType: String? = nil, data: Data = Data()) {
+        self.name = name
+        self.filename = filename
+        self.contentType = contentType
+        self.data = data
+    }
+}
+
+final class VMMultipartBodyPayload {
+    var boundary: String
+    var type: String
+    var parts: [VMMultipartPartPayload] = []
+    init(boundary: String, type: String) {
+        self.boundary = boundary
+        self.type = type
+    }
+
+    /// `contentType()` including the boundary parameter, as OkHttp renders it.
+    var contentType: String {
+        type.contains("boundary=") ? type : "\(type); boundary=\(boundary)"
+    }
+
+    var rendered: Data {
+        var output = Data()
+        for part in parts {
+            output.append(Data("--\(boundary)\r\n".utf8))
+            var disposition = "Content-Disposition: form-data; name=\"\(part.name)\""
+            if let filename = part.filename {
+                disposition += "; filename=\"\(filename)\""
+            }
+            output.append(Data((disposition + "\r\n").utf8))
+            if let contentType = part.contentType {
+                output.append(Data("Content-Type: \(contentType)\r\n".utf8))
+            }
+            output.append(Data("\r\n".utf8))
+            output.append(part.data)
+            output.append(Data("\r\n".utf8))
+        }
+        output.append(Data("--\(boundary)--\r\n".utf8))
+        return output
+    }
+}
+
 final class VMMediaTypePayload {
     let text: String
     init(text: String) { self.text = text }
@@ -394,6 +456,10 @@ enum OkHttpRuntime {
 
     private static func headersClasses() -> [NativeClass] {
         let headers = NativeClass("Lokhttp3/Headers;", superclass: "Ljava/lang/Object;")
+        headers.staticField("Companion", "Lokhttp3/Headers$Companion;")
+        headers.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lokhttp3/Headers$Companion;", payload: NSNull())
+        }
         headers.method("<init>", "([Ljava/lang/String;)V") { runtime, args, _ in
             var entries: [(String, String)] = []
             let count = runtime.arrayLength(args[1])
@@ -448,6 +514,22 @@ enum OkHttpRuntime {
             let text = (payload?.entries ?? []).map { "\($0.0): \($0.1)" }.joined(separator: "\n")
             return runtime.newString(text)
         }
+        headers.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            let payload: VMHeadersPayload? = runtime.payload(args[0], as: VMHeadersPayload.self)
+            let pairs = (payload?.entries ?? []).map { entry -> VMValue in
+                runtime.makeNative(
+                    "Lkotlin/Pair;",
+                    payload: VMPairPayload(first: runtime.newString(entry.0), second: runtime.newString(entry.1))
+                )
+            }
+            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(pairs, immutable: true))
+        }
+        headers.method("getDate", "(Ljava/lang/String;)Ljava/util/Date;") { runtime, args, _ in
+            let payload: VMHeadersPayload? = runtime.payload(args[0], as: VMHeadersPayload.self)
+            guard let text = payload?.value(runtime.stringValue(args[1]) ?? "") else { return .null }
+            guard let millis = parseHTTPDate(text) else { return .null }
+            return runtime.makeNative("Ljava/util/Date;", payload: VMDatePayload(millis))
+        }
         headers.staticMethod("of", "([Ljava/lang/String;)Lokhttp3/Headers;") { runtime, args, _ in
             var entries: [(String, String)] = []
             for index in stride(from: 0, to: runtime.arrayLength(args[0]) - 1, by: 2) {
@@ -457,10 +539,48 @@ enum OkHttpRuntime {
             }
             return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(entries))
         }
+        headers.staticMethod("of", "(Ljava/util/Map;)Lokhttp3/Headers;") { runtime, args, _ in
+            let map: VMMapPayload? = runtime.payload(args[0], as: VMMapPayload.self)
+            var entries: [(String, String)] = []
+            for entry in map?.entries ?? [] {
+                entries.append((runtime.stringValue(entry.key) ?? "", runtime.stringValue(entry.value) ?? ""))
+            }
+            return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(entries))
+        }
         headers.staticMethod("of", "([Lkotlin/Pair;)Lokhttp3/Headers;") { runtime, args, _ in
             var entries: [(String, String)] = []
             for index in 0..<runtime.arrayLength(args[0]) {
                 if let pair: VMPairPayload = runtime.payload(runtime.arrayElement(args[0], index), as: VMPairPayload.self) {
+                    entries.append((runtime.stringValue(pair.first) ?? "", runtime.stringValue(pair.second) ?? ""))
+                }
+            }
+            return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(entries))
+        }
+
+        let companion = NativeClass("Lokhttp3/Headers$Companion;", superclass: "Ljava/lang/Object;")
+        companion.method("of", "([Ljava/lang/String;)Lokhttp3/Headers;") { runtime, args, _ in
+            var entries: [(String, String)] = []
+            let array = args[1]
+            for index in stride(from: 0, to: runtime.arrayLength(array) - 1, by: 2) {
+                let name = runtime.stringValue(runtime.arrayElement(array, index)) ?? ""
+                let value = runtime.stringValue(runtime.arrayElement(array, index + 1)) ?? ""
+                entries.append((name, value))
+            }
+            return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(entries))
+        }
+        companion.method("of", "(Ljava/util/Map;)Lokhttp3/Headers;") { runtime, args, _ in
+            let map: VMMapPayload? = runtime.payload(args[1], as: VMMapPayload.self)
+            var entries: [(String, String)] = []
+            for entry in map?.entries ?? [] {
+                entries.append((runtime.stringValue(entry.key) ?? "", runtime.stringValue(entry.value) ?? ""))
+            }
+            return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(entries))
+        }
+        companion.method("of", "([Lkotlin/Pair;)Lokhttp3/Headers;") { runtime, args, _ in
+            var entries: [(String, String)] = []
+            let array = args[1]
+            for index in 0..<runtime.arrayLength(array) {
+                if let pair: VMPairPayload = runtime.payload(runtime.arrayElement(array, index), as: VMPairPayload.self) {
                     entries.append((runtime.stringValue(pair.first) ?? "", runtime.stringValue(pair.second) ?? ""))
                 }
             }
@@ -490,6 +610,20 @@ enum OkHttpRuntime {
             payload.entries.removeAll { $0.0.caseInsensitiveCompare(name) == .orderedSame }
             return args[0]
         }
+        builder.method("add", "(Ljava/lang/String;)Lokhttp3/Headers$Builder;") { runtime, args, _ in
+            let payload: VMHeadersPayload = try runtime.payloadBox(args[0])
+            let line = runtime.stringValue(args[1]) ?? ""
+            guard let colon = line.firstIndex(of: ":") else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Unexpected header: \(line)")
+            }
+            let name = String(line[line.startIndex..<colon]).trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Unexpected header: \(line)")
+            }
+            payload.entries.append((name, value))
+            return args[0]
+        }
         builder.method("get", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             let payload: VMHeadersPayload? = runtime.payload(args[0], as: VMHeadersPayload.self)
             guard let value = payload?.value(runtime.stringValue(args[1]) ?? "") else { return .null }
@@ -499,7 +633,7 @@ enum OkHttpRuntime {
             let payload: VMHeadersPayload? = runtime.payload(args[0], as: VMHeadersPayload.self)
             return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(payload?.entries ?? []))
         }
-        return [headers, builder]
+        return [headers, companion, builder]
     }
 
     // MARK: - Request
@@ -628,6 +762,12 @@ enum OkHttpRuntime {
             payload.body = args[1]
             return args[0]
         }
+        builder.staticMethod("delete$default", "(Lokhttp3/Request$Builder;Lokhttp3/RequestBody;ILjava/lang/Object;)Lokhttp3/Request$Builder;") { runtime, args, _ in
+            let payload: VMRequestPayload = try runtime.payloadBox(args[0])
+            payload.method = "DELETE"
+            if Int(args[2].asInt32) & 1 == 0 { payload.body = args[1] }
+            return args[0]
+        }
         builder.method("method", "(Ljava/lang/String;Lokhttp3/RequestBody;)Lokhttp3/Request$Builder;") { runtime, args, _ in
             let payload: VMRequestPayload = try runtime.payloadBox(args[0])
             payload.method = runtime.stringValue(args[1]) ?? "GET"
@@ -671,6 +811,13 @@ enum OkHttpRuntime {
         }
         url.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string ?? "")
+        }
+        url.method("topPrivateDomain", "()Ljava/lang/String;") { runtime, args, _ in
+            let host = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.host ?? ""
+            guard let top = publicSuffixDomain(host) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "not a domain name: \(host)")
+            }
+            return runtime.newString(top)
         }
         url.method("host", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.host ?? "")
@@ -780,9 +927,28 @@ enum OkHttpRuntime {
             let payload = runtime.payload(args[0], as: VMHttpUrlPayload.self)
             return runtime.makeNative("Lokhttp3/HttpUrl$Builder;", payload: VMHttpUrlPayload(components: payload?.components ?? URLComponents()))
         }
+        url.method("newBuilder", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let text = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string ?? ""
+            guard let base = URL(string: text),
+                  let link = runtime.stringValue(args[1]),
+                  let resolved = URL(string: link, relativeTo: base),
+                  let parsed = VMHttpUrlPayload.parse(resolved.absoluteString) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "unexpected url")
+            }
+            return runtime.makeNative("Lokhttp3/HttpUrl$Builder;", payload: parsed)
+        }
         url.method("url", "()Ljava/net/URL;") { runtime, args, _ in
             let text = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string ?? ""
             return runtime.makeNative("Ljava/net/URL;", payload: text)
+        }
+        url.method("uri", "()Ljava/net/URI;") { runtime, args, _ in
+            let text = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string ?? ""
+            let cls = try runtime.linkClass("Ljava/net/URI;")
+            let value = VMValue.reference(runtime.allocateObject(cls))
+            if let constructor = cls.lookupVirtual(key: "<init>(Ljava/lang/String;)V") {
+                _ = try runtime.invoke(constructor, [value, runtime.newString(text)])
+            }
+            return value
         }
 
         let builder = NativeClass("Lokhttp3/HttpUrl$Builder;", superclass: "Ljava/lang/Object;")
@@ -939,6 +1105,34 @@ enum OkHttpRuntime {
             payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded("/" + segments.joined(separator: "/"))
             return args[0]
         }
+        builder.method("setEncodedQueryParameter", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            let encodedName = VMHttpUrlPayload.queryEncode(name)
+            let remaining = (payload.components.percentEncodedQuery ?? "")
+                .split(separator: "&", omittingEmptySubsequences: true)
+                .filter { pair in
+                    let raw = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                    return VMHttpUrlPayload.percentDecode(String(raw[0])) != name && String(raw[0]) != encodedName
+                }
+                .map(String.init)
+            let pair = value.isEmpty ? name : "\(name)=\(value)"
+            let query = (remaining + [pair]).joined(separator: "&")
+            payload.components.percentEncodedQuery = VMHttpUrlPayload.sanitizedEncoded(query, query: true)
+            return args[0]
+        }
+        builder.method("removePathSegment", "(I)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let index = Int(args[1].asInt32)
+            var segments = payload.encodedPathSegments
+            guard index >= 0, index < segments.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "path segment index \(index)")
+            }
+            segments.remove(at: index)
+            payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded("/" + segments.joined(separator: "/"))
+            return args[0]
+        }
         builder.method("build", "()Lokhttp3/HttpUrl;") { runtime, args, _ in
             let payload: VMHttpUrlPayload? = runtime.payload(args[0], as: VMHttpUrlPayload.self)
             return runtime.makeNative("Lokhttp3/HttpUrl;", payload: VMHttpUrlPayload(components: payload?.components ?? URLComponents()))
@@ -969,6 +1163,13 @@ enum OkHttpRuntime {
             guard let payload = VMHttpUrlPayload.parse(runtime.stringValue(args[1]) ?? "") else { return .null }
             return runtime.makeNative("Lokhttp3/HttpUrl;", payload: payload)
         }
+        companion.method("defaultPort", "(Ljava/lang/String;)I") { runtime, args, _ in
+            switch (runtime.stringValue(args[1]) ?? "").lowercased() {
+            case "http": return .int32(80)
+            case "https": return .int32(443)
+            default: return .int32(-1)
+            }
+        }
         return [url, builder, companion, urlKt]
     }
 
@@ -995,6 +1196,18 @@ enum OkHttpRuntime {
             guard let value = payload?.headers.value(runtime.stringValue(args[1]) ?? "") else { return .null }
             return runtime.newString(value)
         }
+        response.method("header", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMResponsePayload.self)
+            guard let value = payload?.headers.value(runtime.stringValue(args[1]) ?? "") else {
+                return args[2]
+            }
+            return runtime.newString(value)
+        }
+        response.method("isRedirect", "()Z") { runtime, args, _ in
+            let code = runtime.payload(args[0], as: VMResponsePayload.self)?.code ?? 0
+            return .boolean((300..<400).contains(code))
+        }
+        response.method("priorResponse", "()Lokhttp3/Response;") { _, _, _ in .null }
         response.staticMethod("header$default", "(Lokhttp3/Response;Ljava/lang/String;Ljava/lang/String;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             let payload = runtime.payload(args[0], as: VMResponsePayload.self)
             guard let value = payload?.headers.value(runtime.stringValue(args[1]) ?? "") else { return args[2] }
@@ -1060,6 +1273,12 @@ enum OkHttpRuntime {
         builder.method("addHeader", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Response$Builder;") { runtime, args, _ in
             let payload: VMResponsePayload = try runtime.payloadBox(args[0])
             payload.headers.entries.append((runtime.stringValue(args[1]) ?? "", runtime.stringValue(args[2]) ?? ""))
+            return args[0]
+        }
+        builder.method("removeHeader", "(Ljava/lang/String;)Lokhttp3/Response$Builder;") { runtime, args, _ in
+            let payload: VMResponsePayload = try runtime.payloadBox(args[0])
+            let name = runtime.stringValue(args[1]) ?? ""
+            payload.headers.entries.removeAll { $0.0.caseInsensitiveCompare(name) == .orderedSame }
             return args[0]
         }
         builder.method("headers", "(Lokhttp3/Headers;)Lokhttp3/Response$Builder;") { runtime, args, _ in
@@ -1148,6 +1367,13 @@ enum OkHttpRuntime {
         builder.method("dispatcher", "(Lokhttp3/Dispatcher;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("cookieJar", "(Lokhttp3/CookieJar;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("cache", "(Lokhttp3/Cache;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("dns", "(Lokhttp3/Dns;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("hostnameVerifier", "(Ljavax/net/ssl/HostnameVerifier;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("authenticator", "(Lokhttp3/Authenticator;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("protocols", "(Ljava/util/List;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("connectionSpecs", "(Ljava/util/List;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("sslSocketFactory", "(Ljavax/net/ssl/SSLSocketFactory;Ljavax/net/ssl/X509TrustManager;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("sslSocketFactory$default", "(Lokhttp3/OkHttpClient$Builder;Ljavax/net/ssl/SSLSocketFactory;Ljavax/net/ssl/X509TrustManager;ILjava/lang/Object;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("followRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("followSslRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("retryOnConnectionFailure", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
@@ -1393,6 +1619,20 @@ enum OkHttpRuntime {
             let payload: VMCacheControlPayload? = runtime.payload(args[0], as: VMCacheControlPayload.self)
             return runtime.makeNative("Lokhttp3/CacheControl;", payload: payload ?? VMCacheControlPayload())
         }
+        for (name, field) in [("maxAge", "maxAgeSeconds"), ("maxStale", "maxStaleSeconds")] {
+            builder.method(name, "(ILjava/util/concurrent/TimeUnit;)Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+                let factors: [Int64] = [1, 1_000, 1_000_000, 1_000_000_000, 60_000_000_000, 3_600_000_000_000, 86_400_000_000_000]
+                let unit = max(0, min(runtime.payload(args[2], as: VMTimeUnitPayload.self)?.unit ?? 0, 6))
+                let seconds = Int(Int64(args[1].asInt32) &* factors[unit] / 1_000_000_000)
+                let payload: VMCacheControlPayload = try runtime.payloadBox(args[0])
+                if field == "maxAgeSeconds" {
+                    payload.maxAgeSeconds = seconds
+                } else {
+                    payload.maxStaleSeconds = seconds
+                }
+                return args[0]
+            }
+        }
         return [control, builder]
     }
 
@@ -1492,6 +1732,10 @@ enum OkHttpRuntime {
             let payload = runtime.payload(args[0], as: VMResponseBodyPayload.self)
             return runtime.makeNative("Ljava/io/ByteArrayInputStream;", payload: payload?.data ?? Data())
         }
+        body.method("charStream", "()Ljava/io/Reader;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMResponseBodyPayload.self)
+            return runtime.makeNative("Ljava/io/InputStreamReader;", payload: VMReaderPayload(data: payload?.data ?? Data()))
+        }
         body.method("contentLength", "()J") { runtime, args, _ in
             .int64(Int64(runtime.payload(args[0], as: VMResponseBodyPayload.self)?.data.count ?? 0))
         }
@@ -1527,8 +1771,21 @@ enum OkHttpRuntime {
             }
             return runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: data, contentType: runtime.payload(args[2], as: VMMediaTypePayload.self)?.text))
         }
-        bodyCompanion.method("create$default", "(Lokio/BufferedSource;Lokhttp3/MediaType;JILjava/lang/Object;)Lokhttp3/ResponseBody;") { runtime, args, _ in
-            try makeBody(runtime, source: args[0], mediaType: args[1], length: args[2].asInt64, flags: args[3].asInt32)
+        bodyCompanion.method("create", "(Lokio/BufferedSource;Lokhttp3/MediaType;J)Lokhttp3/ResponseBody;") { runtime, args, _ in
+            try makeBody(runtime, source: args[1], mediaType: args[2], length: args[3].asInt64, flags: 0)
+        }
+        bodyCompanion.method("create", "(Lokio/BufferedSource;Lokhttp3/MediaType;)Lokhttp3/ResponseBody;") { runtime, args, _ in
+            try makeBody(runtime, source: args[1], mediaType: args[2], length: -1, flags: 0)
+        }
+        bodyCompanion.staticMethod("create$default", "(Lokhttp3/ResponseBody$Companion;[BLokhttp3/MediaType;ILjava/lang/Object;)Lokhttp3/ResponseBody;") { runtime, args, _ in
+            var data = Data()
+            for index in 0..<runtime.arrayLength(args[1]) {
+                data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
+            }
+            return runtime.makeNative(
+                "Lokhttp3/ResponseBody;",
+                payload: VMResponseBodyPayload(data: data, contentType: runtime.payload(args[2], as: VMMediaTypePayload.self)?.text)
+            )
         }
         // Kotlin emits default-argument synthetics for companion methods as
         // statics that take the companion as their first parameter.
@@ -1565,12 +1822,36 @@ enum OkHttpRuntime {
 
         let requestBody = NativeClass("Lokhttp3/RequestBody;", superclass: "Ljava/lang/Object;")
         requestBody.staticField("Companion", "Lokhttp3/RequestBody$Companion;")
+        requestBody.staticField("EMPTY", "Lokhttp3/RequestBody;")
+        requestBody.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lokhttp3/RequestBody$Companion;", payload: NSNull())
+            cls.staticValues[1] = runtime.makeNative(
+                "Lokhttp3/RequestBody;",
+                payload: VMFormBodyPayload(pairs: [], data: Data(), contentType: nil)
+            )
+        }
+        requestBody.method("writeTo", "(Lokio/BufferedSink;)V") { runtime, args, _ in
+            guard let payload: VMOkioBufferedSinkPayload = runtime.payload(args[1], as: VMOkioBufferedSinkPayload.self) else { return .zero }
+            if let multipart = runtime.payload(args[0], as: VMMultipartBodyPayload.self) {
+                payload.sink.data.append(multipart.rendered)
+                return .zero
+            }
+            let body = runtime.payload(args[0], as: VMFormBodyPayload.self)
+            payload.sink.data.append(body?.data ?? Data())
+            return .zero
+        }
         requestBody.method("contentType", "()Lokhttp3/MediaType;") { runtime, args, _ in
+            if let multipart = runtime.payload(args[0], as: VMMultipartBodyPayload.self) {
+                return runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: multipart.contentType))
+            }
             guard let contentType = runtime.payload(args[0], as: VMFormBodyPayload.self)?.contentType else { return .null }
             return runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: contentType))
         }
         requestBody.method("contentLength", "()J") { runtime, args, _ in
-            .int64(Int64(runtime.payload(args[0], as: VMFormBodyPayload.self)?.data.count ?? 0))
+            if let multipart = runtime.payload(args[0], as: VMMultipartBodyPayload.self) {
+                return .int64(Int64(multipart.rendered.count))
+            }
+            return .int64(Int64(runtime.payload(args[0], as: VMFormBodyPayload.self)?.data.count ?? 0))
         }
         requestBody.staticMethod("create", "(Lokhttp3/MediaType;Ljava/lang/String;)Lokhttp3/RequestBody;") { runtime, args, _ in
             runtime.makeNative(
@@ -1654,8 +1935,35 @@ enum OkHttpRuntime {
                 )
             }
         }
-        requestBody.prepare = { runtime, cls in
-            cls.staticValues[0] = runtime.makeNative("Lokhttp3/RequestBody$Companion;", payload: NSNull())
+        requestBodyCompanion.staticMethod("create$default", "(Lokhttp3/RequestBody$Companion;[BLokhttp3/MediaType;IIILjava/lang/Object;)Lokhttp3/RequestBody;") { runtime, args, _ in
+            let mask = Int(args[5].asInt32)
+            let offset = mask & 2 != 0 ? 0 : Int(args[3].asInt32)
+            let byteCount = mask & 4 != 0 ? runtime.arrayLength(args[1]) - offset : Int(args[4].asInt32)
+            guard offset >= 0, byteCount >= 0, offset <= runtime.arrayLength(args[1]) - byteCount else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "offset=\(offset) byteCount=\(byteCount)")
+            }
+            var data = Data()
+            for index in offset..<(offset + byteCount) {
+                data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
+            }
+            return runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(
+                    pairs: [],
+                    data: data,
+                    contentType: runtime.payload(args[2], as: VMMediaTypePayload.self)?.text
+                )
+            )
+        }
+        requestBodyCompanion.staticMethod("create$default", "(Lokhttp3/RequestBody$Companion;Ljava/lang/String;Lokhttp3/MediaType;ILjava/lang/Object;)Lokhttp3/RequestBody;") { runtime, args, _ in
+            runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(
+                    pairs: [],
+                    data: Data((runtime.stringValue(args[1]) ?? "").utf8),
+                    contentType: runtime.payload(args[2], as: VMMediaTypePayload.self)?.text
+                )
+            )
         }
         let formBody = NativeClass("Lokhttp3/FormBody;", superclass: "Lokhttp3/RequestBody;")
         formBody.method("<init>", "([Ljava/lang/String;[Ljava/lang/String;)V") { runtime, args, _ in
@@ -1727,7 +2035,158 @@ enum OkHttpRuntime {
                 )
             )
         }
-        return [body, bodyCompanion, bufferedSource, requestBody, requestBodyCompanion, formBody, formBuilder]
+        let multipart = NativeClass("Lokhttp3/MultipartBody;", superclass: "Lokhttp3/RequestBody;")
+        multipart.staticField("FORM", "Lokhttp3/MediaType;")
+        multipart.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: "multipart/form-data"))
+        }
+        multipart.method("type", "()Lokhttp3/MediaType;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMultipartBodyPayload.self) else { return .null }
+            return runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: payload.type))
+        }
+        multipart.method("boundary", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: VMMultipartBodyPayload.self)?.boundary ?? "")
+        }
+        multipart.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMMultipartBodyPayload.self)?.parts.count ?? 0))
+        }
+        multipart.method("parts", "()Ljava/util/List;") { runtime, args, _ in
+            let parts = runtime.payload(args[0], as: VMMultipartBodyPayload.self)?.parts ?? []
+            let values = parts.map { part in
+                runtime.makeNative("Lokhttp3/MultipartBody$Part;", payload: part)
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values, immutable: true))
+        }
+        multipart.method("part", "(I)Lokhttp3/MultipartBody$Part;") { runtime, args, _ in
+            let parts = runtime.payload(args[0], as: VMMultipartBodyPayload.self)?.parts ?? []
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < parts.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index=\(index)")
+            }
+            return runtime.makeNative("Lokhttp3/MultipartBody$Part;", payload: parts[index])
+        }
+        multipart.method("contentType", "()Lokhttp3/MediaType;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMultipartBodyPayload.self) else { return .null }
+            return runtime.makeNative("Lokhttp3/MediaType;", payload: VMMediaTypePayload(text: payload.contentType))
+        }
+        multipart.method("contentLength", "()J") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMultipartBodyPayload.self) else { return .int64(0) }
+            return .int64(Int64(payload.rendered.count))
+        }
+        multipart.method("writeTo", "(Lokio/BufferedSink;)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMultipartBodyPayload.self),
+                  let sink: VMOkioBufferedSinkPayload = runtime.payload(args[1], as: VMOkioBufferedSinkPayload.self) else { return .zero }
+            sink.sink.data.append(payload.rendered)
+            return .zero
+        }
+
+        let part = NativeClass("Lokhttp3/MultipartBody$Part;", superclass: "Ljava/lang/Object;")
+        part.method("headers", "()Lokhttp3/Headers;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMultipartPartPayload.self) else { return .null }
+            var entries: [(String, String)] = [("Content-Disposition", "form-data; name=\"\(payload.name)\"")]
+            if let contentType = payload.contentType {
+                entries.append(("Content-Type", contentType))
+            }
+            return runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(entries))
+        }
+        part.method("body", "()Lokhttp3/RequestBody;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMultipartPartPayload.self) else { return .null }
+            return runtime.makeNative(
+                "Lokhttp3/FormBody;",
+                payload: VMFormBodyPayload(pairs: [], data: payload.data, contentType: payload.contentType)
+            )
+        }
+
+        let multipartBuilder = NativeClass("Lokhttp3/MultipartBody$Builder;", superclass: "Ljava/lang/Object;")
+        func newBuilder(_ runtime: VMRuntime, boundary: String?) -> VMMultipartBodyPayload {
+            VMMultipartBodyPayload(boundary: boundary ?? UUID().uuidString.lowercased(), type: "multipart/form-data")
+        }
+        multipartBuilder.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], newBuilder(runtime, boundary: nil))
+            return .zero
+        }
+        multipartBuilder.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], newBuilder(runtime, boundary: runtime.stringValue(args[1])))
+            return .zero
+        }
+        multipartBuilder.method("<init>", "(Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
+            let mask = Int(args[2].asInt32)
+            let boundary = mask & 1 != 0 ? nil : runtime.stringValue(args[1])
+            runtime.setPayload(args[0], newBuilder(runtime, boundary: boundary))
+            return .zero
+        }
+        multipartBuilder.method("setType", "(Lokhttp3/MediaType;)Lokhttp3/MultipartBody$Builder;") { runtime, args, _ in
+            let payload: VMMultipartBodyPayload = try runtime.payloadBox(args[0])
+            if let type = runtime.payload(args[1], as: VMMediaTypePayload.self)?.text {
+                payload.type = type
+            }
+            return args[0]
+        }
+        multipartBuilder.method("addFormDataPart", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/MultipartBody$Builder;") { runtime, args, _ in
+            let payload: VMMultipartBodyPayload = try runtime.payloadBox(args[0])
+            payload.parts.append(VMMultipartPartPayload(
+                name: runtime.stringValue(args[1]) ?? "",
+                data: Data((runtime.stringValue(args[2]) ?? "").utf8)
+            ))
+            return args[0]
+        }
+        multipartBuilder.method("addFormDataPart", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Lokhttp3/MultipartBody$Builder;") { runtime, args, _ in
+            let payload: VMMultipartBodyPayload = try runtime.payloadBox(args[0])
+            payload.parts.append(VMMultipartPartPayload(
+                name: runtime.stringValue(args[1]) ?? "",
+                filename: runtime.stringValue(args[2]),
+                data: Data((runtime.stringValue(args[3]) ?? "").utf8)
+            ))
+            return args[0]
+        }
+        multipartBuilder.method("addFormDataPart", "(Ljava/lang/String;Ljava/lang/String;Lokhttp3/RequestBody;)Lokhttp3/MultipartBody$Builder;") { runtime, args, _ in
+            let payload: VMMultipartBodyPayload = try runtime.payloadBox(args[0])
+            let body = runtime.payload(args[3], as: VMFormBodyPayload.self)
+            payload.parts.append(VMMultipartPartPayload(
+                name: runtime.stringValue(args[1]) ?? "",
+                filename: runtime.stringValue(args[2]),
+                contentType: body?.contentType,
+                data: body?.data ?? Data()
+            ))
+            return args[0]
+        }
+        multipartBuilder.method("addPart", "(Ljava/lang/String;Lokhttp3/RequestBody;)Lokhttp3/MultipartBody$Builder;") { runtime, args, _ in
+            let payload: VMMultipartBodyPayload = try runtime.payloadBox(args[0])
+            let body = runtime.payload(args[2], as: VMFormBodyPayload.self)
+            payload.parts.append(VMMultipartPartPayload(
+                name: runtime.stringValue(args[1]) ?? "",
+                contentType: body?.contentType,
+                data: body?.data ?? Data()
+            ))
+            return args[0]
+        }
+        multipartBuilder.method("build", "()Lokhttp3/MultipartBody;") { runtime, args, _ in
+            let payload: VMMultipartBodyPayload? = runtime.payload(args[0], as: VMMultipartBodyPayload.self)
+            return runtime.makeNative(
+                "Lokhttp3/MultipartBody;",
+                payload: payload ?? VMMultipartBodyPayload(boundary: UUID().uuidString.lowercased(), type: "multipart/form-data")
+            )
+        }
+
+        let byteStringBody = NativeClass("Lokhttp3/RequestBody$ByteString;", superclass: "Lokhttp3/RequestBody;")
+        byteStringBody.method("<init>", "(Lokio/ByteString;Lokhttp3/MediaType;)V") { runtime, args, _ in
+            let data = runtime.payload(args[1], as: VMByteStringPayload.self)?.data ?? Data()
+            let type = runtime.payload(args[2], as: VMMediaTypePayload.self)?.text
+            runtime.setPayload(args[0], VMFormBodyPayload(pairs: [], data: data, contentType: type))
+            return .zero
+        }
+        let byteArrayBody = NativeClass("Lokhttp3/RequestBody$ByteArray;", superclass: "Lokhttp3/RequestBody;")
+        byteArrayBody.method("<init>", "([BLokhttp3/MediaType;)V") { runtime, args, _ in
+            var data = Data()
+            for index in 0..<runtime.arrayLength(args[1]) {
+                data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
+            }
+            let type = runtime.payload(args[2], as: VMMediaTypePayload.self)?.text
+            runtime.setPayload(args[0], VMFormBodyPayload(pairs: [], data: data, contentType: type))
+            return .zero
+        }
+
+        return [body, bodyCompanion, bufferedSource, requestBody, requestBodyCompanion, formBody, formBuilder, multipart, part, multipartBuilder, byteStringBody, byteArrayBody]
     }
 
     private static func compressionClasses() -> [NativeClass] {
@@ -1883,6 +2342,70 @@ enum OkHttpRuntime {
         return runtime.makeNative("Lokhttp3/Cookie;", payload: payload)
     }
 
+    /// Second-level labels under country-code TLDs that the public suffix list
+    /// treats as registries. OkHttp resolves `topPrivateDomain` with the full
+    /// list; this covers the suffixes extensions actually encounter offline.
+    private static let multiLabelPublicSuffixes: Set<String> = [
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+        "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+        "co.kr", "or.kr", "ne.kr",
+        "com.br", "net.br", "org.br", "gov.br",
+        "com.cn", "net.cn", "org.cn", "gov.cn",
+        "com.ru", "net.ru", "org.ru",
+        "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in",
+        "co.nz", "net.nz", "org.nz",
+        "co.za", "org.za", "net.za",
+        "com.tr", "net.tr", "org.tr", "gov.tr",
+        "com.mx", "net.mx", "org.mx",
+        "com.ar", "net.ar", "org.ar",
+        "co.id", "or.id", "ac.id", "web.id", "my.id",
+        "com.my", "net.my", "org.my",
+        "co.th", "in.th", "or.th", "ac.th", "go.th",
+        "com.vn", "net.vn", "org.vn",
+        "com.sg", "net.sg", "org.sg",
+        "com.hk", "net.hk", "org.hk",
+        "com.tw", "net.tw", "org.tw",
+        "co.il", "org.il", "net.il",
+        "com.es", "org.es", "nom.es",
+        "com.pl", "net.pl", "org.pl",
+        "com.ua", "net.ua", "org.ua",
+        "co.ke", "com.ng", "com.eg", "com.sa", "com.pk", "com.bd",
+    ]
+
+    static func publicSuffixDomain(_ host: String) -> String? {
+        let trimmed = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !trimmed.isEmpty, !trimmed.contains(":") else { return nil }
+        let labels = trimmed.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return nil }
+        if labels.allSatisfy({ Int($0) != nil }) { return nil }
+        let suffixLength = multiLabelPublicSuffixes.contains(labels.suffix(2).joined(separator: ".")) ? 2 : 1
+        let needed = suffixLength + 1
+        guard labels.count >= needed else { return nil }
+        return labels.suffix(needed).joined(separator: ".")
+    }
+
+    /// `Headers.getDate`: the three date formats RFC 7231 requires recipients
+    /// to understand (IMF-fixdate, RFC 850 and asctime).
+    static func parseHTTPDate(_ text: String) -> Int64? {
+        let formats = [
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEEE, dd-MMM-yy HH:mm:ss zzz",
+            "EEE MMM d HH:mm:ss yyyy",
+        ]
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        for format in formats {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: trimmed) {
+                return Int64(date.timeIntervalSince1970 * 1000)
+            }
+        }
+        return nil
+    }
+
     private static func parseCookieDate(_ text: String) -> Date? {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -1910,7 +2433,77 @@ enum OkHttpRuntime {
                 cls.staticValues[index] = runtime.makeNative("Lokhttp3/Protocol;", payload: NSNull())
             }
         }
-        return [timeout, connection, protocolClass]
+        let cache = NativeClass("Lokhttp3/Cache;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Closeable;"])
+        cache.method("<init>", "(Ljava/io/File;J)V") { runtime, args, _ in
+            let directory = runtime.payload(args[1], as: VMFilePayload.self)?.path ?? ""
+            runtime.setPayload(args[0], VMCachePayload(directory: directory, maxSize: args[2].asInt64))
+            return .zero
+        }
+        cache.method("size", "()J") { _, _, _ in .int64(0) }
+        cache.method("hitCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("networkCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("requestCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("writeAbortCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("writeSuccessCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("maxSize", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMCachePayload.self)?.maxSize ?? 0)
+        }
+        cache.method("directory", "()Ljava/io/File;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMCachePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/io/File;", payload: VMFilePayload(path: payload.directory))
+        }
+        cache.method("urls", "()Ljava/util/Iterator;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload([], immutable: true))
+        }
+        cache.method("isClosed", "()Z") { _, _, _ in .boolean(false) }
+        cache.method("flush", "()V") { _, _, _ in .zero }
+        cache.method("delete", "()V") { _, _, _ in .zero }
+        cache.method("close", "()V") { _, _, _ in .zero }
+        cache.method("initialize", "()V") { _, _, _ in .zero }
+
+        let util = NativeClass("Lokhttp3/internal/_UtilCommonKt;")
+        util.staticMethod("closeQuietly", "(Ljava/io/Closeable;)V") { runtime, args, _ in
+            guard args[0].bits != 0,
+                  let cls = runtime.classOf(args[0]),
+                  let method = cls.lookupVirtual(key: "close()V") else { return .zero }
+            _ = try? runtime.invoke(method, [args[0]])
+            return .zero
+        }
+        let dns = NativeClass("Lokhttp3/Dns;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        dns.staticField("SYSTEM", "Lokhttp3/Dns;")
+        dns.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lokhttp3/Dns;", payload: NSNull())
+        }
+        dns.method("lookup", "(Ljava/lang/String;)Ljava/util/List;") { _, _, _ in
+            // The host transport resolves names itself; there is no resolver
+            // object to expose, so fail with a typed exception rather than
+            // inventing addresses.
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "DNS lookup is not available")
+        }
+        let credentials = NativeClass("Lokhttp3/Credentials;")
+        func basic(_ runtime: VMRuntime, username: String, password: String, charset: String) -> VMValue {
+            let encoded: Data
+            switch charset.uppercased() {
+            case "ISO-8859-1", "LATIN1": encoded = "\(username):\(password)".data(using: .isoLatin1) ?? Data()
+            default: encoded = Data("\(username):\(password)".utf8)
+            }
+            return runtime.newString("Basic " + encoded.base64EncodedString())
+        }
+        credentials.staticMethod("basic", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            basic(runtime, username: runtime.stringValue(args[0]) ?? "", password: runtime.stringValue(args[1]) ?? "", charset: "ISO-8859-1")
+        }
+        credentials.staticMethod("basic", "(Ljava/lang/String;Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;") { runtime, args, _ in
+            let charset = runtime.payload(args[2], as: VMCharset.self)?.name ?? "ISO-8859-1"
+            return basic(runtime, username: runtime.stringValue(args[0]) ?? "", password: runtime.stringValue(args[1]) ?? "", charset: charset)
+        }
+        credentials.staticMethod("basic$default", "(Ljava/lang/String;Ljava/lang/String;Ljava/nio/charset/Charset;ILjava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            let mask = Int(args[3].asInt32)
+            let charset = mask & 4 != 0 ? "ISO-8859-1" : (runtime.payload(args[2], as: VMCharset.self)?.name ?? "ISO-8859-1")
+            return basic(runtime, username: runtime.stringValue(args[0]) ?? "", password: runtime.stringValue(args[1]) ?? "", charset: charset)
+        }
+        let authenticator = NativeClass("Lokhttp3/Authenticator;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        authenticator.method("authenticate", "(Lokhttp3/Route;Lokhttp3/Response;)Lokhttp3/Request;") { _, _, _ in .null }
+        return [timeout, connection, protocolClass, cache, util, dns, credentials, authenticator]
     }
 }
 
@@ -2023,6 +2616,11 @@ extension VMRuntime {
                 if let contentType = form.contentType,
                    !headers.contains(where: { $0.0.caseInsensitiveCompare("Content-Type") == .orderedSame }) {
                     headers.append(("Content-Type", contentType))
+                }
+            } else if let multipart = self.payload(payload.body, as: VMMultipartBodyPayload.self) {
+                body = multipart.rendered
+                if !headers.contains(where: { $0.0.caseInsensitiveCompare("Content-Type") == .orderedSame }) {
+                    headers.append(("Content-Type", multipart.contentType))
                 }
             } else {
                 body = Data()

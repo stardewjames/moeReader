@@ -24,6 +24,12 @@ final class VMSpreadBuilderPayload {
     init(capacity: Int) { values.reserveCapacity(max(0, capacity)) }
 }
 
+final class VMHexFormatBuilderPayload {
+    var uppercase = false
+    var bytePrefix = ""
+    var byteSeparator = ""
+}
+
 final class VMHexFormatPayload {
     let uppercase: Bool
     let prefix: String
@@ -45,7 +51,36 @@ enum KotlinSupportRuntime {
         result += rangeClasses()
         result += ioClasses()
         result += reflectionClasses()
+        result += propertyClasses()
+        result += propertyReflectionClasses()
         result += clockClasses()
+        return result
+    }
+
+    // MARK: - kotlin.properties delegate interfaces
+
+    /// `ReadWriteProperty` is implemented by the extension's delegate classes;
+    /// only the interface shape matters, the generated class supplies the body.
+    private static func propertyClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let readWrite = NativeClass(
+            "Lkotlin/properties/ReadWriteProperty;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        readWrite.method("getValue", "(Ljava/lang/Object;Lkotlin/reflect/KProperty;)Ljava/lang/Object;") { _, _, _ in .null }
+        readWrite.method("setValue", "(Ljava/lang/Object;Lkotlin/reflect/KProperty;Ljava/lang/Object;)V") { _, _, _ in .zero }
+        result.append(readWrite)
+
+        let provider = NativeClass(
+            "Lkotlin/properties/PropertyDelegateProvider;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        provider.method("provideDelegate", "(Ljava/lang/Object;Lkotlin/reflect/KProperty;)Ljava/lang/Object;") { _, _, _ in .null }
+        result.append(provider)
         return result
     }
 
@@ -132,14 +167,139 @@ enum KotlinSupportRuntime {
         result.append(spread)
 
         let functionReference = NativeClass("Lkotlin/jvm/internal/FunctionReferenceImpl;", superclass: "Ljava/lang/Object;")
+        // `receiver` is the bound first argument of a callable reference that
+        // Kotlin compiles with a receiver-carrying constructor.
+        functionReference.field("receiver", "Ljava/lang/Object;")
+        functionReference.method("<init>", "(ILjava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V") { runtime, args, _ in
+            if let pointer = args[0].object {
+                VMObjectLayout.slot(pointer, functionReference.instanceFields.count - 1).pointee = args[1]
+            }
+            _ = runtime
+            return .zero
+        }
+        functionReference.method("<init>", "(ILjava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I[Ljava/lang/annotation/Annotation;)V") { _, _, _ in .zero }
         functionReference.method("<init>", "(ILjava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V") { _, _, _ in .zero }
         functionReference.method("<init>", "(ILjava/lang/Class;Ljava/lang/String;Ljava/lang/String;I[Ljava/lang/annotation/Annotation;)V") { _, _, _ in .zero }
         functionReference.method("getArity", "()I") { _, _, _ in .int32(0) }
+        functionReference.method("getReceiver", "()Ljava/lang/Object;") { _, args, _ in
+            guard let pointer = args[0].object,
+                  let field = VMObjectLayout.cls(pointer).field(named: "receiver") else { return .null }
+            return VMObjectLayout.slot(pointer, field.offset).pointee
+        }
         result.append(functionReference)
 
         let propertyReference = NativeClass("Lkotlin/jvm/internal/MutablePropertyReference1Impl;", superclass: "Ljava/lang/Object;")
         propertyReference.method("<init>", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V") { _, _, _ in .zero }
         result.append(propertyReference)
+
+        // Property references mirror the function references: the bound
+        // receiver lives in the `receiver` field and `invoke()` reads it back.
+        let propertyReferences: [(String, String)] = [
+            ("PropertyReference0Impl", "(Ljava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V"),
+            ("MutablePropertyReference0Impl", "(Ljava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V"),
+            ("PropertyReference1Impl", "(Ljava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V"),
+        ]
+        for (name, signature) in propertyReferences {
+            let cls = NativeClass("Lkotlin/jvm/internal/\(name);", superclass: "Ljava/lang/Object;")
+            cls.field("receiver", "Ljava/lang/Object;")
+            cls.method("<init>", signature) { runtime, args, _ in
+                if let pointer = args[0].object {
+                    VMObjectLayout.slot(pointer, cls.instanceFields.count - 1).pointee = args[1]
+                }
+                _ = runtime
+                return .zero
+            }
+            // The receiver-less constructor leaves `receiver` null; only the
+            // unbound reference form uses it.
+            cls.method("<init>", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)V") { _, _, _ in .zero }
+            cls.method("getReceiver", "()Ljava/lang/Object;") { _, args, _ in
+                guard let pointer = args[0].object,
+                      let field = VMObjectLayout.cls(pointer).field(named: "receiver") else { return .null }
+                return VMObjectLayout.slot(pointer, field.offset).pointee
+            }
+            result.append(cls)
+        }
+
+        let propertyReference0 = NativeClass("Lkotlin/jvm/internal/PropertyReference0;", superclass: "Ljava/lang/Object;")
+        propertyReference0.method("invoke", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let cls = runtime.classOf(args[0]),
+                  let get = cls.lookupVirtual(key: "get()Ljava/lang/Object;") else { return .null }
+            return try runtime.invoke(get, [args[0]])
+        }
+        result.append(propertyReference0)
+
+        let functionAdapter = NativeClass(
+            "Lkotlin/jvm/internal/FunctionAdapter;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        functionAdapter.method("getFunctionDelegate", "()Lkotlin/Function;") { _, _, _ in .null }
+        result.append(functionAdapter)
+
+        let mappedMarker = NativeClass(
+            "Lkotlin/jvm/internal/markers/KMappedMarker;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        result.append(mappedMarker)
+        let mutableListMarker = NativeClass(
+            "Lkotlin/jvm/internal/markers/KMutableList;",
+            superclass: nil,
+            interfaces: ["Lkotlin/jvm/internal/markers/KMappedMarker;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        result.append(mutableListMarker)
+
+        let collectionToArray = NativeClass("Lkotlin/jvm/internal/CollectionToArray;")
+        collectionToArray.staticMethod("toArray", "(Ljava/util/Collection;)[Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listItems(args[0]) ?? []
+            let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
+            for (index, item) in items.enumerated() {
+                runtime.setArrayElement(array, index: index, value: item)
+            }
+            return array
+        }
+        collectionToArray.staticMethod("toArray", "(Ljava/util/Collection;[Ljava/lang/Object;)[Ljava/lang/Object;") { runtime, args, _ in
+            let items = runtime.listItems(args[0]) ?? []
+            let suppliedCount = runtime.arrayLength(args[1])
+            let target = suppliedCount >= items.count && suppliedCount > 0
+                ? args[1]
+                : runtime.newArray(component: runtime.classOf(args[1])?.arrayComponent ?? "Ljava/lang/Object;", count: items.count)
+            for (index, item) in items.enumerated() {
+                runtime.setArrayElement(target, index: index, value: item)
+            }
+            if runtime.arrayLength(target) > items.count {
+                for index in items.count..<runtime.arrayLength(target) {
+                    runtime.setArrayElement(target, index: index, value: .null)
+                }
+            }
+            return target
+        }
+        result.append(collectionToArray)
+
+        let debugProbes = NativeClass("Lkotlin/coroutines/jvm/internal/DebugProbesKt;")
+        debugProbes.staticMethod("probeCoroutineSuspended", "(Lkotlin/coroutines/Continuation;)V") { _, _, _ in .zero }
+        debugProbes.staticMethod("probeCoroutineCreated", "(Lkotlin/coroutines/Continuation;)Lkotlin/coroutines/Continuation;") { _, args, _ in args[0] }
+        result.append(debugProbes)
+
+        let restrictedLambda = NativeClass("Lkotlin/coroutines/jvm/internal/RestrictedSuspendLambda;", superclass: "Ljava/lang/Object;")
+        restrictedLambda.method("<init>", "(ILkotlin/coroutines/Continuation;)V") { _, _, _ in .zero }
+        result.append(restrictedLambda)
+
+        let sequenceScope = NativeClass("Lkotlin/sequences/SequenceScope;", superclass: "Ljava/lang/Object;")
+        sequenceScope.method("yield", "(Ljava/lang/Object;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMSequenceCollectorPayload.self)?.values.append(args[1])
+            return runtime.unitValue
+        }
+        sequenceScope.method("yieldAll", "(Ljava/lang/Iterable;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            if let collector = runtime.payload(args[0], as: VMSequenceCollectorPayload.self) {
+                collector.values.append(contentsOf: runtime.kotlinIterableItems(args[1]))
+            }
+            return runtime.unitValue
+        }
+        result.append(sequenceScope)
 
         return result
     }
@@ -208,6 +368,14 @@ enum KotlinSupportRuntime {
 
         let randomDefault = NativeClass("Lkotlin/random/Random$Default;", superclass: "Lkotlin/random/Random;")
         randomDefault.method("<init>", "()V") { _, _, _ in .zero }
+        randomDefault.method("nextDouble", "(DD)D") { _, args, _ in
+            let from = args[1].asDouble
+            let until = args[2].asDouble
+            guard from < until else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Random range is empty: \(from)..\(until)")
+            }
+            return .double(from + Double.random(in: 0..<(until - from)))
+        }
         randomDefault.method("toString", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("Random") }
         result.append(randomDefault)
 
@@ -337,6 +505,123 @@ enum KotlinSupportRuntime {
             return .int32(left < right ? -1 : (left > right ? 1 : 0))
         }
         result.append(uint)
+
+        let uLong = NativeClass("Lkotlin/ULong;", superclass: "Ljava/lang/Object;")
+        uLong.staticMethod("constructor-impl", "(J)J") { _, args, _ in args[0] }
+        uLong.staticMethod("box-impl", "(J)Lkotlin/ULong;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/ULong;", payload: NSNumber(value: args[0].asInt64))
+        }
+        uLong.method("unbox-impl", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? args[0].asInt64)
+        }
+        uLong.staticMethod("toString-impl", "(J)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(String(UInt64(bitPattern: args[0].asInt64)))
+        }
+        uLong.staticMethod("compareTo-impl", "(JJ)I") { _, args, _ in
+            let left = UInt64(bitPattern: args[0].asInt64)
+            let right = UInt64(bitPattern: args[1].asInt64)
+            return .int32(left < right ? -1 : (left > right ? 1 : 0))
+        }
+        result.append(uLong)
+
+        uint.staticMethod("hashCode-impl", "(I)I") { _, args, _ in .int32(args[0].asInt32) }
+
+        let unsignedKt = NativeClass("Lkotlin/UnsignedKt;")
+        unsignedKt.staticMethod("uintToDouble", "(I)D") { _, args, _ in .double(Double(UInt32(bitPattern: args[0].asInt32))) }
+        result.append(unsignedKt)
+
+        let uintArray = NativeClass("Lkotlin/UIntArray;", superclass: "Ljava/lang/Object;")
+        uintArray.staticMethod("get-pVg5ArA", "([II)I") { runtime, args, _ in
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < runtime.arrayLength(args[0]) else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index: \(index)")
+            }
+            return runtime.arrayElement(args[0], index)
+        }
+        uintArray.staticMethod("getSize-impl", "([I)I") { runtime, args, _ in
+            .int32(Int32(runtime.arrayLength(args[0])))
+        }
+        result.append(uintArray)
+
+        let uStrings = NativeClass("Lkotlin/text/UStringsKt;")
+        uStrings.staticMethod("toString-JSWoG40", "(JI)Ljava/lang/String;") { runtime, args, _ in
+            let radix = Int(args[1].asInt32)
+            guard radix == 10 else {
+                guard radix >= 2, radix <= 36 else {
+                    throw VMJavaException("Ljava/lang/IllegalArgumentException;", "radix \(radix) was not in valid range 2..36")
+                }
+                return runtime.newString(String(UInt64(bitPattern: args[0].asInt64), radix: radix))
+            }
+            return runtime.newString(String(UInt64(bitPattern: args[0].asInt64)))
+        }
+        uStrings.staticMethod("toString-V7xB4Y4", "(II)Ljava/lang/String;") { runtime, args, _ in
+            let value = UInt32(bitPattern: args[0].asInt32)
+            let radix = Int(args[1].asInt32)
+            guard radix >= 2, radix <= 36 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "radix \(radix) was not in valid range 2..36")
+            }
+            return runtime.newString(String(value, radix: radix))
+        }
+        uStrings.staticMethod("toUInt", "(Ljava/lang/String;)I") { runtime, args, _ in
+            guard let text = runtime.stringValue(args[0]), let value = UInt32(text) else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", runtime.stringValue(args[0]))
+            }
+            return .int32(Int32(bitPattern: value))
+        }
+        result.append(uStrings)
+
+        hex.staticMethod("toHexString", "(BLkotlin/text/HexFormat;)Ljava/lang/String;") { runtime, args, _ in
+            let format: VMHexFormatPayload? = runtime.payload(args[1], as: VMHexFormatPayload.self)
+            let body = hexString([UInt8(truncatingIfNeeded: args[0].asInt32)], uppercase: format?.uppercase ?? false)
+            return runtime.newString((format?.prefix ?? "") + body + (format?.suffix ?? ""))
+        }
+
+        let hexCompanion = NativeClass("Lkotlin/text/HexFormat$Companion;", superclass: "Ljava/lang/Object;")
+        hexCompanion.method("getDefault", "()Lkotlin/text/HexFormat;") { runtime, _, _ in
+            runtime.makeNative("Lkotlin/text/HexFormat;", payload: VMHexFormatPayload(uppercase: false))
+        }
+        result.append(hexCompanion)
+
+        let hexFormatClass = result.first { $0.descriptor == "Lkotlin/text/HexFormat;" }
+        hexFormatClass?.staticField("Companion", "Lkotlin/text/HexFormat$Companion;")
+        hexFormatClass?.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lkotlin/text/HexFormat$Companion;", payload: NSNull())
+        }
+
+        let hexBuilder = NativeClass("Lkotlin/text/HexFormat$Builder;", superclass: "Ljava/lang/Object;")
+        hexBuilder.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHexFormatBuilderPayload())
+            return .zero
+        }
+        hexBuilder.method("setUpperCase", "(Z)V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHexFormatBuilderPayload.self)?.uppercase = args[1].asBoolean
+            return .zero
+        }
+        hexBuilder.method("getBytes", "()Lkotlin/text/HexFormat$BytesHexFormat$Builder;") { runtime, args, _ in
+            runtime.makeNative(
+                "Lkotlin/text/HexFormat$BytesHexFormat$Builder;",
+                payload: runtime.payload(args[0], as: VMHexFormatBuilderPayload.self) ?? VMHexFormatBuilderPayload()
+            )
+        }
+        hexBuilder.method("build", "()Lkotlin/text/HexFormat;") { runtime, args, _ in
+            let builder = runtime.payload(args[0], as: VMHexFormatBuilderPayload.self)
+            return runtime.makeNative(
+                "Lkotlin/text/HexFormat;",
+                payload: VMHexFormatPayload(uppercase: builder?.uppercase ?? false, prefix: builder?.bytePrefix ?? "")
+            )
+        }
+        result.append(hexBuilder)
+
+        let hexBytesBuilder = NativeClass("Lkotlin/text/HexFormat$BytesHexFormat$Builder;", superclass: "Ljava/lang/Object;")
+        hexBytesBuilder.method("setBytePrefix", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHexFormatBuilderPayload.self)?.bytePrefix = runtime.stringValue(args[1]) ?? ""
+            return .zero
+        }
+        hexBytesBuilder.method("setByteSeparator", "(Ljava/lang/String;)V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHexFormatBuilderPayload.self)?.byteSeparator = runtime.stringValue(args[1]) ?? ""
+            return .zero
+        }
+        result.append(hexBytesBuilder)
 
         return result
     }
@@ -514,6 +799,21 @@ enum KotlinSupportRuntime {
         }
         result.append(charRange)
 
+        let progressionUtil = NativeClass("Lkotlin/internal/ProgressionUtilKt;")
+        progressionUtil.staticMethod("getProgressionLastElement", "(III)I") { _, args, _ in
+            let start = args[0].asInt32
+            let end = args[1].asInt32
+            let step = args[2].asInt32
+            guard step != 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Step must be non-zero.")
+            }
+            if step > 0 {
+                return start >= end ? .int32(end) : .int32(end - differenceModulo(end, start, step))
+            }
+            return start <= end ? .int32(end) : .int32(end + differenceModulo(start, end, -step))
+        }
+        result.append(progressionUtil)
+
         return result
     }
 
@@ -548,6 +848,70 @@ enum KotlinSupportRuntime {
             return runtime.newString(runtime.decode(bytes: [UInt8](data), charset: charset))
         }
         result.append(streams)
+
+        let byteStreams = NativeClass("Lkotlin/io/ByteStreamsKt;")
+        byteStreams.staticMethod("readBytes", "(Ljava/io/InputStream;)[B") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else {
+                throw VMJavaException("Ljava/io/IOException;", "stream is not readable")
+            }
+            let remaining = payload.offset < payload.data.count
+                ? Data(payload.data.dropFirst(payload.offset))
+                : Data()
+            payload.offset = payload.data.count
+            return runtime.byteArrayValue([UInt8](remaining))
+        }
+        byteStreams.staticMethod("copyTo$default", "(Ljava/io/InputStream;Ljava/io/OutputStream;IILjava/lang/Object;)J") { runtime, args, _ in
+            guard let input = runtime.inputStreamPayload(args[0]) else {
+                throw VMJavaException("Ljava/io/IOException;", "stream is not readable")
+            }
+            guard let output = runtime.byteArrayOutputStreamPayload(args[1]) else {
+                throw VMJavaException("Ljava/io/IOException;", "stream is not writable")
+            }
+            let remaining = input.offset < input.data.count
+                ? Data(input.data.dropFirst(input.offset))
+                : Data()
+            input.offset = input.data.count
+            output.data.append(remaining)
+            return .int64(Int64(remaining.count))
+        }
+        result.append(byteStreams)
+
+        let textStreams = NativeClass("Lkotlin/io/TextStreamsKt;")
+        textStreams.staticMethod("readBytes", "(Ljava/net/URL;)[B") { runtime, args, _ in
+            guard let pointer = args[0].object,
+                  let field = VMObjectLayout.cls(pointer).field(named: "value"),
+                  let text = runtime.stringValue(VMObjectLayout.slot(pointer, field.offset).pointee),
+                  let url = URL(string: text) else {
+                throw VMJavaException("Ljava/io/FileNotFoundException;", "invalid URL")
+            }
+            guard let data = try? Data(contentsOf: url) else {
+                throw VMJavaException("Ljava/io/IOException;", "cannot read \(text)")
+            }
+            return runtime.byteArrayValue([UInt8](data))
+        }
+        textStreams.staticMethod("readText", "(Ljava/io/Reader;)Ljava/lang/String;") { runtime, args, _ in
+            guard let reader: VMReaderPayload = runtime.payload(args[0], as: VMReaderPayload.self) else {
+                throw VMJavaException("Ljava/io/IOException;", "reader is not readable")
+            }
+            let remaining = reader.remaining
+            reader.offset = reader.data.count
+            return runtime.newString(String(decoding: remaining, as: UTF8.self))
+        }
+        result.append(textStreams)
+
+        let autoCloseable = NativeClass("Lkotlin/jdk7/AutoCloseableKt;")
+        autoCloseable.staticMethod("closeFinally", "(Ljava/lang/AutoCloseable;Ljava/lang/Throwable;)V") { runtime, args, _ in
+            guard let cls = args[0].bits != 0 ? runtime.classOf(args[0]) : nil,
+                  let close = cls.lookupVirtual(key: "close()V") else { return .zero }
+            if args[1].bits != 0 {
+                // A close failure must not mask the original exception.
+                _ = try? runtime.invoke(close, [args[0]])
+                return .zero
+            }
+            try runtime.invoke(close, [args[0]])
+            return .zero
+        }
+        result.append(autoCloseable)
         return result
     }
 
@@ -615,11 +979,93 @@ enum KotlinSupportRuntime {
         }
         system.method("toString", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("System") }
         result.append(system)
+
+        // `kotlin.time.TimeSource` marks a monotonic instant in nanoseconds.
+        let timeMark = NativeClass(
+            "Lkotlin/time/TimeMark;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        timeMark.method("elapsedNow-UwyO8pc", "()J") { _, _, _ in .int64(0) }
+        result.append(timeMark)
+
+        let monotonic = NativeClass("Lkotlin/time/TimeSource$Monotonic;", superclass: "Ljava/lang/Object;")
+        monotonic.staticField("INSTANCE", "Lkotlin/time/TimeSource$Monotonic;")
+        monotonic.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lkotlin/time/TimeSource$Monotonic;", payload: NSNull())
+        }
+        monotonic.method("markNow-z9LOYto", "()J") { _, _, _ in
+            .int64(Int64(Date().timeIntervalSince1970 * 1_000_000_000))
+        }
+        result.append(monotonic)
+
+        let valueTimeMark = NativeClass(
+            "Lkotlin/time/TimeSource$Monotonic$ValueTimeMark;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/time/TimeMark;"]
+        )
+        valueTimeMark.method("elapsedNow-UwyO8pc", "()J") { runtime, args, _ in
+            let marked = runtime.payload(args[0], as: NSNumber.self)?.int64Value ?? 0
+            let now = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
+            return .int64(now &- marked)
+        }
+        valueTimeMark.staticMethod("box-impl", "(J)Lkotlin/time/TimeSource$Monotonic$ValueTimeMark;") { runtime, args, _ in
+            runtime.makeNative("Lkotlin/time/TimeSource$Monotonic$ValueTimeMark;", payload: NSNumber(value: args[0].asInt64))
+        }
+        result.append(valueTimeMark)
+        return result
+    }
+
+    // MARK: - kotlin.reflect property handles
+
+    private static func propertyReflectionClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let property = NativeClass(
+            "Lkotlin/reflect/KProperty;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        property.method("getName", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("") }
+        property.method("getGetter", "()Lkotlin/reflect/KProperty$Getter;") { _, _, _ in .null }
+        result.append(property)
+
+        let property0 = NativeClass(
+            "Lkotlin/reflect/KProperty0;",
+            superclass: nil,
+            interfaces: ["Lkotlin/reflect/KProperty;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        property0.method("get", "()Ljava/lang/Object;") { _, _, _ in .null }
+        result.append(property0)
+
+        let mutable0 = NativeClass(
+            "Lkotlin/reflect/KMutableProperty0;",
+            superclass: nil,
+            interfaces: ["Lkotlin/reflect/KProperty0;"],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        mutable0.method("set", "(Ljava/lang/Object;)V") { _, _, _ in .zero }
+        result.append(mutable0)
         return result
     }
 }
 
 // MARK: - Shared helpers
+
+/// `kotlin.internal.differenceModulo`: the distance from `b` up to `a` modulo
+/// `c`, computed with wrapping Int arithmetic like the stdlib.
+func differenceModulo(_ a: Int32, _ b: Int32, _ c: Int32) -> Int32 {
+    let ac = kotlinMod(a, c)
+    let bc = kotlinMod(b, c)
+    return kotlinMod(ac &- bc, c)
+}
+
+private func kotlinMod(_ value: Int32, _ modulus: Int32) -> Int32 {
+    let result = value % modulus
+    return result >= 0 ? result : result &+ (modulus < 0 ? -modulus : modulus)
+}
 
 func progressionValues(first: Int, last: Int, step: Int) -> [Int32] {
     guard step != 0 else { return [] }

@@ -36,18 +36,21 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/VMConv.swift` | Value/Swift conversions, collection helpers, charsets, regex |
 | `Engine/JavaCore.swift` | `java.lang`: Object, String, StringBuilder, boxed primitives, Math, System, Class, Thread, throwables |
 | `Engine/JavaUtil.swift` | Collections (`Vector`, live list iterators, copy-on-write list/set), Arrays/Collections/Objects, Optional, StringJoiner |
-| `Engine/KotlinRuntime.swift` | Kotlin stdlib entry points, `Result`, `Lazy`, `IndexedValue` and indexed helpers, sequences, coroutines driving, Duration |
-| `Engine/KotlinSupportRuntime.swift` | Remaining `kotlin.*` helpers: `Ref` holders, spread builders, function/property reference classes, `Random`, `Charsets`/`HexFormat`, unsigned types, ranges/iterators, `kotlin.io` URL streams |
+| `Engine/KotlinRuntime.swift` | Kotlin stdlib entry points, `Result`, `Lazy`, `IndexedValue` and indexed helpers, collections/array/string/char helpers, `Regex` (+ escaping companion), `MatchResult` destructuring, sequences, coroutines driving, Duration |
+| `Engine/KotlinSupportRuntime.swift` | Remaining `kotlin.*` helpers: `Ref` holders, spread builders, function/property reference classes, delegate interfaces (`ReadWriteProperty`, `PropertyDelegateProvider`), `Random`, `Charsets`/`HexFormat` builders, unsigned types, ranges/iterators, `kotlin.io` streams and files, `Clock`/`TimeSource` marks |
 | `Engine/OkHttpRuntime.swift` | okhttp3 objects and interceptors over the host transport |
-| `Engine/JsoupRuntime.swift` | HTML parser, DOM, CSS selector engine |
+| `Engine/JsoupRuntime.swift` | HTML/XML parser (`Parser.htmlParser()`/`xmlParser()`), DOM, attributes and text nodes, CSS selector engine |
 | `Engine/QuickJSRuntime.swift` | `app.cash.quickjs.QuickJs` over JavaScriptCore on Apple hosts; other hosts raise a typed `UnsupportedOperationException` |
 | `Engine/MihonAPI.swift` | `Source`, `HttpSource`, `ParsedHttpSource`, models, filters, `SourceFactory`, network helpers |
 | `Engine/MihonFilters.swift` | FilterList → plain filter tree, selection replay for searches |
-| `Engine/FileRuntime.swift` | `java.io.File`, okio file source/sink/buffer, `kotlin.io.FilesKt.resolve` |
+| `Engine/FileRuntime.swift` | `java.io.File`, `okio.ByteString`, okio file source/sink/buffer, `kotlin.io.FilesKt.resolve` |
 | `Engine/ZstdRuntime.swift` | `OkioZstd` sink/source over zstd frames (raw-block encoder, raw/RLE decoder) |
 | `Engine/JavaTimeRuntime.swift` | `java.time` subset used for chapter dates, including `DateTimeFormatterBuilder` optional sections |
 | `Engine/JavaTextRuntime.swift` | `java.util.Date`/`Calendar`/`TimeZone` and `java.text` date/number formatting |
-| `Engine/CryptoRuntime.swift` | `javax.crypto` AES (CBC/ECB/CTR/GCM) in pure Swift, plus `java.security` key/spec types |
+| `Engine/JavaMathRuntime.swift` | `java.math.BigInteger`/`BigDecimal` over a base-2^32 limb core (exact arithmetic, Knuth division, radix and two's-complement conversion, BigDecimal scale/rounding), plus `RoundingMode` and `StringsKt.toBigDecimalOrNull` |
+| `Engine/CryptoRuntime.swift` | `javax.crypto` AES (CBC/ECB/CTR/GCM, including GCM additional authenticated data and `Cipher.doFinal(byte[], int, int)`) in pure Swift, plus `java.security` key/spec types and the `Cipher` dispatch that routes RSA keys to `JavaPublicKeyRuntime` |
+| `Engine/JavaSecurityRuntime.swift` | `java.security` `MessageDigest`/`MessageDigestSpi` and `SecureRandom`, `javax.crypto` `Mac` and `SecretKeyFactory`/`PBEKeySpec`; MD5/SHA-1/SHA-256/SHA-384/SHA-512 core in pure Swift, so HMAC and PBKDF2 behave the same on Apple and Linux hosts |
+| `Engine/JavaPublicKeyRuntime.swift` | `java.security` `KeyPair`/`KeyPairGenerator`/`KeyFactory`/`Signature`/`AlgorithmParameters` and `java.security.spec`, `javax.crypto` `KeyAgreement` and RSA `Cipher` padding; P-256 point arithmetic, ECDSA (SHA-256, ASN.1 DER) and ECDH, RSA key generation, PKCS#1 v1.5 and OAEP over `VMBigInteger`, with X.509/PKCS#8 DER encode and decode in pure Swift |
 | `Engine/SerializationRuntime.swift` | kotlinx.serialization: JSON parser and encoder, generated/plugin descriptors, builtins, collections, enums, polymorphic fallback, `buildJsonObject`/`buildJsonArray`, `JsonTransformingSerializer` |
 | `Engine/PreferencesRuntime.swift` | androidx.preference model exposed to the source settings UI |
 | `Engine/AndroidRuntime.swift` | Context, SharedPreferences, Injekt bridge, `android.util`/`android.os`/`android.view` stubs used by extensions |
@@ -59,8 +62,39 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/WebKitRuntime.swift` | `android.webkit`: CookieManager over the host transport's cookie storage, URLUtil, WebView over WKWebView with a JavaScript bridge and client/chrome callbacks, plus the `android.view` pieces a WebView needs |
 | `Engine/NativeLibrary.swift` | Registration point: collects every runtime's `NativeClass` list into the VM's native registry |
 | `Engine/MihonEngine.swift` | APK → dex → factory → sources; typed source calls |
+| `Engine/DoHResolver.swift` | DNS over HTTPS (JSON API): `A`/`AAAA` answers, TTL cache, single flight, hostname and address-literal validation, persisted resolver choice |
+| `Engine/PinnedHTTPClient.swift` | HTTP/1.1 over a resolved address with the hostname kept as TLS SNI and `Host`; portable request writer, response decoder, redirects and cookie bridge |
 | `MihonEngineRuntime.swift` | `MihonSourceRuntime` adapter, serial queue, runtime pool |
 | `MihonCompatBackend.swift` | Registers the engine as the `swift` runtime backend (`MihonExtensions/MihonRuntimeBackend.swift`) |
+
+## Encrypted DNS transport
+
+Settings → Encrypted DNS (off by default) resolves source and repository
+hostnames over HTTPS and, while it is on, sends their traffic over a pinned
+connection. It helps on a network that filters names: the lookup leaves the
+device encrypted and the connection carries the resolved address, so a
+resolver cannot match the hostname. It cannot help against a check the server
+itself performs; a browser-check interstitial is still handled by the transport
+path described under *Compatibility envelope*.
+
+- `DoHResolver` asks the configured endpoint (a well-known public resolver —
+  Cloudflare or Google — or a custom `https` URL) for `A` and then `AAAA`,
+  validates every answer, and caches it for the TTL the endpoint returned,
+  capped at 300 s. Concurrent lookups of one host share one query; an address
+  literal is used without a lookup.
+- `PinnedHTTPClient` writes HTTP/1.1 itself, connects to the resolved address,
+  and sets the TLS server name to the original hostname, so SNI and certificate
+  evaluation use the name the source asked for. Response bodies are capped at
+  64 MiB, connect/read time is bounded, and redirects are limited to five hops
+  and may not downgrade HTTPS to HTTP.
+- `MihonEngineHost` and `MihonHTTPClient` (repository/APK downloads plus remote
+  images) switch to the pinned client when the setting is on; cookies go
+  through the same `HTTPCookieStorage` jar the URLSession path uses. With the
+  setting off both paths are unchanged.
+
+Only the `NWConnection` exchange is Apple-only. Without the `Network`
+framework the pinned client fails closed with a typed `transportUnavailable`
+error instead of quietly falling back to the system resolver.
 
 ## Execution model
 
@@ -102,20 +136,48 @@ and the suspend lib-1.6 API in practice:
   backed `Arrays.asList`, copy-on-write list/set), `java.io` byte streams
   (`InputStream` with a real read cursor, `ByteArrayOutputStream`, `File`
   metadata, mkdir, rename, temp files, listing), `java.time`
-  parsing/formatting with zoned/offset/instant support, `java.util.Date`,
+  parsing/formatting with zoned/offset/instant support, `Instant`/`Duration`
+  unit arithmetic (`plus`/`minus`), and region zone rules (a DST gap
+  moves the wall clock forward, an overlap keeps the earlier offset, as
+  `ZonedDateTime.of` does), `java.util.Date`,
   `java.util.Calendar`/`GregorianCalendar` and `TimeZone`,
-  `java.text` `SimpleDateFormat`/`DecimalFormat`, field and method reflection
+  `java.text` `SimpleDateFormat`/`DecimalFormat`, `java.util.regex.Pattern`/
+  `Matcher` over `NSRegularExpression`, field and method reflection
   including `Method.invoke`, `Class.forName` and dynamic `Proxy` instances,
-  atomics, `ReentrantLock`/`ReentrantReadWriteLock`, `ConcurrentHashMap`, and
-  `javax.crypto` AES ciphers (CBC/ECB/CTR/GCM) implemented in pure Swift so
-  the engine builds unchanged on Linux.
+  atomics, `ReentrantLock`/`ReentrantReadWriteLock`, `ConcurrentHashMap`,
+  `javax.crypto` AES ciphers (CBC/ECB/CTR/GCM, GCM additional authenticated
+  data via `updateAAD`, `doFinal(byte[], int, int)`), `javax.crypto.Mac`,
+  `javax.crypto.SecretKeyFactory` with `PBEKeySpec` (PBKDF2),
+  `java.security.MessageDigest` (MD5, SHA-1, SHA-256, SHA-384, SHA-512 over a
+  pure-Swift hash core, with `MessageDigestSpi` so an extension subclass that
+  implements the `engine*` methods is authoritative) and
+  `java.security.SecureRandom`. `Arrays` copies and fills every primitive
+  width (padding or truncating like the JDK), `Locale` carries its JDK
+  constants (language plus country), `System.getProperties()` hands out one
+  live `Properties` table, and `java.lang.ref` weak/soft references hold their
+  referent for the arena's lifetime. `java.nio.ByteBuffer`/`ByteOrder`/
+  `CharBuffer` support wrap/allocate with absolute and relative reads and
+  writes in either byte order, and `Charset` reports decoders/encoders over
+  `ByteBuffer`/`CharBuffer`. `java.text.Normalizer` maps to Foundation's
+  canonical/compatibility forms, `java.util.zip.Inflater` performs real
+  DEFLATE (raw and zlib-wrapped), `GZIPInputStream` and `ZipInputStream` read
+  gzip/zip containers, and `Base64`, `UUID`, `Random` and `TreeMap` round out
+  the `java.util` utility surface. The cipher, hash and MAC code is pure Swift,
+  so the engine builds unchanged on Linux.
 - **Kotlin**: `Intrinsics`, `Unit`, `Pair`/`Triple`, `Result` (including
-  `getOrNull`/`getOrThrow`/unboxing), `Lazy`, collection/text/ranges helpers,
+  `getOrNull`/`getOrThrow`/unboxing), `Lazy`, collection/array/string/text/
+  ranges helpers, unsigned widths (`UInt`, `ULong`, `UByte`, `UIntArray` and
+  the unsigned conversions), range and progression helpers
+  (`downTo`, `step`/`reversed`, `IntProgression`/`CharRange` iterators),
   `IndexedValue` and the boxed `mapIndexed`/`filterIndexed`/`foldIndexed`/
   `reduceIndexed` helpers, `Regex` with iterable `MatchResult`, `IntRange`
-  groups and `RegexOption`, `Charsets`, sequences, `Duration`, `Instant`
+  groups and `RegexOption` (plus `Regex.Companion.escape`/`Pattern.quote`),
+  `MatchResult.Destructured`, `Charsets`, sequences (including `sequence {}`
+  builders), `Duration`, `Instant`
   (including `parseOrNull`), `Ref` holders, spread builders, function/property
-  reference classes, `Random`, hex/unsigned helpers, `kotlin.io` URL streams,
+  reference classes, the `ReadWriteProperty`/`PropertyDelegateProvider`
+  delegate interfaces, `Random`, hex helpers, `kotlin.io` URL/byte/text
+  streams, `kotlin.time.Clock` and `TimeSource` marks,
   `kotlin.coroutines` internals, and the `kotlinx.coroutines` builders needed
   by sources (`coroutineScope`, `async`/`await`, `withContext`, `launch`,
   `delay`, `GlobalScope`). A launched coroutine runs to completion before
@@ -130,12 +192,20 @@ and the suspend lib-1.6 API in practice:
   `JsonPrimitive`), `buildJsonObject`/`buildJsonArray` and
   `JsonElementBuildersKt`, `JsonTransformingSerializer`, and
   `decodeFromJsonElement`/`encodeToJsonElement`/`encodeToString`.
-- **Android**: `android.net.Uri`, `android.text.Html`, `android.util` helpers
-  (`Base64`, `Log`, `LruCache`, `DisplayMetrics`, `AttributeSet`),
+- **Android**: `android.net.Uri`, `android.text.Html`/`TextUtils`, `android.util`
+  helpers (`Base64`, `Log`, `LruCache` with its `create`/`entryRemoved`/
+  `sizeOf` hooks, `DisplayMetrics`, `AttributeSet`, `Patterns`),
+  `android.icu.text` break iteration, `StringSearch`, NFKC/casefold
+  normalisation and collation (with `java.text.StringCharacterIterator`) for
+  text search and sorting,
   `android.os` (`Bundle`, `Build`/`Build.VERSION`, `SystemClock`, `Handler`,
-  `Looper`, `Message`), `android.view` (`View`, `ViewGroup`/`LayoutParams`,
-  `View.MeasureSpec`), `android.content` shared preferences (including string
-  sets), and `androidx.preference` controls for source preference screens.
+  `HandlerThread`, `Looper`, `Message`), `android.view` (`View` with the
+  padding, content-description, click-listener, context and resource members a
+  headless widget reads, `ViewGroup`/`LayoutParams` with the child list behind
+  `addView`/`getChildAt`, `View.MeasureSpec`), `android.content` shared
+  preferences (including string sets), `Intent`/`ComponentName`/`ResultReceiver`
+  parcel plumbing, and `androidx.preference` controls for source preference
+  screens.
   `android.graphics` (Bitmap and BitmapFactory over ImageIO, Canvas drawing,
   Paint/Rect/Typeface) and `android.text.StaticLayout`/`Layout`/`TextPaint`
   render real pixels on Apple hosts; on Linux every pixel operation raises
@@ -151,21 +221,31 @@ and the suspend lib-1.6 API in practice:
 - **okhttp3**: `Request`/`Response`/`Headers`/`HttpUrl` including the
   `HttpUrl.Builder` surface (path segments, query add/set/remove, host, scheme,
   port, fragment), calls, client builders, `CacheControl`, interceptor chains,
-  form bodies, compression markers, `Dispatcher`, `Cookie`/`CookieJar` over the
-  shared jar, and the `Duration` timeout overloads.
+  form bodies, multipart bodies with a rendered boundary, byte-backed request
+  bodies (`RequestBody.create` from `String` or `byte[]`, plus the `$default`
+  overloads), compression markers, `Dispatcher`, `Cookie`/`CookieJar` over the
+  shared jar, and the `Duration` timeout overloads. `ResponseBody.Companion.create`
+  accepts a string, bytes, a file or a `BufferedSource`, with and without an
+  explicit content length.
   `HttpUrl.parse`/`toHttpUrlOrNull` return null (and `get`/`toHttpUrl` throw)
   for anything but an absolute `http`/`https` URL with a host, so sources that
   treat a parseable search query as a deep link only do so for real URLs.
-- **okio**: `BufferedSource`, `BufferedSink`, `Source`, `Sink`, `Buffer`, and
-  `Okio` factories over `java.io.File`. A non-appending file sink truncates on
+- **okio**: `okio.ByteString` (from `String` or `byte[]`, base64 and hex
+  codecs, `md5`/`sha256` digests, slicing and `substring`), `BufferedSource`,
+  `BufferedSink`, `Source`, `Sink`, `Buffer` (`snapshot`, `read`/`writeAll`,
+  `skip`, byte counts, EOF checks) and `Okio` factories over `java.io.File`. A
+  non-appending file sink truncates on
   its first flush and appends afterwards. `com.squareup.zstd.okio.OkioZstd`
   compresses into spec-compliant zstd frames of raw blocks and decompresses
   raw/RLE-block frames, which covers zstd-framed caches the extension writes
   itself.
-- **jsoup**: tolerant HTML parser, `Document`/`Element`/`Elements`,
+- **jsoup**: tolerant HTML parser with `Parser.htmlParser()`/`xmlParser()`
+  tree-builder choice (XML documents keep no implied tags), `Document`,
+  `Element`, `Elements`, `Attributes`/`Attribute`, `TextNode` and `Node`,
   `Jsoup.parse`/`parseBodyFragment`, text and attribute access including
   `hasText`, a CSS selector engine (`>`, `+`, `~`, `:has`, `:is`,
-  `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), and the
+  `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), typed
+  `Evaluator` instances, and the
   `selectText`/`selectInt`/`attrOrText`/`asJsoup` helpers. One `select` call
   memoizes normalized text, class lists, regex/selector parses and `:has`
   answer sets per node; `:has` results are folded into descendant and
@@ -215,6 +295,11 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   array-backed `Arrays.asList`, live sublists and fixed-size mutation errors.
 - `MihonTimeSemanticsTests` covers formatter widths/names/offsets, zoned and
   instant formatting, epoch parsing and system default zones.
+- `MihonKotlinCollectionsTests` covers array `copyOfRange`/`plus`/`copyInto`
+  bounds, `take` edge counts, `toSortedSet`/`maxOrNull` ordering,
+  collection-to-byte-array unboxing, progression `step` validation,
+  destructured group order, `ReadWriteProperty` dispatch, `Regex.escape` and
+  the UTF-8/char/text helpers.
 - `MihonKotlinReflectionTests` covers Java whitespace, static field reflection,
   method names, null field targets, lazy modes, array bounds, resource bundles
   and property parsing.
@@ -223,6 +308,29 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - `MihonSecurityBoundsTests` covers ZIP/ZIP64 truncation and overflow, DEX
   class-data validation, store rollback and shared-APK cleanup.
 - `MihonFilterStateTests` covers per-source filter persistence and reset.
+- `MihonCryptoDigestTests` covers published vectors for `MessageDigest`
+  (whole-input, streamed and chunked updates, `digest(byte[], int, int)`,
+  reset, algorithm names, short buffers, `NoSuchAlgorithmException`), a
+  subclassed `MessageDigest`, `Mac`, PBKDF2/`PBEKeySpec`, `SecureRandom`
+  buffer fills, and AES-GCM additional authenticated data.
+- `MihonJsonBuilderTests` covers `buildJsonObject`/`buildJsonArray` through
+  instance and static builders (nested objects, shared array storage,
+  last-value-wins), primitive accessors across boxed and primitive
+  signatures, `JsonNull` factories, and a content-polymorphic transforming
+  serializer.
+- `MihonJsoupSurfaceTests` covers `Parser.htmlParser()`/`xmlParser()` tree
+  selection, XML parsing, element/attribute mutation and `TextNode`/
+  `Attributes` access, typed evaluator parity with string selectors,
+  fail-closed helper statics, and a 2 MB page select inside the time budget.
+- `OkioOkHttpSurfaceTests` covers `ByteString` representations, base64/hex
+  decoding, digest vectors, equality/slicing, buffer ordering and EOF checks,
+  `BufferedSource` reads/skips/ranges, `ResponseBody.Companion.create` with
+  known and unknown lengths, `Headers` iteration, `CacheControl` `TimeUnit`
+  overloads, multipart rendering and byte-backed request bodies.
+- `MihonAndroidSurfaceTests` covers `Base64` flag handling, `TextUtils`
+  null/empty/join/split/digit semantics, `LruCache` eviction and resize,
+  `Configuration` UI mode, `Bundle` parcel round-trips, ICU break iteration/
+  `StringSearch`/NFKC normalisation, and `Patterns` matching.
 - `scripts/analyze_compat.py` audits an APK's host API references against the
   engine registry. See "Auditing the native surface" below.
 - An opt-in extension test runs a real lib-1.6 extension through the whole
@@ -232,7 +340,7 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   no site reference is committed; local notes are in the ignored
   `site-notes.local.md`.
 - The portable suite (engine sources plus the MihonExtensions runtime files,
-  built on Linux) passes 151 tests with no failures. The runner takes every
+  built on Linux) passes over 200 tests with no failures. The runner takes every
   file in `MoeReaderTests`, then drops the ones that need app sources or Apple
   frameworks, so a new engine test is picked up without editing a list.
 - A live harness sweep of the 35 most-downloaded lib-1.6 extensions runs load,
@@ -270,6 +378,21 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - `MihonQuickJsTests` pins both branches of `app.cash.quickjs`: the
   JavaScriptCore round trip and the typed `UnsupportedOperationException` on a
   host without it.
+- `DoHResolverTests` covers JSON answer parsing (`A` before `AAAA`, `CNAME`
+  ignored, empty and malformed bodies, invalid literals, the TTL cap), query
+  construction, hostname and IPv4/IPv6 normalisation, cache expiry with an
+  injected clock, single-flight collapse, endpoint validation, and the
+  persisted setting (off by default).
+- `PinnedHTTPClientTests` covers request serialisation (fixed header order,
+  framing headers, injection rejection), response decoding (content-length,
+  chunked with extensions and trailers, close-delimited, the 64 MiB cap,
+  truncated bodies, interim responses, gzip marker passthrough), redirect
+  rewrite/hop cap/loop detection/HTTPS-downgrade rejection, the cookie bridge,
+  and the fail-closed branch on a host without `Network`.
+  `DoHEngineRoutingTests` pins the switch: with the setting on, the engine host
+  and the app's HTTP client take the pinned route and report a typed failure
+  where `Network` is missing. The `NWConnection` exchange itself can only be
+  exercised on a device.
 - `MihonChallengeDetectionTests` covers both protection families (server
   header, interstitial markup, clearance-cookie names, status codes),
   `MihonChallengeRetryTests` covers the single retry with a fresh cookie jar,

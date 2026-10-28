@@ -54,9 +54,11 @@ class VMSetPayload {
     }
 }
 
-final class VMMapPayload {
+class VMMapPayload {
     var entries: [(key: VMValue, value: VMValue)]
     var immutable: Bool
+    /// `MapsKt.withDefault` factory: `getValue` answers it for a missing key.
+    var defaultFactory: VMValue?
     init(_ entries: [(key: VMValue, value: VMValue)] = [], immutable: Bool = false) {
         self.entries = entries
         self.immutable = immutable
@@ -238,6 +240,14 @@ enum JavaUtil {
         result += miscQueueClasses()
         result += localeClasses()
         result += textClasses()
+        result += nioClasses()
+        result += normalizerClasses()
+        result += zipClasses()
+        result += referenceClasses()
+        result += base64Classes()
+        result += identityClasses()
+        result += sortedMapClasses()
+        result += propertiesClass()
         result += miscClasses()
         return result
     }
@@ -260,8 +270,14 @@ enum JavaUtil {
         ] {
             collection.method(name, signature) { _, _, _ in .zero }
         }
+        collection.method("containsAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            JavaUtil.containsAll(runtime, args[0], args[1])
+        }
 
         let list = NativeClass("Ljava/util/List;", superclass: nil, interfaces: ["Ljava/util/Collection;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        list.method("containsAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            JavaUtil.containsAll(runtime, args[0], args[1])
+        }
         for (name, signature) in [
             ("get", "(I)Ljava/lang/Object;"),
             ("set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
@@ -279,6 +295,9 @@ enum JavaUtil {
 
         let set = NativeClass("Ljava/util/Set;", superclass: nil, interfaces: ["Ljava/util/Collection;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         set.method("add", "(Ljava/lang/Object;)Z") { _, _, _ in .zero }
+        set.method("containsAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            JavaUtil.containsAll(runtime, args[0], args[1])
+        }
 
         let map = NativeClass("Ljava/util/Map;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         for (name, signature) in [
@@ -308,6 +327,21 @@ enum JavaUtil {
 
         let comparator = NativeClass("Ljava/util/Comparator;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         comparator.method("compare", "(Ljava/lang/Object;Ljava/lang/Object;)I") { _, _, _ in .int32(0) }
+        comparator.method("reversed", "()Ljava/util/Comparator;") { runtime, args, _ in
+            runtime.makeNative("Lmihoncompat/ReversedComparator;", payload: args[0])
+        }
+
+        let function = NativeClass("Ljava/util/function/Function;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        function.method("apply", "(Ljava/lang/Object;)Ljava/lang/Object;") { _, _, _ in .null }
+        function.method("andThen", "(Ljava/util/function/Function;)Ljava/util/function/Function;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/function/Function;", payload: NSNull())
+        }
+        function.method("compose", "(Ljava/util/function/Function;)Ljava/util/function/Function;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/function/Function;", payload: NSNull())
+        }
+
+        let supplier = NativeClass("Ljava/util/function/Supplier;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        supplier.method("get", "()Ljava/lang/Object;") { _, _, _ in .null }
 
         let listIterator = NativeClass("Ljava/util/ListIterator;", superclass: nil, interfaces: ["Ljava/util/Iterator;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         listIterator.method("hasPrevious", "()Z") { _, _, _ in .boolean(false) }
@@ -315,7 +349,7 @@ enum JavaUtil {
 
         let randomAccess = NativeClass("Ljava/util/RandomAccess;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
 
-        return [collection, list, set, map, mapEntry, comparator, listIterator, randomAccess]
+        return [collection, list, set, map, mapEntry, comparator, function, supplier, listIterator, randomAccess]
     }
 
     // MARK: - java.util.ArrayList
@@ -399,6 +433,9 @@ enum JavaUtil {
         queue.method("peek", "()Ljava/lang/Object;") { _, _, _ in .null }
         let abstractCollection = NativeClass("Ljava/util/AbstractCollection;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/Collection;"])
         abstractCollection.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.collectionToString(args[0]) }
+        abstractCollection.method("containsAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            JavaUtil.containsAll(runtime, args[0], args[1])
+        }
         abstractCollection.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
             let items = runtime.listItems(args[0]) ?? []
             let array = runtime.newArray(component: "Ljava/lang/Object;", count: items.count)
@@ -613,6 +650,33 @@ enum JavaUtil {
             guard let list = runtime.listPayload(args[0]) else { return .boolean(false) }
             return .boolean(list.items.contains { runtime.javaEquals($0, args[1]) })
         }
+        cls.method("containsAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            JavaUtil.containsAll(runtime, args[0], args[1])
+        }
+        cls.method("addAll", "(ILjava/util/Collection;)Z") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index <= list.items.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(list.items.count)")
+            }
+            let incoming = runtime.listItems(args[2]) ?? []
+            list.items.insert(contentsOf: incoming, at: index)
+            return .boolean(!incoming.isEmpty)
+        }
+        cls.method("removeAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let incoming = runtime.listItems(args[1]) ?? []
+            let before = list.items.count
+            list.items.removeAll { item in incoming.contains { runtime.javaEquals($0, item) } }
+            return .boolean(list.items.count != before)
+        }
+        cls.method("retainAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let incoming = runtime.listItems(args[1]) ?? []
+            let before = list.items.count
+            list.items.removeAll { item in !incoming.contains { runtime.javaEquals($0, item) } }
+            return .boolean(list.items.count != before)
+        }
         cls.method("clear", "()V") { runtime, args, _ in
             try runtime.mutableList(args[0]).items.removeAll(keepingCapacity: true)
             return .zero
@@ -751,6 +815,9 @@ enum JavaUtil {
             guard let set = runtime.setPayload(args[0]) else { return .boolean(false) }
             return .boolean(set.items.contains { runtime.javaEquals($0, args[1]) })
         }
+        cls.method("containsAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            JavaUtil.containsAll(runtime, args[0], args[1])
+        }
         cls.method("remove", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             let set = try runtime.mutableSet(args[0])
             if let index = set.items.firstIndex(where: { runtime.javaEquals($0, args[1]) }) {
@@ -886,6 +953,10 @@ enum JavaUtil {
             return .zero
         }
         linked.method("<init>", "(IF)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMMapPayload())
+            return .zero
+        }
+        linked.method("<init>", "(IFZ)V") { runtime, args, _ in
             runtime.setPayload(args[0], VMMapPayload())
             return .zero
         }
@@ -1766,7 +1837,37 @@ enum JavaUtil {
             let items = runtime.listItems(args[0]) ?? []
             return .int32(Int32(items.filter { runtime.javaEquals($0, args[1]) }.count))
         }
+        cls.staticMethod("synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
+            // The engine serialises operations, so the wrapper only has to be
+            // the same table; extensions compare identity of what they get back.
+            args[0].bits != 0 ? args[0] : runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload())
+        }
+        cls.staticMethod("synchronizedList", "(Ljava/util/List;)Ljava/util/List;") { runtime, args, _ in
+            args[0].bits != 0 ? args[0] : runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+        }
+        cls.staticMethod("synchronizedSet", "(Ljava/util/Set;)Ljava/util/Set;") { runtime, args, _ in
+            args[0].bits != 0 ? args[0] : runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload())
+        }
+        cls.staticField("EMPTY_MAP", "Ljava/util/Map;")
+        cls.staticField("EMPTY_LIST", "Ljava/util/List;")
+        cls.staticField("EMPTY_SET", "Ljava/util/Set;")
+        cls.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload([], immutable: true))
+            cls.staticValues[1] = runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload([], immutable: true))
+            cls.staticValues[2] = runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload([], immutable: true))
+        }
         return [cls]
+    }
+
+    /// `Arrays.fill(array, from, to, value)` with the JDK's index checks.
+    static func fillArray(_ runtime: VMRuntime, _ array: VMValue, from: Int, to: Int, value: VMValue) throws {
+        let count = runtime.arrayLength(array)
+        guard from >= 0, to <= count, from <= to else {
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;", "fromIndex \(from) > toIndex \(to)")
+        }
+        for index in from..<to {
+            runtime.setArrayElement(array, index: index, value: value)
+        }
     }
 
     private static func arraysClass() -> [NativeClass] {
@@ -1813,6 +1914,90 @@ enum JavaUtil {
         cls.staticMethod("stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;") { _, _, _ in
             throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "Arrays.stream")
         }
+        for letter in ["B", "C", "D", "F", "J", "S", "Z"] {
+            cls.staticMethod("copyOf", "([\(letter)I)[\(letter)") { runtime, args, _ in
+                let count = Int(args[1].asInt32)
+                guard count >= 0 else { throw VMJavaException("Ljava/lang/NegativeArraySizeException;", "\(count)") }
+                return runtime.copyArray(args[0], count: count, component: letter)
+            }
+        }
+        cls.staticMethod("copyOfRange", "([BII)[B") { runtime, args, _ in
+            let total = runtime.arrayLength(args[0])
+            let from = Int(args[1].asInt32)
+            let to = Int(args[2].asInt32)
+            guard from >= 0, from <= total else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "from \(from), length \(total)")
+            }
+            guard from <= to else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "from(\(from)) > to(\(to))")
+            }
+            return runtime.copyArrayRange(args[0], from: from, to: to, component: "B")
+        }
+        cls.staticMethod("equals", "([B[B)Z") { runtime, args, _ in
+            let left = runtime.arrayLength(args[0]), right = runtime.arrayLength(args[1])
+            guard left == right else { return .boolean(false) }
+            if args[0].bits == args[1].bits { return .boolean(true) }
+            for index in 0..<left where runtime.arrayElement(args[0], index).asInt32 != runtime.arrayElement(args[1], index).asInt32 {
+                return .boolean(false)
+            }
+            return .boolean(true)
+        }
+        cls.staticMethod("hashCode", "([B)I") { runtime, args, _ in
+            var hash: Int32 = 1
+            for index in 0..<runtime.arrayLength(args[0]) {
+                hash = 31 &* hash &+ runtime.arrayElement(args[0], index).asInt32
+            }
+            return .int32(hash)
+        }
+        cls.staticMethod("hashCode", "([I)I") { runtime, args, _ in
+            var hash: Int32 = 1
+            for index in 0..<runtime.arrayLength(args[0]) {
+                hash = 31 &* hash &+ runtime.arrayElement(args[0], index).asInt32
+            }
+            return .int32(hash)
+        }
+        cls.staticMethod("fill", "([BB)V") { runtime, args, _ in
+            try fillArray(runtime, args[0], from: 0, to: runtime.arrayLength(args[0]), value: args[1])
+            return .zero
+        }
+        cls.staticMethod("fill", "([BIIB)V") { runtime, args, _ in
+            try fillArray(runtime, args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), value: args[3])
+            return .zero
+        }
+        cls.staticMethod("fill", "([II)V") { runtime, args, _ in
+            try fillArray(runtime, args[0], from: 0, to: runtime.arrayLength(args[0]), value: args[1])
+            return .zero
+        }
+        cls.staticMethod("fill", "([IIII)V") { runtime, args, _ in
+            try fillArray(runtime, args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), value: args[3])
+            return .zero
+        }
+        cls.staticMethod("sort", "([C)V") { runtime, args, _ in
+            let count = runtime.arrayLength(args[0])
+            let units = (0..<count).map { UInt16(truncatingIfNeeded: runtime.arrayElement(args[0], $0).asInt32) }.sorted()
+            for (index, unit) in units.enumerated() {
+                runtime.setArrayElement(args[0], index: index, value: .int32(Int32(unit)))
+            }
+            return .zero
+        }
+        cls.staticMethod("toString", "([B)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
+        cls.staticMethod("toString", "([D)Ljava/lang/String;") { runtime, args, _ in
+            var parts: [String] = []
+            parts.reserveCapacity(runtime.arrayLength(args[0]))
+            for index in 0..<runtime.arrayLength(args[0]) {
+                parts.append(String(runtime.arrayElement(args[0], index).asDouble))
+            }
+            return runtime.newString("[" + parts.joined(separator: ", ") + "]")
+        }
+        cls.staticMethod("toString", "([F)Ljava/lang/String;") { runtime, args, _ in
+            var parts: [String] = []
+            parts.reserveCapacity(runtime.arrayLength(args[0]))
+            for index in 0..<runtime.arrayLength(args[0]) {
+                parts.append(String(runtime.arrayElement(args[0], index).asFloat))
+            }
+            return runtime.newString("[" + parts.joined(separator: ", ") + "]")
+        }
+        cls.staticMethod("toString", "([S)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
         return [cls]
     }
 
@@ -1886,24 +2071,73 @@ enum JavaUtil {
         return [deque]
     }
 
+    /// JDK `Locale` constants. The value keeps the language in slot 0 and the
+    /// country (upper-case, empty when absent) in slot 1 so `toString`,
+    /// `equals` and `hashCode` behave like the JDK's base locale.
+    private static let localeConstants: [(String, String, String)] = [
+        ("ENGLISH", "en", ""),
+        ("FRENCH", "fr", ""),
+        ("GERMAN", "de", ""),
+        ("ITALIAN", "it", ""),
+        ("JAPANESE", "ja", ""),
+        ("KOREAN", "ko", ""),
+        ("CHINESE", "zh", ""),
+        ("CHINA", "zh", "CN"),
+        ("SIMPLIFIED_CHINESE", "zh", "CN"),
+        ("TRADITIONAL_CHINESE", "zh", "TW"),
+        ("FRANCE", "fr", "FR"),
+        ("GERMANY", "de", "DE"),
+        ("ITALY", "it", "IT"),
+        ("JAPAN", "ja", "JP"),
+        ("KOREA", "ko", "KR"),
+        ("PRC", "zh", "CN"),
+        ("TAIWAN", "zh", "TW"),
+        ("UK", "en", "GB"),
+        ("US", "en", "US"),
+        ("CANADA", "en", "CA"),
+        ("CANADA_FRENCH", "fr", "CA"),
+        ("ROOT", "", ""),
+    ]
+
     private static func localeClasses() -> [NativeClass] {
         let locale = NativeClass("Ljava/util/Locale;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Serializable;"])
         locale.field("language", "Ljava/lang/String;")
+        locale.field("country", "Ljava/lang/String;")
         locale.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
             if let pointer = args[0].object {
                 VMObjectLayout.slot(pointer, 0).pointee = runtime.newString((runtime.stringValue(args[1]) ?? "").lowercased())
+                VMObjectLayout.slot(pointer, 1).pointee = runtime.newString("")
             }
             return .zero
         }
         locale.method("<init>", "(Ljava/lang/String;Ljava/lang/String;)V") { runtime, args, _ in
             if let pointer = args[0].object {
                 VMObjectLayout.slot(pointer, 0).pointee = runtime.newString((runtime.stringValue(args[1]) ?? "").lowercased())
+                VMObjectLayout.slot(pointer, 1).pointee = runtime.newString((runtime.stringValue(args[2]) ?? "").uppercased())
+            }
+            return .zero
+        }
+        locale.method("<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V") { runtime, args, _ in
+            if let pointer = args[0].object {
+                VMObjectLayout.slot(pointer, 0).pointee = runtime.newString((runtime.stringValue(args[1]) ?? "").lowercased())
+                VMObjectLayout.slot(pointer, 1).pointee = runtime.newString((runtime.stringValue(args[2]) ?? "").uppercased())
             }
             return .zero
         }
         locale.method("getLanguage", "()Ljava/lang/String;") { runtime, args, _ in
             guard let pointer = args[0].object else { return runtime.newString("") }
-            return VMObjectLayout.slot(pointer, 0).pointee
+            let value = VMObjectLayout.slot(pointer, 0).pointee
+            return value.bits == 0 ? runtime.newString("") : value
+        }
+        locale.method("getCountry", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let pointer = args[0].object else { return runtime.newString("") }
+            let value = VMObjectLayout.slot(pointer, 1).pointee
+            return value.bits == 0 ? runtime.newString("") : value
+        }
+        locale.method("getISO3Language", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let pointer = args[0].object else { return runtime.newString("") }
+            let code = runtime.stringValue(VMObjectLayout.slot(pointer, 0).pointee) ?? ""
+            return runtime.newString(Locale.current.localizedString(forLanguageCode: code) == nil ? "" : code)
         }
         locale.method("getDisplayLanguage", "()Ljava/lang/String;") { runtime, args, _ in
             guard let pointer = args[0].object else { return runtime.newString("") }
@@ -1922,24 +2156,1222 @@ enum JavaUtil {
         }
         locale.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             guard let pointer = args[0].object else { return runtime.newString("") }
-            return VMObjectLayout.slot(pointer, 0).pointee
+            let language = runtime.stringValue(VMObjectLayout.slot(pointer, 0).pointee) ?? ""
+            let country = runtime.stringValue(VMObjectLayout.slot(pointer, 1).pointee) ?? ""
+            return runtime.newString(country.isEmpty ? language : "\(language)_\(country)")
+        }
+        locale.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard let left = args[0].object, let right = args[1].object,
+                  VMObjectLayout.cls(right).descriptor == "Ljava/util/Locale;" else { return .boolean(args[0].bits == args[1].bits) }
+            let leftLanguage = runtime.stringValue(VMObjectLayout.slot(left, 0).pointee) ?? ""
+            let rightLanguage = runtime.stringValue(VMObjectLayout.slot(right, 0).pointee) ?? ""
+            let leftCountry = runtime.stringValue(VMObjectLayout.slot(left, 1).pointee) ?? ""
+            let rightCountry = runtime.stringValue(VMObjectLayout.slot(right, 1).pointee) ?? ""
+            return .boolean(leftLanguage == rightLanguage && leftCountry == rightCountry)
+        }
+        locale.method("hashCode", "()I") { runtime, args, _ in
+            guard let pointer = args[0].object else { return .int32(0) }
+            let hash = runtime.stringHash(VMObjectLayout.slot(pointer, 0).pointee)
+                ^ runtime.stringHash(VMObjectLayout.slot(pointer, 1).pointee)
+            return .int32(hash)
         }
         locale.staticMethod("getDefault", "()Ljava/util/Locale;") { runtime, _, _ in
             runtime.localeValue(code: Locale.current.language.languageCode?.identifier ?? "en")
         }
         locale.staticMethod("forLanguageTag", "(Ljava/lang/String;)Ljava/util/Locale;") { runtime, args, _ in
-            let tag = runtime.stringValue(args[0]) ?? "en"
-            return runtime.localeValue(code: String(tag.split(separator: "-").first ?? "en"))
+            let parts = (runtime.stringValue(args[0]) ?? "en").split(separator: "-").map(String.init)
+            let language = parts.first ?? "en"
+            let country = parts.count > 1 && parts[1].count == 2 ? parts[1] : ""
+            return runtime.localeValue(language: language, country: country)
         }
-        locale.staticField("US", "Ljava/util/Locale;")
-        locale.staticField("ENGLISH", "Ljava/util/Locale;")
-        locale.staticField("ROOT", "Ljava/util/Locale;")
+        for (name, _, _) in localeConstants {
+            locale.staticField(name, "Ljava/util/Locale;")
+        }
         locale.prepare = { runtime, cls in
-            cls.staticValues[0] = runtime.localeValue(code: "en")
-            cls.staticValues[1] = runtime.localeValue(code: "en")
-            cls.staticValues[2] = runtime.localeValue(code: "")
+            for (index, entry) in JavaUtil.localeConstants.enumerated() {
+                cls.staticValues[index] = runtime.localeValue(language: entry.1, country: entry.2)
+            }
         }
         return [locale]
+    }
+
+    // MARK: - java.nio
+
+    /// Collection helper shared by the `Collection`/`List`/`Set` interfaces
+    /// and the concrete collections that implement them.
+    static func containsAll(_ runtime: VMRuntime, _ receiver: VMValue, _ other: VMValue) -> VMValue {
+        let items = runtime.listItems(receiver) ?? []
+        let incoming = runtime.listItems(other) ?? []
+        for item in incoming where !items.contains(where: { runtime.javaEquals($0, item) }) {
+            return .boolean(false)
+        }
+        return .boolean(true)
+    }
+
+    static func byteBuffer(_ runtime: VMRuntime, _ value: VMValue) throws -> VMByteBufferPayload {
+        guard let payload = runtime.payload(value, as: VMByteBufferPayload.self) else {
+            throw VMJavaException("Ljava/lang/NullPointerException;")
+        }
+        return payload
+    }
+
+    static func bufferByte(_ payload: VMByteBufferPayload, _ runtime: VMRuntime, at index: Int) -> UInt8 {
+        if let array = payload.arrayValue {
+            return UInt8(truncatingIfNeeded: runtime.arrayElement(array, index).asInt32)
+        }
+        return payload.storage[index]
+    }
+
+    static func setBufferByte(_ payload: VMByteBufferPayload, _ runtime: VMRuntime, _ byte: UInt8, at index: Int) {
+        if let array = payload.arrayValue {
+            runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: byte))))
+        } else if index < payload.storage.count {
+            payload.storage[index] = byte
+        }
+    }
+
+    static func bufferUnsigned(_ payload: VMByteBufferPayload, _ runtime: VMRuntime, at index: Int, count: Int) -> UInt64 {
+        var value: UInt64 = 0
+        if payload.bigEndian {
+            for offset in 0..<count {
+                value = (value << 8) | UInt64(bufferByte(payload, runtime, at: index + offset))
+            }
+        } else {
+            for offset in 0..<count {
+                value |= UInt64(bufferByte(payload, runtime, at: index + offset)) << (8 * UInt64(offset))
+            }
+        }
+        return value
+    }
+
+    static func putBufferUnsigned(_ payload: VMByteBufferPayload, _ runtime: VMRuntime, _ value: UInt64, at index: Int, count: Int) {
+        for offset in 0..<count {
+            let shift = payload.bigEndian ? 8 * UInt64(count - 1 - offset) : 8 * UInt64(offset)
+            setBufferByte(payload, runtime, UInt8(truncatingIfNeeded: value >> shift), at: index + offset)
+        }
+    }
+
+    private static func nioClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let order = NativeClass("Ljava/nio/ByteOrder;", superclass: "Ljava/lang/Object;")
+        order.staticField("BIG_ENDIAN", "Ljava/nio/ByteOrder;")
+        order.staticField("LITTLE_ENDIAN", "Ljava/nio/ByteOrder;")
+        order.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Ljava/nio/ByteOrder;", payload: VMByteOrderPayload(bigEndian: true))
+            cls.staticValues[1] = runtime.makeNative("Ljava/nio/ByteOrder;", payload: VMByteOrderPayload(bigEndian: false))
+        }
+        order.staticMethod("nativeOrder", "()Ljava/nio/ByteOrder;") { runtime, _, _ in
+            runtime.makeNative("Ljava/nio/ByteOrder;", payload: VMByteOrderPayload(bigEndian: true))
+        }
+        order.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let bigEndian = runtime.payload(args[0], as: VMByteOrderPayload.self)?.bigEndian ?? true
+            return runtime.newString(bigEndian ? "BIG_ENDIAN" : "LITTLE_ENDIAN")
+        }
+        result.append(order)
+
+        let buffer = NativeClass("Ljava/nio/Buffer;", superclass: "Ljava/lang/Object;")
+        buffer.method("capacity", "()I") { runtime, args, _ in
+            .int32(Int32(try JavaUtil.byteBuffer(runtime, args[0]).capacity))
+        }
+        buffer.method("position", "()I") { runtime, args, _ in
+            .int32(Int32(try JavaUtil.byteBuffer(runtime, args[0]).position))
+        }
+        buffer.method("position", "(I)Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let position = Int(args[1].asInt32)
+            guard position >= 0, position <= payload.limit else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "newPosition \(position), limit \(payload.limit)")
+            }
+            payload.position = position
+            if payload.mark > position { payload.mark = -1 }
+            return args[0]
+        }
+        buffer.method("limit", "()I") { runtime, args, _ in
+            .int32(Int32(try JavaUtil.byteBuffer(runtime, args[0]).limit))
+        }
+        buffer.method("limit", "(I)Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let limit = Int(args[1].asInt32)
+            guard limit >= 0, limit <= payload.capacity else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "newLimit \(limit), capacity \(payload.capacity)")
+            }
+            payload.limit = limit
+            if payload.position > limit { payload.position = limit }
+            if payload.mark > limit { payload.mark = -1 }
+            return args[0]
+        }
+        buffer.method("remaining", "()I") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            return .int32(Int32(max(0, payload.limit - payload.position)))
+        }
+        buffer.method("hasRemaining", "()Z") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            return .boolean(payload.position < payload.limit)
+        }
+        buffer.method("flip", "()Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.limit = payload.position
+            payload.position = 0
+            payload.mark = -1
+            return args[0]
+        }
+        buffer.method("rewind", "()Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.position = 0
+            payload.mark = -1
+            return args[0]
+        }
+        buffer.method("clear", "()Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.position = 0
+            payload.limit = payload.capacity
+            payload.mark = -1
+            return args[0]
+        }
+        buffer.method("mark", "()Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.mark = payload.position
+            return args[0]
+        }
+        buffer.method("reset", "()Ljava/nio/Buffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard payload.mark >= 0 else { throw VMJavaException("Ljava/nio/InvalidMarkException;") }
+            payload.position = payload.mark
+            return args[0]
+        }
+        buffer.method("isReadOnly", "()Z") { runtime, args, _ in
+            .boolean(try JavaUtil.byteBuffer(runtime, args[0]).readOnly)
+        }
+        buffer.method("isDirect", "()Z") { _, _, _ in .boolean(false) }
+        buffer.method("hasArray", "()Z") { runtime, args, _ in
+            .boolean(try JavaUtil.byteBuffer(runtime, args[0]).arrayValue != nil || !(try JavaUtil.byteBuffer(runtime, args[0]).readOnly))
+        }
+        buffer.method("arrayOffset", "()I") { _, _, _ in .int32(0) }
+        result.append(buffer)
+
+        let byteBuffer = NativeClass("Ljava/nio/ByteBuffer;", superclass: "Ljava/nio/Buffer;")
+        byteBuffer.staticMethod("wrap", "([B)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let count = runtime.arrayLength(args[0])
+            return runtime.makeNative(
+                "Ljava/nio/ByteBuffer;",
+                payload: VMByteBufferPayload(array: args[0], capacity: count, offset: 0, length: count)
+            )
+        }
+        byteBuffer.staticMethod("wrap", "([BII)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let capacity = runtime.arrayLength(args[0])
+            let offset = Int(args[1].asInt32)
+            let length = Int(args[2].asInt32)
+            guard offset >= 0, length >= 0, offset <= capacity - length else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "offset \(offset), length \(length), arrayLength \(capacity)")
+            }
+            return runtime.makeNative(
+                "Ljava/nio/ByteBuffer;",
+                payload: VMByteBufferPayload(array: args[0], capacity: capacity, offset: offset, length: length)
+            )
+        }
+        byteBuffer.staticMethod("allocate", "(I)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let capacity = Int(args[0].asInt32)
+            guard capacity >= 0 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "capacity \(capacity)") }
+            return runtime.makeNative("Ljava/nio/ByteBuffer;", payload: VMByteBufferPayload(storage: [UInt8](repeating: 0, count: capacity)))
+        }
+        byteBuffer.method("position", "(I)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let position = Int(args[1].asInt32)
+            guard position >= 0, position <= payload.limit else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "newPosition \(position), limit \(payload.limit)")
+            }
+            payload.position = position
+            if payload.mark > position { payload.mark = -1 }
+            return args[0]
+        }
+        byteBuffer.method("limit", "(I)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let limit = Int(args[1].asInt32)
+            guard limit >= 0, limit <= payload.capacity else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "newLimit \(limit), capacity \(payload.capacity)")
+            }
+            payload.limit = limit
+            if payload.position > limit { payload.position = limit }
+            return args[0]
+        }
+        byteBuffer.method("flip", "()Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.limit = payload.position
+            payload.position = 0
+            payload.mark = -1
+            return args[0]
+        }
+        byteBuffer.method("clear", "()Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.position = 0
+            payload.limit = payload.capacity
+            payload.mark = -1
+            return args[0]
+        }
+        byteBuffer.method("rewind", "()Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.position = 0
+            payload.mark = -1
+            return args[0]
+        }
+        byteBuffer.method("order", "()Ljava/nio/ByteOrder;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            return runtime.makeNative("Ljava/nio/ByteOrder;", payload: VMByteOrderPayload(bigEndian: payload.bigEndian))
+        }
+        byteBuffer.method("order", "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            payload.bigEndian = runtime.payload(args[1], as: VMByteOrderPayload.self)?.bigEndian ?? true
+            return args[0]
+        }
+        byteBuffer.method("array", "()[B") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            if let array = payload.arrayValue { return array }
+            let array = runtime.newArray(component: "B", count: payload.capacity)
+            payload.arrayValue = array
+            for index in 0..<payload.capacity {
+                runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: payload.storage[index]))))
+            }
+            return array
+        }
+        byteBuffer.method("arrayOffset", "()I") { _, _, _ in .int32(0) }
+        byteBuffer.method("get", "()B") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard payload.position < payload.limit else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            let byte = JavaUtil.bufferByte(payload, runtime, at: payload.position)
+            payload.position += 1
+            return .int32(Int32(Int8(bitPattern: byte)))
+        }
+        byteBuffer.method("get", "(I)B") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < payload.limit else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), limit \(payload.limit)") }
+            return .int32(Int32(Int8(bitPattern: JavaUtil.bufferByte(payload, runtime, at: index))))
+        }
+        byteBuffer.method("get", "([B)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let length = runtime.arrayLength(args[1])
+            guard length <= payload.limit - payload.position else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            for index in 0..<length {
+                runtime.setArrayElement(args[1], index: index, value: .int32(Int32(Int8(bitPattern: JavaUtil.bufferByte(payload, runtime, at: payload.position + index)))))
+            }
+            payload.position += length
+            return args[0]
+        }
+        byteBuffer.method("get", "([BII)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let offset = Int(args[2].asInt32)
+            let length = Int(args[3].asInt32)
+            let capacity = runtime.arrayLength(args[1])
+            guard offset >= 0, length >= 0, offset <= capacity - length else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;")
+            }
+            guard length <= payload.limit - payload.position else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            for index in 0..<length {
+                runtime.setArrayElement(args[1], index: offset + index, value: .int32(Int32(Int8(bitPattern: JavaUtil.bufferByte(payload, runtime, at: payload.position + index)))))
+            }
+            payload.position += length
+            return args[0]
+        }
+        byteBuffer.method("getShort", "()S") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard payload.limit - payload.position >= 2 else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            let value = JavaUtil.bufferUnsigned(payload, runtime, at: payload.position, count: 2)
+            payload.position += 2
+            return .int32(Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: value))))
+        }
+        byteBuffer.method("getInt", "()I") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard payload.limit - payload.position >= 4 else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            let value = JavaUtil.bufferUnsigned(payload, runtime, at: payload.position, count: 4)
+            payload.position += 4
+            return .int32(Int32(bitPattern: UInt32(truncatingIfNeeded: value)))
+        }
+        byteBuffer.method("getInt", "(I)I") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, payload.limit - index >= 4 else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            return .int32(Int32(bitPattern: UInt32(truncatingIfNeeded: JavaUtil.bufferUnsigned(payload, runtime, at: index, count: 4))))
+        }
+        byteBuffer.method("getLong", "()J") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard payload.limit - payload.position >= 8 else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            let value = JavaUtil.bufferUnsigned(payload, runtime, at: payload.position, count: 8)
+            payload.position += 8
+            return .int64(Int64(bitPattern: value))
+        }
+        byteBuffer.method("put", "(B)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            guard payload.position < payload.limit else { throw VMJavaException("Ljava/nio/BufferOverflowException;") }
+            JavaUtil.setBufferByte(payload, runtime, UInt8(truncatingIfNeeded: args[1].asInt32), at: payload.position)
+            payload.position += 1
+            return args[0]
+        }
+        byteBuffer.method("put", "(IB)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < payload.limit else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            JavaUtil.setBufferByte(payload, runtime, UInt8(truncatingIfNeeded: args[2].asInt32), at: index)
+            return args[0]
+        }
+        byteBuffer.method("put", "([B)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            let length = runtime.arrayLength(args[1])
+            guard length <= payload.limit - payload.position else { throw VMJavaException("Ljava/nio/BufferOverflowException;") }
+            for index in 0..<length {
+                JavaUtil.setBufferByte(payload, runtime, UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32), at: payload.position + index)
+            }
+            payload.position += length
+            return args[0]
+        }
+        byteBuffer.method("putInt", "(I)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            guard payload.limit - payload.position >= 4 else { throw VMJavaException("Ljava/nio/BufferOverflowException;") }
+            JavaUtil.putBufferUnsigned(payload, runtime, UInt64(UInt32(bitPattern: args[1].asInt32)), at: payload.position, count: 4)
+            payload.position += 4
+            return args[0]
+        }
+        byteBuffer.method("putInt", "(II)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, payload.limit - index >= 4 else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            JavaUtil.putBufferUnsigned(payload, runtime, UInt64(UInt32(bitPattern: args[2].asInt32)), at: index, count: 4)
+            return args[0]
+        }
+        byteBuffer.method("putLong", "(J)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            guard payload.limit - payload.position >= 8 else { throw VMJavaException("Ljava/nio/BufferOverflowException;") }
+            JavaUtil.putBufferUnsigned(payload, runtime, UInt64(bitPattern: args[1].asInt64), at: payload.position, count: 8)
+            payload.position += 8
+            return args[0]
+        }
+        byteBuffer.method("putLong", "(IJ)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, payload.limit - index >= 8 else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            JavaUtil.putBufferUnsigned(payload, runtime, UInt64(bitPattern: args[2].asInt64), at: index, count: 8)
+            return args[0]
+        }
+        byteBuffer.method("putShort", "(S)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            guard payload.limit - payload.position >= 2 else { throw VMJavaException("Ljava/nio/BufferOverflowException;") }
+            JavaUtil.putBufferUnsigned(payload, runtime, UInt64(UInt16(truncatingIfNeeded: args[1].asInt32)), at: payload.position, count: 2)
+            payload.position += 2
+            return args[0]
+        }
+        byteBuffer.method("putShort", "(IS)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            guard !payload.readOnly else { throw VMJavaException("Ljava/nio/ReadOnlyBufferException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, payload.limit - index >= 2 else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            JavaUtil.putBufferUnsigned(payload, runtime, UInt64(UInt16(truncatingIfNeeded: args[2].asInt32)), at: index, count: 2)
+            return args[0]
+        }
+        byteBuffer.method("hasRemaining", "()Z") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            return .boolean(payload.position < payload.limit)
+        }
+        byteBuffer.method("remaining", "()I") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            return .int32(Int32(max(0, payload.limit - payload.position)))
+        }
+        byteBuffer.method("isReadOnly", "()Z") { runtime, args, _ in
+            .boolean(try JavaUtil.byteBuffer(runtime, args[0]).readOnly)
+        }
+        byteBuffer.method("slice", "()Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            if let array = payload.arrayValue {
+                return runtime.makeNative(
+                    "Ljava/nio/ByteBuffer;",
+                    payload: VMByteBufferPayload(array: array, capacity: payload.capacity, offset: payload.position, length: max(0, payload.limit - payload.position))
+                )
+            }
+            let bytes = Array(payload.storage[payload.position..<max(payload.position, payload.limit)])
+            let sliced = VMByteBufferPayload(storage: bytes)
+            sliced.bigEndian = payload.bigEndian
+            return runtime.makeNative("Ljava/nio/ByteBuffer;", payload: sliced)
+        }
+        byteBuffer.method("duplicate", "()Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let payload = try JavaUtil.byteBuffer(runtime, args[0])
+            let copy: VMByteBufferPayload
+            if let array = payload.arrayValue {
+                copy = VMByteBufferPayload(array: array, capacity: payload.capacity, offset: 0, length: payload.capacity)
+            } else {
+                copy = VMByteBufferPayload(storage: payload.storage)
+            }
+            copy.position = payload.position
+            copy.limit = payload.limit
+            copy.bigEndian = payload.bigEndian
+            copy.readOnly = payload.readOnly
+            return runtime.makeNative("Ljava/nio/ByteBuffer;", payload: copy)
+        }
+        result.append(byteBuffer)
+
+        let charBuffer = NativeClass("Ljava/nio/CharBuffer;", superclass: "Ljava/lang/Object;")
+        charBuffer.method("array", "()[C") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMCharBufferPayload.self) else {
+                throw VMJavaException("Ljava/lang/UnsupportedOperationException;")
+            }
+            let array = runtime.newArray(component: "C", count: payload.units.count)
+            for (index, unit) in payload.units.enumerated() {
+                runtime.setArrayElement(array, index: index, value: .int32(Int32(unit)))
+            }
+            return array
+        }
+        charBuffer.method("arrayOffset", "()I") { _, _, _ in .int32(0) }
+        charBuffer.method("hasArray", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCharBufferPayload.self) != nil)
+        }
+        charBuffer.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMCharBufferPayload.self)
+            return runtime.newString(units: payload?.units ?? [])
+        }
+        charBuffer.method("remaining", "()I") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMCharBufferPayload.self)
+            return .int32(Int32(payload?.units.count ?? 0))
+        }
+        result.append(charBuffer)
+
+        result += charsetClasses()
+        return result
+    }
+
+    /// `Charset` itself is registered by `JavaShared` (VMConv) alongside the
+    /// other charset primitives; these are the stream coder classes it hands
+    /// out, which JavaShared does not provide.
+    private static func charsetClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let decoder = NativeClass("Ljava/nio/charset/CharsetDecoder;", superclass: "Ljava/lang/Object;")
+        decoder.method("charset", "()Ljava/nio/charset/Charset;") { runtime, args, _ in
+            let name = runtime.payload(args[0], as: VMCharset.self)?.name ?? "UTF-8"
+            return runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: name))
+        }
+        decoder.method("decode", "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;") { runtime, args, _ in
+            let charset = runtime.payload(args[0], as: VMCharset.self)?.name ?? "UTF-8"
+            let payload = try JavaUtil.byteBuffer(runtime, args[1])
+            guard payload.limit - payload.position >= 0 else { throw VMJavaException("Ljava/nio/BufferUnderflowException;") }
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(payload.limit - payload.position)
+            for index in payload.position..<payload.limit {
+                bytes.append(JavaUtil.bufferByte(payload, runtime, at: index))
+            }
+            payload.position = payload.limit
+            let text = runtime.decode(bytes: bytes, charset: charset)
+            return runtime.makeNative("Ljava/nio/CharBuffer;", payload: VMCharBufferPayload(units: Array(text.utf16)))
+        }
+        decoder.method("onMalformedInput", "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;") { _, args, _ in args[0] }
+        decoder.method("onUnmappableCharacter", "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;") { _, args, _ in args[0] }
+        decoder.method("reset", "()Ljava/nio/charset/CharsetDecoder;") { _, args, _ in args[0] }
+        result.append(decoder)
+
+        let encoder = NativeClass("Ljava/nio/charset/CharsetEncoder;", superclass: "Ljava/lang/Object;")
+        encoder.method("charset", "()Ljava/nio/charset/Charset;") { runtime, args, _ in
+            let name = runtime.payload(args[0], as: VMCharset.self)?.name ?? "UTF-8"
+            return runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: name))
+        }
+        encoder.method("encode", "(Ljava/nio/CharBuffer;)Ljava/nio/ByteBuffer;") { runtime, args, _ in
+            let charset = runtime.payload(args[0], as: VMCharset.self)?.name ?? "UTF-8"
+            let text = String(decoding: runtime.payload(args[1], as: VMCharBufferPayload.self)?.units ?? [], as: UTF16.self)
+            let bytes = runtime.encode(text, charset: charset)
+            let buffer = runtime.makeNative("Ljava/nio/ByteBuffer;", payload: VMByteBufferPayload(storage: bytes))
+            if let payload = runtime.payload(buffer, as: VMByteBufferPayload.self) {
+                payload.position = 0
+                payload.limit = bytes.count
+            }
+            return buffer
+        }
+        encoder.method("reset", "()Ljava/nio/charset/CharsetEncoder;") { _, args, _ in args[0] }
+        result.append(encoder)
+        return result
+    }
+
+    static func canonicalCharset(_ text: String) -> String? {
+        switch text.uppercased() {
+        case "UTF-8", "UTF8", "UNICODE-1-1-UTF-8": return "UTF-8"
+        case "UTF-16", "UTF16": return "UTF-16"
+        case "UTF-16BE": return "UTF-16BE"
+        case "UTF-16LE": return "UTF-16LE"
+        case "ISO-8859-1", "ISO8859-1", "ISO8859_1", "LATIN1", "L1": return "ISO-8859-1"
+        case "US-ASCII", "ASCII", "ANSI_X3.4-1968": return "US-ASCII"
+        default: return nil
+        }
+    }
+
+    // MARK: - java.text.Normalizer
+
+    private static func normalizerClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let form = NativeClass("Ljava/text/Normalizer$Form;", superclass: "Ljava/lang/Object;")
+        for name in ["NFD", "NFC", "NFKD", "NFKC"] {
+            form.staticField(name, "Ljava/text/Normalizer$Form;")
+        }
+        form.prepare = { runtime, cls in
+            for (index, name) in ["NFD", "NFC", "NFKD", "NFKC"].enumerated() {
+                cls.staticValues[index] = runtime.makeNative("Ljava/text/Normalizer$Form;", payload: name)
+            }
+        }
+        form.method("name", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: String.self) ?? "")
+        }
+        form.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: String.self) ?? "")
+        }
+        result.append(form)
+
+        let normalizer = NativeClass("Ljava/text/Normalizer;", superclass: "Ljava/lang/Object;")
+        normalizer.staticMethod("normalize", "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;") { runtime, args, _ in
+            let text = runtime.stringValue(runtime.javaToString(args[0])) ?? ""
+            let formName = runtime.payload(args[1], as: String.self) ?? "NFC"
+            return runtime.newString(normalize(text, form: formName))
+        }
+        normalizer.staticMethod("isNormalized", "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Z") { runtime, args, _ in
+            let text = runtime.stringValue(runtime.javaToString(args[0])) ?? ""
+            let formName = runtime.payload(args[1], as: String.self) ?? "NFC"
+            return .boolean(normalize(text, form: formName) == text)
+        }
+        result.append(normalizer)
+        return result
+    }
+
+    static func normalize(_ text: String, form: String) -> String {
+        switch form.uppercased() {
+        case "NFD": return text.decomposedStringWithCanonicalMapping
+        case "NFKD": return text.decomposedStringWithCompatibilityMapping
+        case "NFKC": return text.precomposedStringWithCompatibilityMapping
+        default: return text.precomposedStringWithCanonicalMapping
+        }
+    }
+
+    // MARK: - java.util.zip
+
+    private static func zipClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let inflater = NativeClass("Ljava/util/zip/Inflater;", superclass: "Ljava/lang/Object;")
+        inflater.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMInflaterPayload(nowrap: false))
+            return .zero
+        }
+        inflater.method("<init>", "(Z)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMInflaterPayload(nowrap: args[1].asBoolean))
+            return .zero
+        }
+        inflater.method("setInput", "([B)V") { runtime, args, _ in
+            try setInflaterInput(runtime, args[0], array: args[1], offset: 0, length: runtime.arrayLength(args[1]))
+            return .zero
+        }
+        inflater.method("setInput", "([BII)V") { runtime, args, _ in
+            try setInflaterInput(runtime, args[0], array: args[1], offset: Int(args[2].asInt32), length: Int(args[3].asInt32))
+            return .zero
+        }
+        inflater.method("inflate", "([B)I") { runtime, args, _ in
+            try inflate(runtime, args[0], into: args[1], offset: 0, length: runtime.arrayLength(args[1]))
+        }
+        inflater.method("inflate", "([BII)I") { runtime, args, _ in
+            try inflate(runtime, args[0], into: args[1], offset: Int(args[2].asInt32), length: Int(args[3].asInt32))
+        }
+        inflater.method("finished", "()Z") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMInflaterPayload.self) else { return .boolean(false) }
+            return .boolean(payload.finished)
+        }
+        inflater.method("needsInput", "()Z") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMInflaterPayload.self) else { return .boolean(true) }
+            return .boolean(payload.needsInput)
+        }
+        inflater.method("getRemaining", "()I") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMInflaterPayload.self) else { return .int32(0) }
+            return .int32(Int32(payload.input.count))
+        }
+        inflater.method("getBytesRead", "()J") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMInflaterPayload.self) else { return .int64(0) }
+            return .int64(Int64(payload.bytesRead))
+        }
+        inflater.method("getBytesWritten", "()J") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMInflaterPayload.self) else { return .int64(0) }
+            return .int64(Int64(payload.bytesWritten))
+        }
+        inflater.method("end", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMInflaterPayload(nowrap: false, ended: true))
+            return .zero
+        }
+        inflater.method("reset", "()V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMInflaterPayload.self) else { return .zero }
+            payload.output = nil
+            payload.outOffset = 0
+            payload.finished = false
+            return .zero
+        }
+        inflater.method("setDictionary", "([B)V") { _, _, _ in .zero }
+        inflater.method("getAdler", "()I") { _, _, _ in .int32(1) }
+        result.append(inflater)
+
+        for descriptor in ["Ljava/util/zip/GZIPInputStream;"] {
+            let gzip = NativeClass(descriptor, superclass: "Ljava/io/InputStream;")
+            gzip.method("<init>", "(Ljava/io/InputStream;)V") { runtime, args, _ in
+                try gunzip(runtime, into: args[0], from: args[1])
+                return .zero
+            }
+            gzip.method("<init>", "(Ljava/io/InputStream;I)V") { runtime, args, _ in
+                try gunzip(runtime, into: args[0], from: args[1])
+                return .zero
+            }
+            gzip.method("read", "()I") { runtime, args, _ in
+                guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(-1) }
+                return .int32(JavaUtil.streamByte(payload))
+            }
+            gzip.method("close", "()V") { _, _, _ in .zero }
+            result.append(gzip)
+        }
+
+        let zipEntry = NativeClass("Ljava/util/zip/ZipEntry;", superclass: "Ljava/lang/Object;")
+        zipEntry.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: MihonZIPEntry.self)?.name ?? "")
+        }
+        zipEntry.method("getSize", "()J") { runtime, args, _ in
+            .int64(Int64(runtime.payload(args[0], as: MihonZIPEntry.self)?.uncompressedSize ?? -1))
+        }
+        zipEntry.method("getCompressedSize", "()J") { runtime, args, _ in
+            .int64(Int64(runtime.payload(args[0], as: MihonZIPEntry.self)?.compressedSize ?? -1))
+        }
+        zipEntry.method("getMethod", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: MihonZIPEntry.self)?.method ?? 0))
+        }
+        zipEntry.method("getTime", "()J") { _, _, _ in .int64(0) }
+        zipEntry.method("isDirectory", "()Z") { runtime, args, _ in
+            .boolean((runtime.payload(args[0], as: MihonZIPEntry.self)?.name ?? "").hasSuffix("/"))
+        }
+        zipEntry.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: MihonZIPEntry.self)?.name ?? "")
+        }
+        result.append(zipEntry)
+
+        let zipInput = NativeClass("Ljava/util/zip/ZipInputStream;", superclass: "Ljava/io/InputStream;")
+        zipInput.method("<init>", "(Ljava/io/InputStream;)V") { runtime, args, _ in
+            let data = remainingData(runtime, args[1]) ?? Data()
+            guard let archive = try? MihonZIPArchive(data: data) else {
+                throw VMJavaException("Ljava/util/zip/ZipException;", "invalid zip stream")
+            }
+            runtime.setPayload(args[0], VMZipInputStreamPayload(archive: archive))
+            return .zero
+        }
+        zipInput.method("getNextEntry", "()Ljava/util/zip/ZipEntry;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMZipInputStreamPayload.self) else { return .null }
+            guard payload.index + 1 < payload.archive.entries.count else {
+                payload.index = payload.archive.entries.count
+                return .null
+            }
+            payload.index += 1
+            let entry = payload.archive.entries[payload.index]
+            let data = (try? payload.archive.data(for: entry.name)) ?? Data()
+            payload.stream = VMInputStreamPayload(data)
+            return runtime.makeNative("Ljava/util/zip/ZipEntry;", payload: entry)
+        }
+        zipInput.method("read", "()I") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMZipInputStreamPayload.self),
+                  let stream = payload.stream else { return .int32(-1) }
+            return .int32(JavaUtil.streamByte(stream))
+        }
+        zipInput.method("read", "([BII)I") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMZipInputStreamPayload.self),
+                  let stream = payload.stream else { return .int32(-1) }
+            return .int32(Int32(JavaUtil.readBytes(runtime, payload: stream, into: args[1], offset: Int(args[2].asInt32), count: Int(args[3].asInt32))))
+        }
+        zipInput.method("available", "()I") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMZipInputStreamPayload.self),
+                  let stream = payload.stream else { return .int32(0) }
+            return .int32(Int32(max(0, stream.data.count - stream.offset)))
+        }
+        zipInput.method("close", "()V") { _, _, _ in .zero }
+        zipInput.method("closeEntry", "()V") { _, _, _ in .zero }
+        result.append(zipInput)
+        return result
+    }
+
+    static func setInflaterInput(_ runtime: VMRuntime, _ receiver: VMValue, array: VMValue, offset: Int, length: Int) throws {
+        guard let payload = runtime.payload(receiver, as: VMInflaterPayload.self) else {
+            throw VMJavaException("Ljava/lang/NullPointerException;")
+        }
+        let total = runtime.arrayLength(array)
+        guard offset >= 0, length >= 0, offset <= total - length else {
+            throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;")
+        }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(length)
+        for index in 0..<length {
+            bytes.append(UInt8(truncatingIfNeeded: runtime.arrayElement(array, offset + index).asInt32))
+        }
+        payload.input = bytes
+        payload.needsInput = false
+        payload.output = nil
+        payload.outOffset = 0
+        payload.finished = false
+    }
+
+    static func inflate(_ runtime: VMRuntime, _ receiver: VMValue, into destination: VMValue, offset: Int, length: Int) throws -> VMValue {
+        guard let payload = runtime.payload(receiver, as: VMInflaterPayload.self) else {
+            throw VMJavaException("Ljava/lang/NullPointerException;")
+        }
+        let capacity = runtime.arrayLength(destination)
+        guard offset >= 0, length >= 0, offset <= capacity - length else {
+            throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;")
+        }
+        if payload.ended { throw VMJavaException("Ljava/lang/NullPointerException;", "Inflater ended") }
+        if payload.output == nil {
+            guard !payload.input.isEmpty else { return .int32(0) }
+            var start = 0
+            if !payload.nowrap {
+                let bytes = payload.input
+                guard bytes.count >= 2, bytes[0] & 0x0F == 8, (Int(bytes[0]) << 8 | Int(bytes[1])) % 31 == 0 else {
+                    throw VMJavaException("Ljava/util/zip/DataFormatException;", "incorrect header check")
+                }
+                start = 2
+                if bytes[1] & 0x20 != 0 { start += 4 }
+            }
+            do {
+                let result = try MihonInflate.decompress(
+                    payload.input,
+                    startOffset: start,
+                    outputLimit: 64 * 1024 * 1024
+                )
+                payload.output = result.bytes
+                payload.outOffset = 0
+                payload.bytesRead = result.endOffset
+                payload.bytesWritten = result.bytes.count - start
+            } catch {
+                throw VMJavaException("Ljava/util/zip/DataFormatException;", "invalid deflate stream")
+            }
+        }
+        let available = max(0, (payload.output?.count ?? 0) - payload.outOffset)
+        let count = min(length, available)
+        if let output = payload.output {
+            for index in 0..<count {
+                runtime.setArrayElement(
+                    destination,
+                    index: offset + index,
+                    value: .int32(Int32(Int8(bitPattern: output[payload.outOffset + index])))
+                )
+            }
+        }
+        payload.outOffset += count
+        if payload.outOffset >= (payload.output?.count ?? 0) {
+            payload.finished = true
+        }
+        return .int32(Int32(count))
+    }
+
+    static func remainingData(_ runtime: VMRuntime, _ stream: VMValue) -> Data? {
+        if let payload = runtime.inputStreamPayload(stream) {
+            guard payload.offset < payload.data.count else { return Data() }
+            return Data(payload.data.dropFirst(payload.offset))
+        }
+        return runtime.payload(stream, as: Data.self)
+    }
+
+    /// One byte from an `InputStream` payload (`-1` at end of stream).
+    static func streamByte(_ payload: VMInputStreamPayload) -> Int32 {
+        guard payload.offset < payload.data.count else { return -1 }
+        let byte = payload.data[payload.data.startIndex + payload.offset]
+        payload.offset += 1
+        return Int32(byte)
+    }
+
+    static func gunzip(_ runtime: VMRuntime, into receiver: VMValue, from source: VMValue) throws {
+        guard let data = remainingData(runtime, source) else {
+            throw VMJavaException("Ljava/io/IOException;", "no input stream")
+        }
+        guard MihonGzip.isGzip(data), let inflated = try? MihonGzip.decompress(data) else {
+            throw VMJavaException("Ljava/util/zip/ZipException;", "Not in GZIP format")
+        }
+        runtime.setPayload(receiver, VMInputStreamPayload(inflated))
+    }
+
+    // MARK: - java.lang.ref
+
+    private static func referenceClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let reference = NativeClass("Ljava/lang/ref/Reference;", superclass: "Ljava/lang/Object;")
+        reference.method("get", "()Ljava/lang/Object;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMReferencePayload.self)?.value ?? .null
+        }
+        reference.method("clear", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMReferencePayload.self)?.value = .null
+            return .zero
+        }
+        reference.method("isEnqueued", "()Z") { _, _, _ in .boolean(false) }
+        result.append(reference)
+        for descriptor in ["Ljava/lang/ref/WeakReference;", "Ljava/lang/ref/SoftReference;"] {
+            let cls = NativeClass(descriptor, superclass: "Ljava/lang/ref/Reference;")
+            cls.method("<init>", "(Ljava/lang/Object;)V") { runtime, args, _ in
+                runtime.setPayload(args[0], VMReferencePayload(value: args[1]))
+                return .zero
+            }
+            cls.method("<init>", "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V") { runtime, args, _ in
+                runtime.setPayload(args[0], VMReferencePayload(value: args[1]))
+                return .zero
+            }
+            result.append(cls)
+        }
+        result.append(NativeClass("Ljava/lang/ref/ReferenceQueue;", superclass: "Ljava/lang/Object;"))
+        return result
+    }
+
+    // MARK: - java.util.Base64
+
+    private static func base64Classes() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let base64 = NativeClass("Ljava/util/Base64;", superclass: "Ljava/lang/Object;")
+        for (name, signature, urlSafe) in [
+            ("getDecoder", "()Ljava/util/Base64$Decoder;", false),
+            ("getUrlDecoder", "()Ljava/util/Base64$Decoder;", true),
+        ] {
+            base64.staticMethod(name, signature) { runtime, _, _ in
+                runtime.makeNative("Ljava/util/Base64$Decoder;", payload: VMBase64Payload(urlSafe: urlSafe, padded: true))
+            }
+        }
+        for (name, signature, urlSafe) in [
+            ("getEncoder", "()Ljava/util/Base64$Encoder;", false),
+            ("getUrlEncoder", "()Ljava/util/Base64$Encoder;", true),
+        ] {
+            base64.staticMethod(name, signature) { runtime, _, _ in
+                runtime.makeNative("Ljava/util/Base64$Encoder;", payload: VMBase64Payload(urlSafe: urlSafe, padded: true))
+            }
+        }
+        result.append(base64)
+
+        let decoder = NativeClass("Ljava/util/Base64$Decoder;", superclass: "Ljava/lang/Object;")
+        decoder.method("decode", "(Ljava/lang/String;)[B") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMBase64Payload.self) ?? VMBase64Payload(urlSafe: false, padded: true)
+            let text = runtime.stringValue(args[1]) ?? ""
+            guard let bytes = decodeBase64(text, urlSafe: payload.urlSafe) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Illegal base64 character")
+            }
+            return JavaUtil.byteArray(Data(bytes), runtime: runtime)
+        }
+        decoder.method("decode", "([B)[B") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMBase64Payload.self) ?? VMBase64Payload(urlSafe: false, padded: true)
+            let text = String(decoding: JavaUtil.data(from: args[1], runtime: runtime, offset: 0, count: runtime.arrayLength(args[1])), as: UTF8.self)
+            guard let bytes = decodeBase64(text, urlSafe: payload.urlSafe) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Illegal base64 character")
+            }
+            return JavaUtil.byteArray(Data(bytes), runtime: runtime)
+        }
+        result.append(decoder)
+
+        let encoder = NativeClass("Ljava/util/Base64$Encoder;", superclass: "Ljava/lang/Object;")
+        encoder.method("encodeToString", "([B)Ljava/lang/String;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMBase64Payload.self) ?? VMBase64Payload(urlSafe: false, padded: true)
+            let bytes = JavaUtil.data(from: args[1], runtime: runtime, offset: 0, count: runtime.arrayLength(args[1]))
+            return runtime.newString(encodeBase64([UInt8](bytes), urlSafe: payload.urlSafe, padded: payload.padded))
+        }
+        encoder.method("encode", "([B)[B") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMBase64Payload.self) ?? VMBase64Payload(urlSafe: false, padded: true)
+            let bytes = JavaUtil.data(from: args[1], runtime: runtime, offset: 0, count: runtime.arrayLength(args[1]))
+            let text = encodeBase64([UInt8](bytes), urlSafe: payload.urlSafe, padded: payload.padded)
+            return JavaUtil.byteArray(Data(text.utf8), runtime: runtime)
+        }
+        encoder.method("withoutPadding", "()Ljava/util/Base64$Encoder;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMBase64Payload.self) ?? VMBase64Payload(urlSafe: false, padded: true)
+            return runtime.makeNative("Ljava/util/Base64$Encoder;", payload: VMBase64Payload(urlSafe: payload.urlSafe, padded: false))
+        }
+        encoder.method("withPadding", "(I)Ljava/util/Base64$Encoder;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMBase64Payload.self) ?? VMBase64Payload(urlSafe: false, padded: true)
+            return runtime.makeNative("Ljava/util/Base64$Encoder;", payload: VMBase64Payload(urlSafe: payload.urlSafe, padded: true))
+        }
+        result.append(encoder)
+        return result
+    }
+
+    static func encodeBase64(_ bytes: [UInt8], urlSafe: Bool, padded: Bool) -> String {
+        var text = Data(bytes).base64EncodedString()
+        if urlSafe {
+            text = text.replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+        }
+        if !padded {
+            while text.hasSuffix("=") { text.removeLast() }
+        }
+        return text
+    }
+
+    static func decodeBase64(_ text: String, urlSafe: Bool) -> [UInt8]? {
+        var value = text
+        if urlSafe {
+            value = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        }
+        while value.count % 4 != 0 { value += "=" }
+        guard let data = Data(base64Encoded: value) else { return nil }
+        return [UInt8](data)
+    }
+
+    // MARK: - java.util.UUID / Random / TreeMap / Properties
+
+    private static func identityClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let uuid = NativeClass("Ljava/util/UUID;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Comparable;", "Ljava/io/Serializable;"])
+        uuid.staticMethod("randomUUID", "()Ljava/util/UUID;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/UUID;", payload: VMUuidPayload(uuid: Foundation.UUID()))
+        }
+        uuid.staticMethod("fromString", "(Ljava/lang/String;)Ljava/util/UUID;") { runtime, args, _ in
+            let text = runtime.stringValue(args[0]) ?? ""
+            guard let parsed = Foundation.UUID(uuidString: text) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Invalid UUID string: \(text)")
+            }
+            return runtime.makeNative("Ljava/util/UUID;", payload: VMUuidPayload(uuid: parsed))
+        }
+        uuid.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString((runtime.payload(args[0], as: VMUuidPayload.self)?.uuid.uuidString ?? "").lowercased())
+        }
+        uuid.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/util/UUID;" else { return .boolean(false) }
+            return .boolean(runtime.payload(args[0], as: VMUuidPayload.self)?.uuid == runtime.payload(args[1], as: VMUuidPayload.self)?.uuid)
+        }
+        uuid.method("hashCode", "()I") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUuidPayload.self) else { return .int32(0) }
+            return .int32(Int32(truncatingIfNeeded: payload.mostSignificantBits ^ payload.leastSignificantBits))
+        }
+        uuid.method("getMostSignificantBits", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMUuidPayload.self)?.mostSignificantBits ?? 0)
+        }
+        uuid.method("getLeastSignificantBits", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMUuidPayload.self)?.leastSignificantBits ?? 0)
+        }
+        uuid.method("compareTo", "(Ljava/util/UUID;)I") { runtime, args, _ in
+            let left: VMUuidPayload? = runtime.payload(args[0], as: VMUuidPayload.self)
+            let right: VMUuidPayload? = runtime.payload(args[1], as: VMUuidPayload.self)
+            let l = left?.mostSignificantBits ?? 0, r = right?.mostSignificantBits ?? 0
+            if l != r { return .int32(l < r ? -1 : 1) }
+            let ll = left?.leastSignificantBits ?? 0, rl = right?.leastSignificantBits ?? 0
+            return .int32(ll != rl && ll < rl ? -1 : (ll != rl ? 1 : 0))
+        }
+        result.append(uuid)
+
+        let random = NativeClass("Ljava/util/Random;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Serializable;"])
+        random.method("<init>", "()V") { runtime, args, _ in
+            let seed = UInt64(Date().timeIntervalSince1970 * 1000) ^ DispatchTime.now().uptimeNanoseconds
+            runtime.setPayload(args[0], VMRandomPayload(seed: seed))
+            return .zero
+        }
+        random.method("<init>", "(J)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMRandomPayload(seed: UInt64(bitPattern: args[1].asInt64)))
+            return .zero
+        }
+        random.method("setSeed", "(J)V") { runtime, args, _ in
+            let payload = try JavaUtil.mutableRandom(runtime, args[0])
+            payload.seed(UInt64(bitPattern: args[1].asInt64))
+            return .zero
+        }
+        random.method("nextInt", "()I") { runtime, args, _ in
+            .int32(Int32(bitPattern: UInt32(truncatingIfNeeded: try JavaUtil.mutableRandom(runtime, args[0]).next(32))))
+        }
+        random.method("nextInt", "(I)I") { runtime, args, _ in
+            let bound = Int(args[1].asInt32)
+            guard bound > 0 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "bound must be positive") }
+            return .int32(Int32(try JavaUtil.mutableRandom(runtime, args[0]).next(31) % UInt64(bound)))
+        }
+        random.method("nextLong", "()J") { runtime, args, _ in
+            .int64(Int64(bitPattern: try JavaUtil.mutableRandom(runtime, args[0]).next(64)))
+        }
+        random.method("nextBoolean", "()Z") { runtime, args, _ in
+            .boolean((try JavaUtil.mutableRandom(runtime, args[0]).next(1)) == 1)
+        }
+        random.method("nextDouble", "()D") { runtime, args, _ in
+            .double(Double(try JavaUtil.mutableRandom(runtime, args[0]).next(53)) / 9007199254740992.0)
+        }
+        random.method("nextFloat", "()F") { runtime, args, _ in
+            .float(Float(try JavaUtil.mutableRandom(runtime, args[0]).next(24)) / 16777216.0)
+        }
+        random.method("nextGaussian", "()D") { runtime, args, _ in
+            let payload = try JavaUtil.mutableRandom(runtime, args[0])
+            let u1 = max(Double(payload.next(53)) / 9007199254740992.0, 1e-12)
+            let u2 = Double(payload.next(53)) / 9007199254740992.0
+            return .double((-2 * log(u1)).squareRoot() * cos(2 * Double.pi * u2))
+        }
+        random.method("nextBytes", "([B)V") { runtime, args, _ in
+            let payload = try JavaUtil.mutableRandom(runtime, args[0])
+            for index in 0..<runtime.arrayLength(args[1]) {
+                runtime.setArrayElement(args[1], index: index, value: .int32(Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: payload.next(8))))))
+            }
+            return .zero
+        }
+        result.append(random)
+        return result
+    }
+
+    static func mutableRandom(_ runtime: VMRuntime, _ value: VMValue) throws -> VMRandomPayload {
+        guard let payload = runtime.payload(value, as: VMRandomPayload.self) else {
+            throw VMJavaException("Ljava/lang/NullPointerException;")
+        }
+        return payload
+    }
+
+    // MARK: - java.util.TreeMap
+
+    private static func sortedMapClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+        let treeMap = NativeClass("Ljava/util/TreeMap;", superclass: "Ljava/util/AbstractMap;", interfaces: ["Ljava/util/Map;"])
+        treeMap.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMTreeMapPayload())
+            return .zero
+        }
+        treeMap.method("<init>", "(Ljava/util/Comparator;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMTreeMapPayload(comparator: args[1]))
+            return .zero
+        }
+        treeMap.method("<init>", "(Ljava/util/Map;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMTreeMapPayload(entries: runtime.mapPayload(args[1])?.entries ?? []))
+            return .zero
+        }
+        mapMethods(treeMap)
+
+        func tree(_ runtime: VMRuntime, _ value: VMValue) throws -> VMTreeMapPayload {
+            guard let payload = runtime.payload(value, as: VMTreeMapPayload.self) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            return payload
+        }
+        treeMap.method("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            if let index = map.entries.firstIndex(where: { JavaUtil.treeOrder(map, runtime, $0.key, args[1]) == 0 }) {
+                let previous = map.entries[index].value
+                map.entries[index].value = args[2]
+                return previous
+            }
+            map.entries.append((args[1], args[2]))
+            map.entries.sort { JavaUtil.treeOrder(map, runtime, $0.key, $1.key) < 0 }
+            return .null
+        }
+        treeMap.method("get", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            for entry in map.entries where JavaUtil.treeOrder(map, runtime, entry.key, args[1]) == 0 {
+                return entry.value
+            }
+            return .null
+        }
+        treeMap.method("containsKey", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return .boolean(map.entries.contains { JavaUtil.treeOrder(map, runtime, $0.key, args[1]) == 0 })
+        }
+        treeMap.method("firstKey", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let first = try tree(runtime, args[0]).entries.first else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;")
+            }
+            return first.key
+        }
+        treeMap.method("lastKey", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let last = try tree(runtime, args[0]).entries.last else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;")
+            }
+            return last.key
+        }
+        treeMap.method("comparator", "()Ljava/util/Comparator;") { runtime, args, _ in
+            try tree(runtime, args[0]).comparator
+        }
+        treeMap.method("keySet", "()Ljava/util/Set;") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(map.entries.map(\.key), immutable: true))
+        }
+        treeMap.method("entrySet", "()Ljava/util/Set;") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            return runtime.makeNative("Ljava/util/EntrySet;", payload: VMEntrySetPayload(entries: map.entries, owner: map))
+        }
+        treeMap.method("headMap", "(Ljava/lang/Object;)Ljava/util/Map;") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            let entries = map.entries.filter { JavaUtil.treeOrder(map, runtime, $0.key, args[1]) < 0 }
+            return runtime.makeNative("Ljava/util/TreeMap;", payload: VMTreeMapPayload(entries: entries, comparator: map.comparator))
+        }
+        treeMap.method("tailMap", "(Ljava/lang/Object;)Ljava/util/Map;") { runtime, args, _ in
+            let map = try tree(runtime, args[0])
+            let entries = map.entries.filter { JavaUtil.treeOrder(map, runtime, $0.key, args[1]) >= 0 }
+            return runtime.makeNative("Ljava/util/TreeMap;", payload: VMTreeMapPayload(entries: entries, comparator: map.comparator))
+        }
+        result.append(treeMap)
+
+        let reversed = NativeClass("Lmihoncompat/ReversedComparator;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/Comparator;"])
+        reversed.method("compare", "(Ljava/lang/Object;Ljava/lang/Object;)I") { runtime, args, _ in
+            let delegate = runtime.payload(args[0], as: VMValue.self) ?? .null
+            guard delegate.bits != 0, let method = runtime.classOf(delegate)?.lookupVirtual(key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I") else {
+                return .int32(0)
+            }
+            let order = try runtime.invoke(method, [delegate, args[1], args[2]])
+            return .int32(-order.asInt32)
+        }
+        reversed.method("toString", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("reversed") }
+        result.append(reversed)
+        return result
+    }
+
+    static func treeOrder(_ map: VMTreeMapPayload, _ runtime: VMRuntime, _ left: VMValue, _ right: VMValue) -> Int32 {
+        if map.comparator.bits != 0,
+           let method = runtime.classOf(map.comparator)?.lookupVirtual(key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I") {
+            return (try? runtime.invoke(method, [map.comparator, left, right]))?.asInt32 ?? 0
+        }
+        if runtime.javaEquals(left, right) { return 0 }
+        return runtime.naturalCompare(left, right)
+    }
+
+    // MARK: - java.util.Properties
+
+    private static func propertiesClass() -> [NativeClass] {
+        let cls = NativeClass("Ljava/util/Properties;", superclass: "Ljava/util/AbstractMap;", interfaces: ["Ljava/util/Map;"])
+        cls.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMMapPayload())
+            return .zero
+        }
+        cls.method("<init>", "(Ljava/util/Properties;)V") { runtime, args, _ in
+            let defaults = runtime.mapPayload(args[1])?.entries ?? []
+            runtime.setPayload(args[0], VMMapPayload(defaults))
+            return .zero
+        }
+        cls.method("getProperty", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let map = runtime.mapPayload(args[0]) else { return .null }
+            for entry in map.entries where runtime.javaEquals(entry.key, args[1]) {
+                if let text = runtime.stringValue(entry.value) { return runtime.newString(text) }
+                return .null
+            }
+            return .null
+        }
+        cls.method("getProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            guard let map = runtime.mapPayload(args[0]) else { return args[2] }
+            for entry in map.entries where runtime.javaEquals(entry.key, args[1]) {
+                if let text = runtime.stringValue(entry.value) { return runtime.newString(text) }
+            }
+            return args[2]
+        }
+        cls.method("setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;") { runtime, args, _ in
+            guard args[1].bits != 0, args[2].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let map = try runtime.mutableMap(args[0])
+            for index in map.entries.indices where runtime.javaEquals(map.entries[index].key, args[1]) {
+                let previous = map.entries[index].value
+                map.entries[index].value = args[2]
+                return previous
+            }
+            map.entries.append((args[1], args[2]))
+            return .null
+        }
+        cls.method("stringPropertyNames", "()Ljava/util/Set;") { runtime, args, _ in
+            let map = runtime.mapPayload(args[0])
+            let names = (map?.entries ?? []).compactMap { entry -> VMValue? in
+                guard runtime.stringValue(entry.key) != nil, runtime.stringValue(entry.value) != nil else { return nil }
+                return entry.key
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(names))
+        }
+        mapMethods(cls)
+        return [cls]
     }
 
     private static func ioClasses() -> [NativeClass] {
@@ -2009,6 +3441,21 @@ enum JavaUtil {
         inputStream.method("available", "()I") { runtime, args, _ in
             guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(0) }
             return .int32(Int32(max(0, payload.data.count - payload.offset)))
+        }
+        inputStream.method("readNBytes", "(I)[B") { runtime, args, _ in
+            let requested = Int(args[1].asInt32)
+            guard requested >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "len < 0")
+            }
+            guard let payload = runtime.inputStreamPayload(args[0]) else {
+                return byteArray(Data(), runtime: runtime)
+            }
+            let available = max(0, payload.data.count - payload.offset)
+            let count = min(requested, available)
+            let start = payload.data.startIndex + payload.offset
+            let chunk = Data(payload.data[start..<(start + count)])
+            payload.offset += count
+            return byteArray(chunk, runtime: runtime)
         }
         inputStream.method("close", "()V") { _, _, _ in .zero }
         inputStream.method("mark", "(I)V") { runtime, args, _ in
@@ -2220,6 +3667,129 @@ final class VMStringJoinerPayload {
     init(separator: String) { self.separator = separator }
 }
 
+final class VMByteOrderPayload {
+    let bigEndian: Bool
+    init(bigEndian: Bool) { self.bigEndian = bigEndian }
+}
+
+/// `java.nio.ByteBuffer` state over either a Java `byte[]` (wrap keeps the
+/// backing array live) or a Swift buffer (`allocate`).
+final class VMByteBufferPayload {
+    var arrayValue: VMValue?
+    var storage: [UInt8]
+    var capacity: Int
+    var position: Int
+    var limit: Int
+    var mark = -1
+    var bigEndian = true
+    var readOnly = false
+
+    init(storage: [UInt8]) {
+        self.storage = storage
+        self.capacity = storage.count
+        self.position = 0
+        self.limit = storage.count
+    }
+
+    init(array: VMValue, capacity: Int, offset: Int, length: Int) {
+        self.arrayValue = array
+        self.storage = []
+        self.capacity = capacity
+        self.position = offset
+        self.limit = offset + length
+    }
+}
+
+final class VMCharBufferPayload {
+    var units: [UInt16]
+    init(units: [UInt16]) { self.units = units }
+}
+
+final class VMReferencePayload {
+    var value: VMValue
+    init(value: VMValue) { self.value = value }
+}
+
+final class VMBase64Payload {
+    let urlSafe: Bool
+    let padded: Bool
+    init(urlSafe: Bool, padded: Bool) {
+        self.urlSafe = urlSafe
+        self.padded = padded
+    }
+}
+
+final class VMUuidPayload {
+    let uuid: Foundation.UUID
+
+    init(uuid: Foundation.UUID) { self.uuid = uuid }
+
+    private var parts: (UInt64, UInt64) {
+        let hex = uuid.uuidString.replacingOccurrences(of: "-", with: "")
+        let first = UInt64(hex.prefix(16), radix: 16) ?? 0
+        let second = UInt64(hex.suffix(16), radix: 16) ?? 0
+        return (first, second)
+    }
+
+    var mostSignificantBits: Int64 { Int64(bitPattern: parts.0) }
+    var leastSignificantBits: Int64 { Int64(bitPattern: parts.1) }
+}
+
+/// Deterministic PRNG state. `java.util.Random` only promises a specific
+/// sequence for a given seed in its own implementation; extensions use it for
+/// nonces and shuffles, so a stable SplitMix64 is enough and never repeats a
+/// seed-dependent sequence between runs.
+final class VMRandomPayload {
+    private var state: UInt64
+
+    init(seed: UInt64) { state = seed }
+
+    func seed(_ value: UInt64) { state = value }
+
+    func next(_ bits: Int) -> UInt64 {
+        state = state &+ 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        z = z ^ (z >> 31)
+        return bits >= 64 ? z : (z >> UInt64(64 - bits))
+    }
+}
+
+final class VMTreeMapPayload: VMMapPayload {
+    var comparator: VMValue
+
+    init(entries: [(key: VMValue, value: VMValue)] = [], comparator: VMValue = .null) {
+        self.comparator = comparator
+        super.init(entries)
+    }
+}
+
+final class VMInflaterPayload {
+    let nowrap: Bool
+    var ended: Bool
+    var input: [UInt8] = []
+    var output: [UInt8]?
+    var outOffset = 0
+    var needsInput = true
+    var finished = false
+    var bytesRead = 0
+    var bytesWritten = 0
+
+    init(nowrap: Bool, ended: Bool = false) {
+        self.nowrap = nowrap
+        self.ended = ended
+    }
+}
+
+final class VMZipInputStreamPayload {
+    let archive: MihonZIPArchive
+    var index = -1
+    var stream: VMInputStreamPayload?
+
+    init(archive: MihonZIPArchive) { self.archive = archive }
+}
+
 final class VMEntrySetPayload {
     private let snapshot: [(key: VMValue, value: VMValue)]
     var owner: VMMapPayload?
@@ -2281,5 +3851,16 @@ extension VMRuntime {
         let created = VMByteArrayOutputStreamPayload()
         setPayload(value, created)
         return created
+    }
+
+    /// A `java.util.Locale` with both slots filled. `localeValue(code:)` in
+    /// VMConv only carries the language (that is all `Locale.getDefault` ever
+    /// needs); the JDK constants also fix a country.
+    func localeValue(language: String, country: String) -> VMValue {
+        guard let cls = findClass("Ljava/util/Locale;") else { return .null }
+        let pointer = allocateObject(cls)
+        VMObjectLayout.slot(pointer, 0).pointee = newString(language.lowercased())
+        VMObjectLayout.slot(pointer, 1).pointee = newString(country.uppercased())
+        return .reference(pointer)
     }
 }
