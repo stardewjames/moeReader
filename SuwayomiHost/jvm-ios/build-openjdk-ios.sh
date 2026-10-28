@@ -42,16 +42,19 @@ if [ ! -f "build/$CONF/spec.gmk" ]; then
   mkdir -p build
   until mkdir build/.configure.lock 2>/dev/null; do sleep 2; done
   trap 'rmdir build/.configure.lock 2>/dev/null || true' EXIT
-  bash configure \
-    --with-conf-name="$CONF" \
-    --with-boot-jdk="$JAVA_HOME" \
-    --openjdk-target=aarch64-macos-ios \
-    --with-sysroot="$SYSROOT" \
-    --with-libffi-include="$FFI/include/ffi" \
-    --with-libffi-lib="$FFI" \
-    --with-cups-include="$(xcrun --sdk macosx --show-sdk-path)/usr/include" \
-    --disable-warnings-as-errors \
-    "${EXTRA[@]}"
+  run_configure() {
+    bash configure \
+      --with-conf-name="$CONF" \
+      --with-boot-jdk="$JAVA_HOME" \
+      --openjdk-target=aarch64-macos-ios \
+      --with-sysroot="$SYSROOT" \
+      --with-libffi-include="$FFI/include/ffi" \
+      --with-libffi-lib="$FFI" \
+      --with-cups-include="$(xcrun --sdk macosx --show-sdk-path)/usr/include" \
+      --disable-warnings-as-errors "$@"
+  }
+  # macOS ships bash 3.2, where "${EXTRA[@]}" on an empty array trips set -u.
+  if [ ${#EXTRA[@]} -gt 0 ]; then run_configure "${EXTRA[@]}"; else run_configure; fi
   rmdir build/.configure.lock
   trap - EXIT
 fi

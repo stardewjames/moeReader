@@ -140,7 +140,7 @@ On a Mac with Xcode 26 and GNU make 4 (`brew install autoconf make`):
 
 ```bash
 cd SuwayomiHost/jvm-ios
-export JAVA_HOME=$(/usr/libexec/java_home -v 26)   # boot JDK; the build is JDK 27
+export JAVA_HOME=$(/usr/libexec/java_home -v 26)   # boot JDK; the build is JDK 28
 ./fetch-openjdk.sh                 # pinned openjdk/mobile + libffi (SHA-256 pinned)
 ./build-openjdk-macos.sh           # jmod/jlink of the same source (required by jlink)
 ./build-openjdk-ios.sh iphoneos    # and/or iphonesimulator

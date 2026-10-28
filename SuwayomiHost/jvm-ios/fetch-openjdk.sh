@@ -15,7 +15,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 W="$HERE/work"
 
 MOBILE_REPO=https://github.com/openjdk/mobile.git
-MOBILE_COMMIT="${MOBILE_COMMIT:-c1ed06aaef34c8dccf71e236d1ffa20918a77cfb}" # 2026-07-30, JDK 27
+MOBILE_COMMIT="${MOBILE_COMMIT:-c1ed06aaef34c8dccf71e236d1ffa20918a77cfb}" # 2026-07-30, JDK 28
 
 FFI_DEVICE_URL=https://github.com/openjdk-mobile/ios-tools/releases/download/libffi-build/libffi-ios.zip
 FFI_DEVICE_SHA=4f39fd1d53fbd69d1bdbd915413077d130daa3f6792d1b3a03a690a9cbd4dea3

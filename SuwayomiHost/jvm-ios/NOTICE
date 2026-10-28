@@ -2,7 +2,7 @@ OpenJDK Mobile / HotSpot Zero runtime
 
 The iOS runtime is built from OpenJDK Mobile:
   https://github.com/openjdk/mobile
-  commit pinned by fetch-openjdk.sh (JDK 27)
+  commit pinned by fetch-openjdk.sh (JDK 28)
 
 - libjvm.a is HotSpot Zero (interpreter only), distributed under the GNU
   General Public License version 2 only, without the Classpath Exception.

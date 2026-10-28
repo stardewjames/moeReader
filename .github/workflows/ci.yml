@@ -39,7 +39,7 @@ jobs:
       - name: Refresh the cached runtime
         if: steps.jvm.outputs.cache-hit == 'true'
         run: HOST_ONLY=1 SKIP_HOST_BUILD=1 SuwayomiHost/jvm-ios/package.sh
-      # The iOS cross build needs the JDK 26 boot JDK (the build itself is 27).
+      # The iOS cross build needs the JDK 26 boot JDK (the build itself is 28).
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
