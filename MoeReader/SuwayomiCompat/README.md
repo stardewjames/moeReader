@@ -113,8 +113,9 @@ lib/                       java.home of the static VM (HotSpot derives <bundle>/
 `SuwayomiHost/jvm-ios/package.sh` writes it under
 `SuwayomiHost/build/runtime/ios/` together with `jvm.xcconfig`, which
 `Suwayomi.xcconfig` includes when present. Without it the app builds as usual
-and Settings shows the backend as unavailable in that build. CI builds and
-caches it (`.github/workflows/ci.yml`).
+and Settings shows the backend as unavailable in that build. CI reuses a
+previously compiled VM whenever the VM's own build inputs are unchanged and
+only re-packages it (`.github/workflows/ci.yml`).
 
 For desktop and Linux hosts, `SUWAYOMI_RUNTIME_DIR` points at a directory with
 the same layout (`./gradlew :host:desktopRuntime`) and `SUWAYOMI_LIBJVM` at a

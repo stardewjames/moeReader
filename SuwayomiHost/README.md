@@ -176,9 +176,24 @@ flags only for packaged SDKs and disables dead stripping only for those SDKs.
 Without the package (or for an SDK whose VM was not built), the app still
 builds and the backend reports itself unavailable.
 
-CI builds the VM on a cache miss (keyed by `jvm-ios/**` and the HotSpot
-options), using JDK 26 as the boot JDK, and otherwise refreshes only the host
-jar and options. A cold build takes tens of minutes.
+CI separates compiling the VM from packaging it. `archive-build.py` tars the
+compiled output (`fetch-openjdk.sh`, `build-openjdk-macos.sh` and
+`build-openjdk-ios.sh` results) into
+`SuwayomiHost/build/hotspot-zero-ios.tar.gz`, which CI caches under a key
+derived only from those three scripts, and uploads as the
+`suwayomi-hotspot-zero-ios` artifact on a cache miss. Every run then extracts
+it and runs `package.sh`, so a host-jar, `jvm-options` or packaging change
+skips the cross build and only re-packages. A cold build takes tens of
+minutes; a re-package takes minutes. `JVM_CACHE_VERSION` in the workflow
+forces a cold rebuild; `workflow_dispatch` runs the job on demand, and the
+artifact is the copy that outlives the cache's one-week eviction window.
+
+Restore the artifact into a checkout and package it by hand with:
+
+```bash
+tar -xzf suwayomi-hotspot-zero-ios.tar.gz -C SuwayomiHost/jvm-ios
+SKIP_HOST_BUILD=1 SuwayomiHost/jvm-ios/package.sh
+```
 
 Not verified from this repository's development host (Windows, no Mac): the
 OpenJDK Mobile build, the app link and the VM on a device or simulator.

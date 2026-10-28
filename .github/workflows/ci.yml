@@ -1,13 +1,17 @@
 name: CI
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+env:
+  # Bump when the compiled HotSpot Zero output itself must change but no input
+  # below it did; it turns every runner's cached build into a cold one.
+  JVM_CACHE_VERSION: 1
 jobs:
   build:
     runs-on: macos-26
     # A cold OpenJDK Mobile (HotSpot Zero) build for iOS takes most of this;
-    # cached runs take minutes.
+    # a cached one only runs package.sh, which takes minutes.
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
@@ -30,19 +34,23 @@ jobs:
       - name: Build the host jar on JDK 21
         working-directory: SuwayomiHost
         run: ./gradlew --console=plain -q :host:shadowJar
-      # The VM part of the runtime only changes with jvm-ios/ and the HotSpot
-      # options; the host jar is refreshed even when the VM cache hits.
-      - name: Restore the Suwayomi runtime
+      # Only the sources and scripts that compile the VM are in this key. The
+      # host jar, jvm-options/openjdk.options and package.sh are packaging
+      # inputs: changing them re-runs package.sh against these same binaries.
+      - name: Restore compiled HotSpot Zero
         id: jvm
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
-          path: SuwayomiHost/build/runtime/ios
-          key: suwayomi-openjdk-ios-${{ hashFiles('SuwayomiHost/jvm-ios/fetch-openjdk.sh', 'SuwayomiHost/jvm-ios/build-openjdk-macos.sh', 'SuwayomiHost/jvm-ios/build-openjdk-ios.sh', 'SuwayomiHost/jvm-ios/package.sh', 'SuwayomiHost/jvm-options/openjdk.options') }}
-      - name: Refresh the cached runtime
+          # The archive, not jvm-ios/work: the build tree holds gigabytes of
+          # intermediates that package.sh never reads.
+          path: SuwayomiHost/build/hotspot-zero-ios.tar.gz
+          key: hotspot-zero-ios-${{ env.JVM_CACHE_VERSION }}-${{ hashFiles('SuwayomiHost/jvm-ios/fetch-openjdk.sh', 'SuwayomiHost/jvm-ios/build-openjdk-macos.sh', 'SuwayomiHost/jvm-ios/build-openjdk-ios.sh') }}
+      - name: Extract compiled HotSpot Zero
         if: steps.jvm.outputs.cache-hit == 'true'
-        run: HOST_ONLY=1 SKIP_HOST_BUILD=1 SuwayomiHost/jvm-ios/package.sh
+        run: tar -xzf SuwayomiHost/build/hotspot-zero-ios.tar.gz -C SuwayomiHost/jvm-ios
       # The iOS cross build needs the JDK 26 boot JDK (the build itself is 28).
       - uses: actions/setup-java@v5
+        if: steps.jvm.outputs.cache-hit != 'true'
         with:
           distribution: temurin
           java-version: "26"
@@ -54,7 +62,25 @@ jobs:
           ./fetch-openjdk.sh
           ./build-openjdk-macos.sh
           ./build-openjdk-ios.sh iphoneos
-          SKIP_HOST_BUILD=1 ./package.sh
+      - name: Archive the compiled HotSpot Zero build
+        if: steps.jvm.outputs.cache-hit != 'true'
+        run: python3 SuwayomiHost/jvm-ios/archive-build.py SuwayomiHost/build/hotspot-zero-ios.tar.gz
+      - uses: actions/cache/save@v5
+        if: steps.jvm.outputs.cache-hit != 'true'
+        with:
+          path: SuwayomiHost/build/hotspot-zero-ios.tar.gz
+          key: ${{ steps.jvm.outputs.cache-primary-key }}
+      # The cache is evicted when unused for a week; the artifact is the
+      # downloadable copy of the same binaries.
+      - uses: actions/upload-artifact@v7
+        if: steps.jvm.outputs.cache-hit != 'true'
+        with:
+          name: suwayomi-hotspot-zero-ios
+          path: SuwayomiHost/build/hotspot-zero-ios.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+      - name: Package the Suwayomi runtime
+        run: SKIP_HOST_BUILD=1 SuwayomiHost/jvm-ios/package.sh
       - run: ./scripts/build_ipa.sh
       - uses: actions/upload-artifact@v7
         with:
