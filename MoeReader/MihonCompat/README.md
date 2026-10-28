@@ -234,9 +234,12 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   built on Linux) passes 129 tests with no failures.
 - A live harness sweep of the 35 most-downloaded lib-1.6 extensions runs load,
   popular (both pages), latest, both search modes, details, chapters and pages:
-  25 of the 35 end `RESULT OK`, up from 2 in the original baseline. The rest
-  stop at browser-check interstitials (some served as a plain 403 to a headless
-  client) or at JavaScriptCore on a headless host.
+  25 of the 35 end `RESULT OK` on the extension's default host, and 27 when a
+  source's user-selectable mirror preference is pointed at its other entry,
+  up from 2 in the original baseline. The rest stop at browser-check
+  interstitials (some served as a plain 403 to a headless client), at a
+  JavaScriptCore-backed page decoder on a headless host, or at a filter path
+  the extension itself restricts to non-empty queries.
 - The static audit (runtime registry dump fed to `SiteTests/harness/audit.py`)
   reports zero missing host classes, methods, fields or supertypes across the
   same 35 APKs.
