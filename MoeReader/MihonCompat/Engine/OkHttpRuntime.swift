@@ -70,12 +70,88 @@ final class VMHttpUrlPayload {
     var host: String { components.host ?? "" }
     var scheme: String { components.scheme ?? "https" }
     var port: Int { components.port ?? (scheme == "https" ? 443 : 80) }
+    /// OkHttp keeps the path percent-encoded; `encodedPath` returns it verbatim.
+    var encodedPath: String {
+        let path = components.percentEncodedPath
+        return path.isEmpty ? "/" : path
+    }
     var pathSegments: [String] {
         (components.path.split(separator: "/", omittingEmptySubsequences: true)).map(String.init)
     }
+    var encodedPathSegments: [String] {
+        (components.percentEncodedPath.split(separator: "/", omittingEmptySubsequences: true)).map(String.init)
+    }
     var queryNames: [String] { (components.queryItems ?? []).map(\.name) }
+    var rawQuery: String? {
+        guard let query = components.percentEncodedQuery, !query.isEmpty else { return nil }
+        return query
+    }
     func queryParameter(_ name: String) -> String? {
         components.queryItems?.first { $0.name == name }?.value
+    }
+    func queryParameterValues(_ name: String) -> [String] {
+        (components.queryItems ?? []).filter { $0.name == name }.map { $0.value ?? "" }
+    }
+    /// Query pairs split from the raw text so an empty value stays distinguishable.
+    static func queryPairs(_ query: String?) -> [(name: String, value: String, encoded: String)] {
+        guard let query, !query.isEmpty else { return [] }
+        return query.split(separator: "&", omittingEmptySubsequences: true).map { pair in
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let rawName = String(parts[0])
+            let rawValue = parts.count > 1 ? String(parts[1]) : ""
+            return (
+                Self.percentDecode(rawName),
+                Self.percentDecode(rawValue),
+                pair.description
+            )
+        }
+    }
+
+    static func percentDecode(_ text: String) -> String {
+        text.contains("%") ? (text.removingPercentEncoding ?? text) : text
+    }
+    /// OkHttp canonicalises query names and values with this set left unescaped.
+    static func queryEncode(_ text: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~!$'()*,;:@/?")
+        return text.addingPercentEncoding(withAllowedCharacters: allowed) ?? text
+    }
+
+    /// `URLComponents` traps on any character it considers invalid for a
+    /// percent-encoded component. OkHttp accepts raw text, so escape everything
+    /// outside the RFC 3986 set (keeping valid `%XX` escapes intact) before
+    /// handing a string to Foundation. `query: true` also allows `?`.
+    static func sanitizedEncoded(_ text: String, query: Bool = false) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~!$&'()*+,;=:@/")
+        if query { allowed.insert(charactersIn: "?") }
+        let characters = Array(text)
+        var output = ""
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            if character == "%" {
+                let valid = index + 2 < characters.count
+                    && characters[index + 1].isHexDigit
+                    && characters[index + 2].isHexDigit
+                if valid {
+                    output.append("%")
+                    index += 1
+                    continue
+                }
+                output += "%25"
+                index += 1
+                continue
+            }
+            if character.isASCII, let scalar = character.unicodeScalars.first, allowed.contains(scalar) {
+                output.append(character)
+                index += 1
+                continue
+            }
+            output += String(character).addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            index += 1
+        }
+        return output
     }
 }
 
@@ -87,6 +163,88 @@ final class VMCallPayload {
         self.request = request
         self.client = client
     }
+}
+
+/// Cookie storage shared with `android.webkit.CookieManager`. Foundation on
+/// Linux never persists `Set-Cookie` from URLSession into
+/// `HTTPCookieStorage`, so the engine applies OkHttp's `CookieJar` contract
+/// itself against the host's storage.
+enum VMCookieJar {
+    static func cookies(storage: HTTPCookieStorage, for url: URL) -> [HTTPCookie] {
+        (storage.cookies ?? []).filter { matches($0, url) }
+    }
+
+    /// RFC 6265 domain/path matching as OkHttp implements it for `Cookie.matches`.
+    static func matches(_ cookie: HTTPCookie, _ url: URL) -> Bool {
+        guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
+        var domain = cookie.domain.lowercased()
+        if domain.hasPrefix(".") { domain.removeFirst() }
+        guard !domain.isEmpty else { return false }
+        guard host == domain || host.hasSuffix("." + domain) else { return false }
+        let path = cookie.path.isEmpty ? "/" : cookie.path
+        let requestPath = url.path.isEmpty ? "/" : url.path
+        if requestPath != path, !requestPath.hasPrefix(path.hasSuffix("/") ? path : path + "/") { return false }
+        if cookie.isSecure, url.scheme?.lowercased() != "https" { return false }
+        if let expires = cookie.expiresDate, expires <= Date() { return false }
+        return true
+    }
+
+    static func store(headers: [(String, String)], for urlString: String, storage: HTTPCookieStorage) {
+        guard let url = URL(string: urlString) else { return }
+        for (name, value) in headers where name.caseInsensitiveCompare("Set-Cookie") == .orderedSame {
+            for chunk in splitSetCookie(value) {
+                WebKitRuntime.storeCookie(storage, header: chunk, for: url)
+            }
+        }
+    }
+
+    /// Foundation merges several `Set-Cookie` values into one comma-joined
+    /// string; a comma only separates cookies when a new `name=` follows it
+    /// (`Expires` dates also contain commas).
+    static func splitSetCookie(_ value: String) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        let characters = Array(value)
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            current.append(character)
+            if character == "," {
+                var cursor = index + 1
+                while cursor < characters.count, characters[cursor] == " " { cursor += 1 }
+                var nameEnd = cursor
+                while nameEnd < characters.count, characters[nameEnd] != "=", !characters[nameEnd].isWhitespace,
+                      characters[nameEnd] != ";" {
+                    nameEnd += 1
+                }
+                if nameEnd < characters.count, characters[nameEnd] == "=", nameEnd > cursor {
+                    parts.append(current)
+                    current = ""
+                }
+            }
+            index += 1
+        }
+        if !current.isEmpty { parts.append(current) }
+        return parts
+    }
+
+    static func header(_ cookies: [HTTPCookie]) -> String {
+        cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+}
+
+/// `okhttp3.Cookie` as extensions touch it: parse a header value for a URL and
+/// read the fields back.
+struct VMCookiePayload {
+    var name: String
+    var value: String
+    var domain: String
+    var path: String
+    var expiresAt: Int64
+    var secure = false
+    var httpOnly = false
+    var hostOnly = true
+    var persistent = false
 }
 
 final class VMResponsePayload {
@@ -151,10 +309,52 @@ final class VMChainPayload {
     }
 }
 
+/// `okhttp3.Dispatcher` settings; the host performs requests synchronously, so
+/// only the configured limits are observable.
+final class VMDispatchPayload {
+    var maxRequests = 64
+    var maxRequestsPerHost = 5
+}
+
 final class VMCacheControlPayload {
     var maxAgeSeconds: Int = -1
+    var sMaxAgeSeconds: Int = -1
+    var maxStaleSeconds: Int = -1
+    var minFreshSeconds: Int = -1
     var noCache = false
+    var noStore = false
+    var noTransform = false
+    var onlyIfCached = false
+    var isPrivate = false
+    var isPublic = false
     var immutable = false
+    /// `CacheControl.parse(Headers)` / `Request.cacheControl` semantics.
+    static func parse(_ header: String?) -> VMCacheControlPayload {
+        let payload = VMCacheControlPayload()
+        guard let header, !header.isEmpty else { return payload }
+        for raw in header.split(separator: ",") {
+            let directive = raw.trimmingCharacters(in: .whitespaces).lowercased()
+            switch true {
+            case directive == "no-cache": payload.noCache = true
+            case directive == "no-store": payload.noStore = true
+            case directive == "no-transform": payload.noTransform = true
+            case directive == "only-if-cached": payload.onlyIfCached = true
+            case directive == "private": payload.isPrivate = true
+            case directive == "public": payload.isPublic = true
+            case directive == "immutable": payload.immutable = true
+            case directive.hasPrefix("max-age="):
+                payload.maxAgeSeconds = Int(directive.dropFirst("max-age=".count)) ?? -1
+            case directive.hasPrefix("s-maxage="):
+                payload.sMaxAgeSeconds = Int(directive.dropFirst("s-maxage=".count)) ?? -1
+            case directive.hasPrefix("max-stale"):
+                payload.maxStaleSeconds = Int(directive.split(separator: "=").last ?? "") ?? 0
+            case directive.hasPrefix("min-fresh="):
+                payload.minFreshSeconds = Int(directive.dropFirst("min-fresh=".count)) ?? -1
+            default: break
+            }
+        }
+        return payload
+    }
 }
 
 final class VMMediaTypePayload {
@@ -185,6 +385,7 @@ enum OkHttpRuntime {
         result += mediaTypeClasses()
         result += bodyClasses()
         result += compressionClasses()
+        result += cookieClasses()
         result += miscClasses()
         return result
     }
@@ -338,7 +539,11 @@ enum OkHttpRuntime {
             }
         }
         request.method("cacheControl", "()Lokhttp3/CacheControl;") { runtime, args, _ in
-            runtime.payload(args[0], as: VMRequestPayload.self)?.cacheControl ?? .null
+            guard let payload = runtime.payload(args[0], as: VMRequestPayload.self) else { return .null }
+            if payload.cacheControl.bits != 0 { return payload.cacheControl }
+            // OkHttp computes this lazily from the header; it is never null.
+            let parsed = VMCacheControlPayload.parse(payload.headers.value("Cache-Control"))
+            return runtime.makeNative("Lokhttp3/CacheControl;", payload: parsed)
         }
         request.method("newBuilder", "()Lokhttp3/Request$Builder;") { runtime, args, _ in
             let payload: VMRequestPayload? = runtime.payload(args[0], as: VMRequestPayload.self)
@@ -477,7 +682,89 @@ enum OkHttpRuntime {
             .int32(Int32(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.port ?? 443))
         }
         url.method("encodedPath", "()Ljava/lang/String;") { runtime, args, _ in
-            runtime.newString(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.components.path ?? "/")
+            runtime.newString(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.encodedPath ?? "/")
+        }
+        url.method("pathSize", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.pathSegments.count ?? 0))
+        }
+        url.method("encodedPathSegments", "()Ljava/util/List;") { runtime, args, _ in
+            let segments = (runtime.payload(args[0], as: VMHttpUrlPayload.self)?.encodedPathSegments ?? []).map { runtime.newString($0) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(segments, immutable: true))
+        }
+        url.method("query", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let query = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery else { return .null }
+            return runtime.newString(VMHttpUrlPayload.percentDecode(query))
+        }
+        url.method("encodedQuery", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let query = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery else { return .null }
+            return runtime.newString(query)
+        }
+        url.method("fragment", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let fragment = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.components.percentEncodedFragment else { return .null }
+            return runtime.newString(VMHttpUrlPayload.percentDecode(fragment))
+        }
+        url.method("encodedFragment", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let fragment = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.components.percentEncodedFragment else { return .null }
+            return runtime.newString(fragment)
+        }
+        url.method("querySize", "()I") { runtime, args, _ in
+            guard let query = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery else { return .int32(0) }
+            return .int32(Int32(VMHttpUrlPayload.queryPairs(query).count))
+        }
+        url.method("queryParameterNames", "()Ljava/util/Set;") { runtime, args, _ in
+            let query = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery
+            var seen = Set<String>()
+            var names: [VMValue] = []
+            for pair in VMHttpUrlPayload.queryPairs(query) where seen.insert(pair.name).inserted {
+                names.append(runtime.newString(pair.name))
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(names))
+        }
+        url.method("queryParameterValues", "(Ljava/lang/String;)Ljava/util/List;") { runtime, args, _ in
+            let name = runtime.stringValue(args[1]) ?? ""
+            let query = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery
+            let values = VMHttpUrlPayload.queryPairs(query).filter { $0.name == name }.map { runtime.newString($0.value) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values, immutable: true))
+        }
+        url.method("queryParameterName", "(I)Ljava/lang/String;") { runtime, args, _ in
+            let pairs = VMHttpUrlPayload.queryPairs(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery)
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < pairs.count else { return .null }
+            return runtime.newString(pairs[index].name)
+        }
+        url.method("queryParameterValue", "(I)Ljava/lang/String;") { runtime, args, _ in
+            let pairs = VMHttpUrlPayload.queryPairs(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.rawQuery)
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < pairs.count else { return .null }
+            return runtime.newString(pairs[index].value)
+        }
+        url.method("isHttps", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.scheme == "https")
+        }
+        url.method("username", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.components.user ?? "")
+        }
+        url.method("password", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: VMHttpUrlPayload.self)?.components.password ?? "")
+        }
+        url.method("resolve", "(Ljava/lang/String;)Lokhttp3/HttpUrl;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMHttpUrlPayload.self),
+                  let base = URL(string: payload.string),
+                  let link = runtime.stringValue(args[1]),
+                  let resolved = URL(string: link, relativeTo: base),
+                  let parsed = VMHttpUrlPayload.parse(resolved.absoluteString) else { return .null }
+            return runtime.makeNative("Lokhttp3/HttpUrl;", payload: parsed)
+        }
+        url.method("redact", "()Lokhttp3/HttpUrl;") { runtime, args, _ in
+            args[0]
+        }
+        url.method("hashCode", "()I") { runtime, args, _ in
+            .int32(Int32(truncatingIfNeeded: runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string.hashValue ?? 0))
+        }
+        url.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let lhs = runtime.payload(args[0], as: VMHttpUrlPayload.self)?.string ?? ""
+            let rhs = runtime.payload(args[1], as: VMHttpUrlPayload.self)?.string ?? ""
+            return .boolean(lhs == rhs)
         }
         url.method("pathSegments", "()Ljava/util/List;") { runtime, args, _ in
             let segments = (runtime.payload(args[0], as: VMHttpUrlPayload.self)?.pathSegments ?? []).map { runtime.newString($0) }
@@ -528,6 +815,128 @@ enum OkHttpRuntime {
             var items = (payload.components.queryItems ?? []).filter { $0.name != name }
             items.append(URLQueryItem(name: name, value: runtime.stringValue(args[2])))
             payload.components.queryItems = items
+            return args[0]
+        }
+        builder.method("addEncodedQueryParameter", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let name = runtime.stringValue(args[1]) ?? ""
+            let value = runtime.stringValue(args[2]) ?? ""
+            var query = payload.components.percentEncodedQuery ?? ""
+            let pair = value.isEmpty ? name : "\(name)=\(value)"
+            query = query.isEmpty ? pair : query + "&" + pair
+            payload.components.percentEncodedQuery = VMHttpUrlPayload.sanitizedEncoded(query, query: true)
+            return args[0]
+        }
+        builder.method("removeAllQueryParameters", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let name = runtime.stringValue(args[1]) ?? ""
+            let encoded = VMHttpUrlPayload.queryEncode(name)
+            let remaining = (payload.components.percentEncodedQuery ?? "")
+                .split(separator: "&", omittingEmptySubsequences: true)
+                .filter { pair in
+                    let raw = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                    return VMHttpUrlPayload.percentDecode(String(raw[0])) != name && String(raw[0]) != encoded
+                }
+                .map(String.init)
+            payload.components.percentEncodedQuery = remaining.isEmpty ? nil : remaining.joined(separator: "&")
+            return args[0]
+        }
+        builder.method("removeAllEncodedQueryParameters", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let name = runtime.stringValue(args[1]) ?? ""
+            let remaining = (payload.components.percentEncodedQuery ?? "")
+                .split(separator: "&", omittingEmptySubsequences: true)
+                .filter { pair in
+                    String(pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)[0]) != name
+                }
+                .map(String.init)
+            payload.components.percentEncodedQuery = remaining.isEmpty ? nil : remaining.joined(separator: "&")
+            return args[0]
+        }
+        builder.method("query", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let query = runtime.stringValue(args[1]) ?? ""
+            payload.components.percentEncodedQuery = query.isEmpty ? nil : VMHttpUrlPayload.sanitizedEncoded(VMHttpUrlPayload.queryEncode(query), query: true)
+            return args[0]
+        }
+        builder.method("encodedQuery", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let query = runtime.stringValue(args[1]) ?? ""
+            payload.components.percentEncodedQuery = query.isEmpty ? nil : VMHttpUrlPayload.sanitizedEncoded(query, query: true)
+            return args[0]
+        }
+        builder.method("fragment", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            guard let fragment = runtime.stringValue(args[1]) else {
+                payload.components.percentEncodedFragment = nil
+                return args[0]
+            }
+            payload.components.percentEncodedFragment = VMHttpUrlPayload.queryEncode(fragment)
+            return args[0]
+        }
+        builder.method("encodedFragment", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            payload.components.percentEncodedFragment = runtime.stringValue(args[1]).map { VMHttpUrlPayload.sanitizedEncoded($0, query: true) }
+            return args[0]
+        }
+        builder.method("host", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            payload.components.host = runtime.stringValue(args[1])
+            return args[0]
+        }
+        builder.method("scheme", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            payload.components.scheme = runtime.stringValue(args[1])?.lowercased()
+            return args[0]
+        }
+        builder.method("port", "(I)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            payload.components.port = Int(args[1].asInt32)
+            return args[0]
+        }
+        builder.method("encodedPath", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            var path = runtime.stringValue(args[1]) ?? "/"
+            if !path.hasPrefix("/") { path = "/" + path }
+            payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded(path)
+            return args[0]
+        }
+        builder.method("addEncodedPathSegment", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            var path = payload.components.percentEncodedPath
+            if !path.hasSuffix("/") { path += "/" }
+            path += runtime.stringValue(args[1]) ?? ""
+            payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded(path)
+            return args[0]
+        }
+        builder.method("addEncodedPathSegments", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            var path = payload.components.percentEncodedPath
+            if !path.hasSuffix("/") { path += "/" }
+            path += runtime.stringValue(args[1]) ?? ""
+            payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded(path)
+            return args[0]
+        }
+        builder.method("setPathSegment", "(ILjava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let index = Int(args[1].asInt32)
+            var segments = payload.encodedPathSegments
+            guard index >= 0, index < segments.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "path segment index \(index)")
+            }
+            segments[index] = runtime.stringValue(args[2]) ?? ""
+            payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded("/" + segments.joined(separator: "/"))
+            return args[0]
+        }
+        builder.method("setEncodedPathSegment", "(ILjava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
+            let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
+            let index = Int(args[1].asInt32)
+            var segments = payload.encodedPathSegments
+            guard index >= 0, index < segments.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "path segment index \(index)")
+            }
+            segments[index] = runtime.stringValue(args[2]) ?? ""
+            payload.components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded("/" + segments.joined(separator: "/"))
             return args[0]
         }
         builder.method("build", "()Lokhttp3/HttpUrl;") { runtime, args, _ in
@@ -603,6 +1012,15 @@ enum OkHttpRuntime {
         response.method("request", "()Lokhttp3/Request;") { runtime, args, _ in
             runtime.payload(args[0], as: VMResponsePayload.self)?.request ?? .null
         }
+        response.method("protocol", "()Lokhttp3/Protocol;") { runtime, _, _ in
+            runtime.makeNative("Lokhttp3/Protocol;", payload: NSNull())
+        }
+        response.method("peekBody", "(J)Lokhttp3/ResponseBody;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMResponsePayload.self) else { return .null }
+            let limit = Int(max(0, args[1].asInt64))
+            let data = payload.body.count > limit ? payload.body.prefix(limit) : payload.body[...]
+            return runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: Data(data), contentType: payload.contentType))
+        }
         response.method("close", "()V") { _, _, _ in .zero }
         response.method("newBuilder", "()Lokhttp3/Response$Builder;") { runtime, args, _ in
             let payload = runtime.payload(args[0], as: VMResponsePayload.self)
@@ -656,6 +1074,7 @@ enum OkHttpRuntime {
             payload.contentType = body?.contentType
             return args[0]
         }
+        builder.method("protocol", "(Lokhttp3/Protocol;)Lokhttp3/Response$Builder;") { _, args, _ in args[0] }
         builder.method("request", "(Lokhttp3/Request;)Lokhttp3/Response$Builder;") { runtime, args, _ in
             try runtime.payloadBox(args[0], as: VMResponsePayload.self).request = args[1]
             return args[0]
@@ -680,6 +1099,12 @@ enum OkHttpRuntime {
             builder.interceptors = payload?.interceptors ?? []
             builder.networkInterceptors = payload?.networkInterceptors ?? []
             return runtime.makeNative("Lokhttp3/OkHttpClient$Builder;", payload: builder)
+        }
+        client.method("cookieJar", "()Lokhttp3/CookieJar;") { runtime, _, _ in
+            runtime.makeNative("Lokhttp3/CookieJar;", payload: NSNull())
+        }
+        client.method("dispatcher", "()Lokhttp3/Dispatcher;") { runtime, _, _ in
+            runtime.makeNative("Lokhttp3/Dispatcher;", payload: VMDispatchPayload())
         }
         client.method("interceptors", "()Ljava/util/List;") { runtime, args, _ in
             let payload = runtime.payload(args[0], as: VMClientPayload.self)
@@ -717,7 +1142,12 @@ enum OkHttpRuntime {
             for signature in ["(J)Lokhttp3/OkHttpClient$Builder;", "(JLjava/util/concurrent/TimeUnit;)Lokhttp3/OkHttpClient$Builder;"] {
                 builder.method(name, signature) { _, args, _ in args[0] }
             }
+            // Kotlin `Duration` parameter: inline class mangled name, nanos.
+            builder.method(name + "-LRDsOJo", "(J)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         }
+        builder.method("dispatcher", "(Lokhttp3/Dispatcher;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("cookieJar", "(Lokhttp3/CookieJar;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("cache", "(Lokhttp3/Cache;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("followRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("followSslRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("retryOnConnectionFailure", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
@@ -728,7 +1158,45 @@ enum OkHttpRuntime {
             result.networkInterceptors = payload?.networkInterceptors ?? []
             return runtime.makeNative("Lokhttp3/OkHttpClient;", payload: result)
         }
-        return [client, builder]
+
+        let dispatcher = NativeClass("Lokhttp3/Dispatcher;", superclass: "Ljava/lang/Object;")
+        dispatcher.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMDispatchPayload())
+            return .zero
+        }
+        dispatcher.method("setMaxRequests", "(I)V") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMDispatchPayload.self).maxRequests = Int(args[1].asInt32)
+            return .zero
+        }
+        dispatcher.method("getMaxRequests", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMDispatchPayload.self)?.maxRequests ?? 64))
+        }
+        dispatcher.method("setMaxRequestsPerHost", "(I)V") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMDispatchPayload.self).maxRequestsPerHost = Int(args[1].asInt32)
+            return .zero
+        }
+        dispatcher.method("getMaxRequestsPerHost", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMDispatchPayload.self)?.maxRequestsPerHost ?? 5))
+        }
+        dispatcher.method("queuedCalls", "()Ljava/util/List;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+        }
+        dispatcher.method("runningCalls", "()Ljava/util/List;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+        }
+        dispatcher.method("queuedCallsCount", "()I") { _, _, _ in .int32(0) }
+        dispatcher.method("runningCallsCount", "()I") { _, _, _ in .int32(0) }
+        dispatcher.method("cancelAll", "()V") { _, _, _ in .zero }
+        dispatcher.method("executorService", "()Ljava/util/concurrent/ExecutorService;") { runtime, _, _ in
+            runtime.makeNative("Ljava/util/concurrent/ExecutorService;", payload: NSNull())
+        }
+        dispatcher.method("idleCallback", "(Ljava/lang/Runnable;)V") { runtime, args, _ in
+            if let cls = runtime.classOf(args[1]), let method = cls.lookupVirtual(key: "run()V") {
+                _ = try? runtime.invoke(method, [args[1]])
+            }
+            return .zero
+        }
+        return [client, builder, dispatcher]
     }
 
     private static func callClasses() -> [NativeClass] {
@@ -819,12 +1287,70 @@ enum OkHttpRuntime {
         control.method("maxAgeSeconds", "()I") { runtime, args, _ in
             .int32(Int32(runtime.payload(args[0], as: VMCacheControlPayload.self)?.maxAgeSeconds ?? -1))
         }
+        control.method("sMaxAgeSeconds", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMCacheControlPayload.self)?.sMaxAgeSeconds ?? -1))
+        }
+        control.method("maxStaleSeconds", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMCacheControlPayload.self)?.maxStaleSeconds ?? -1))
+        }
+        control.method("minFreshSeconds", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMCacheControlPayload.self)?.minFreshSeconds ?? -1))
+        }
         control.method("noCache", "()Z") { runtime, args, _ in
             .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.noCache ?? false)
         }
-        control.method("isPrivate", "()Z") { _, _, _ in .boolean(false) }
-        control.method("isPublic", "()Z") { _, _, _ in .boolean(true) }
-        control.method("toString", "()Ljava/lang/String;") { _, _, _ in .null }
+        control.method("noStore", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.noStore ?? false)
+        }
+        control.method("noTransform", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.noTransform ?? false)
+        }
+        control.method("onlyIfCached", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.onlyIfCached ?? false)
+        }
+        control.method("isPrivate", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.isPrivate ?? false)
+        }
+        control.method("isPublic", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.isPublic ?? false)
+        }
+        control.method("immutable", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMCacheControlPayload.self)?.immutable ?? false)
+        }
+        control.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMCacheControlPayload.self) else { return .null }
+            var parts: [String] = []
+            if payload.noCache { parts.append("no-cache") }
+            if payload.noStore { parts.append("no-store") }
+            if payload.maxAgeSeconds != -1 { parts.append("max-age=\(payload.maxAgeSeconds)") }
+            if payload.sMaxAgeSeconds != -1 { parts.append("s-maxage=\(payload.sMaxAgeSeconds)") }
+            if payload.maxStaleSeconds != -1 { parts.append("max-stale=\(payload.maxStaleSeconds)") }
+            if payload.minFreshSeconds != -1 { parts.append("min-fresh=\(payload.minFreshSeconds)") }
+            if payload.onlyIfCached { parts.append("only-if-cached") }
+            if payload.noTransform { parts.append("no-transform") }
+            if payload.immutable { parts.append("immutable") }
+            return runtime.newString(parts.joined(separator: ", "))
+        }
+        control.staticMethod("parse", "(Lokhttp3/Headers;)Lokhttp3/CacheControl;") { runtime, args, _ in
+            let header = runtime.payload(args[0], as: VMHeadersPayload.self)?.value("Cache-Control")
+            return runtime.makeNative("Lokhttp3/CacheControl;", payload: VMCacheControlPayload.parse(header))
+        }
+        control.method("newBuilder", "()Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMCacheControlPayload.self) ?? VMCacheControlPayload()
+            let copy = VMCacheControlPayload()
+            copy.maxAgeSeconds = payload.maxAgeSeconds
+            copy.sMaxAgeSeconds = payload.sMaxAgeSeconds
+            copy.maxStaleSeconds = payload.maxStaleSeconds
+            copy.minFreshSeconds = payload.minFreshSeconds
+            copy.noCache = payload.noCache
+            copy.noStore = payload.noStore
+            copy.noTransform = payload.noTransform
+            copy.onlyIfCached = payload.onlyIfCached
+            copy.isPrivate = payload.isPrivate
+            copy.isPublic = payload.isPublic
+            copy.immutable = payload.immutable
+            return runtime.makeNative("Lokhttp3/CacheControl$Builder;", payload: copy)
+        }
 
         let builder = NativeClass("Lokhttp3/CacheControl$Builder;", superclass: "Ljava/lang/Object;")
         builder.method("<init>", "()V") { runtime, args, _ in
@@ -835,12 +1361,34 @@ enum OkHttpRuntime {
             try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).maxAgeSeconds = Int(args[1].asInt64 / 1_000_000_000)
             return args[0]
         }
-        builder.method("maxStale-LRDsOJo", "(J)Lokhttp3/CacheControl$Builder;") { _, args, _ in args[0] }
+        builder.method("maxStale-LRDsOJo", "(J)Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).maxStaleSeconds = Int(args[1].asInt64 / 1_000_000_000)
+            return args[0]
+        }
+        builder.method("minFresh-LRDsOJo", "(J)Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).minFreshSeconds = Int(args[1].asInt64 / 1_000_000_000)
+            return args[0]
+        }
         builder.method("noCache", "()Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
             try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).noCache = true
             return args[0]
         }
-        builder.method("noStore", "()Lokhttp3/CacheControl$Builder;") { _, args, _ in args[0] }
+        builder.method("noStore", "()Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).noStore = true
+            return args[0]
+        }
+        builder.method("noTransform", "()Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).noTransform = true
+            return args[0]
+        }
+        builder.method("onlyIfCached", "()Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).onlyIfCached = true
+            return args[0]
+        }
+        builder.method("immutable", "()Lokhttp3/CacheControl$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMCacheControlPayload.self).immutable = true
+            return args[0]
+        }
         builder.method("build", "()Lokhttp3/CacheControl;") { runtime, args, _ in
             let payload: VMCacheControlPayload? = runtime.payload(args[0], as: VMCacheControlPayload.self)
             return runtime.makeNative("Lokhttp3/CacheControl;", payload: payload ?? VMCacheControlPayload())
@@ -898,6 +1446,30 @@ enum OkHttpRuntime {
     }
 
     private static func bodyClasses() -> [NativeClass] {
+        /// `ResponseBody.Companion.create(source, contentType, contentLength)`:
+        /// `flags` follows Kotlin default-argument masks (bit 1 = source,
+        /// bit 2 = contentType, bit 4 = contentLength), and a defaulted or
+        /// negative contentLength reads the source to its end.
+        func makeBody(_ runtime: VMRuntime, source: VMValue, mediaType: VMValue, length: Int64, flags: Int32) throws -> VMValue {
+            let contentType = runtime.payload(mediaType, as: VMMediaTypePayload.self)?.text
+            let limit: Int
+            if flags & 4 != 0 || length < 0 {
+                limit = Int.max
+            } else {
+                limit = Int(length)
+            }
+            if let buffered = runtime.payload(source, as: VMBufferedSourcePayload.self) {
+                return runtime.makeNative(
+                    "Lokhttp3/ResponseBody;",
+                    payload: VMResponseBodyPayload(data: buffered.consume(min(limit, buffered.data.count - buffered.offset)), contentType: contentType)
+                )
+            }
+            if let buffer = runtime.payload(source, as: VMOkioBufferPayload.self) {
+                let data = limit == Int.max ? buffer.takeAll() : Data(buffer.takeAll().prefix(limit))
+                return runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: data, contentType: contentType))
+            }
+            throw VMJavaException("Ljava/lang/NullPointerException;", "source == null")
+        }
         let body = NativeClass("Lokhttp3/ResponseBody;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Closeable;"])
         body.staticField("Companion", "Lokhttp3/ResponseBody$Companion;")
         body.prepare = { runtime, cls in
@@ -954,6 +1526,14 @@ enum OkHttpRuntime {
                 data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
             }
             return runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: data, contentType: runtime.payload(args[2], as: VMMediaTypePayload.self)?.text))
+        }
+        bodyCompanion.method("create$default", "(Lokio/BufferedSource;Lokhttp3/MediaType;JILjava/lang/Object;)Lokhttp3/ResponseBody;") { runtime, args, _ in
+            try makeBody(runtime, source: args[0], mediaType: args[1], length: args[2].asInt64, flags: args[3].asInt32)
+        }
+        // Kotlin emits default-argument synthetics for companion methods as
+        // statics that take the companion as their first parameter.
+        bodyCompanion.staticMethod("create$default", "(Lokhttp3/ResponseBody$Companion;Lokio/BufferedSource;Lokhttp3/MediaType;JILjava/lang/Object;)Lokhttp3/ResponseBody;") { runtime, args, _ in
+            try makeBody(runtime, source: args[1], mediaType: args[2], length: args[3].asInt64, flags: args[4].asInt32)
         }
         bodyCompanion.method("create", "(Lokhttp3/MediaType;Ljava/io/File;)Lokhttp3/ResponseBody;") { runtime, args, _ in
             runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: Data(), contentType: runtime.payload(args[1], as: VMMediaTypePayload.self)?.text))
@@ -1042,6 +1622,38 @@ enum OkHttpRuntime {
                 )
             )
         }
+        for signature in [
+            "(Ljava/lang/String;Lokhttp3/MediaType;)Lokhttp3/RequestBody;",
+            "([BLokhttp3/MediaType;)Lokhttp3/RequestBody;",
+        ] {
+            requestBodyCompanion.method("create", signature) { runtime, args, _ in
+                let textIndex = signature.hasPrefix("(Ljava/lang/String;") ? 1 : -1
+                let data: Data
+                let typeIndex: Int
+                if textIndex > 0 {
+                    data = Data((runtime.stringValue(args[textIndex]) ?? "").utf8)
+                    typeIndex = 2
+                } else if signature.hasPrefix("([B") {
+                    var bytes = Data()
+                    for index in 0..<runtime.arrayLength(args[1]) {
+                        bytes.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
+                    }
+                    data = bytes
+                    typeIndex = 2
+                } else {
+                    data = Data()
+                    typeIndex = 2
+                }
+                return runtime.makeNative(
+                    "Lokhttp3/FormBody;",
+                    payload: VMFormBodyPayload(
+                        pairs: [],
+                        data: data,
+                        contentType: runtime.payload(args[typeIndex], as: VMMediaTypePayload.self)?.text
+                    )
+                )
+            }
+        }
         requestBody.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lokhttp3/RequestBody$Companion;", payload: NSNull())
         }
@@ -1079,6 +1691,15 @@ enum OkHttpRuntime {
 
         let formBuilder = NativeClass("Lokhttp3/FormBody$Builder;", superclass: "Ljava/lang/Object;")
         formBuilder.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(
+                args[0],
+                VMFormBodyPayload(pairs: [], data: Data(), contentType: "application/x-www-form-urlencoded")
+            )
+            return .zero
+        }
+        formBuilder.method("<init>", "(Ljava/nio/charset/Charset;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
+            // `FormBody.Builder(charset = ...)`: the charset only affects encoding,
+            // which the request layer applies from the content type.
             runtime.setPayload(
                 args[0],
                 VMFormBodyPayload(pairs: [], data: Data(), contentType: "application/x-www-form-urlencoded")
@@ -1138,6 +1759,141 @@ enum OkHttpRuntime {
         return markers
     }
 
+    private static func cookieClasses() -> [NativeClass] {
+        let cookie = NativeClass("Lokhttp3/Cookie;", superclass: "Ljava/lang/Object;")
+        cookie.staticField("Companion", "Lokhttp3/Cookie$Companion;")
+        cookie.prepare = { runtime, cls in
+            cls.staticValues[0] = runtime.makeNative("Lokhttp3/Cookie$Companion;", payload: NSNull())
+        }
+        func payload(_ runtime: VMRuntime, _ value: VMValue) -> VMCookiePayload? {
+            runtime.payload(value, as: VMCookiePayload.self)
+        }
+        cookie.method("name", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(payload(runtime, args[0])?.name ?? "")
+        }
+        cookie.method("value", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(payload(runtime, args[0])?.value ?? "")
+        }
+        cookie.method("domain", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(payload(runtime, args[0])?.domain ?? "")
+        }
+        cookie.method("path", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(payload(runtime, args[0])?.path ?? "")
+        }
+        cookie.method("expiresAt", "()J") { runtime, args, _ in
+            .int64(payload(runtime, args[0])?.expiresAt ?? 253402300799000)
+        }
+        cookie.method("secure", "()Z") { runtime, args, _ in
+            .boolean(payload(runtime, args[0])?.secure ?? false)
+        }
+        cookie.method("httpOnly", "()Z") { runtime, args, _ in
+            .boolean(payload(runtime, args[0])?.httpOnly ?? false)
+        }
+        cookie.method("hostOnly", "()Z") { runtime, args, _ in
+            .boolean(payload(runtime, args[0])?.hostOnly ?? true)
+        }
+        cookie.method("persistent", "()Z") { runtime, args, _ in
+            .boolean(payload(runtime, args[0])?.persistent ?? false)
+        }
+        cookie.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let cookie = payload(runtime, args[0]) else { return runtime.newString("") }
+            return runtime.newString("\(cookie.name)=\(cookie.value)")
+        }
+        cookie.method("matches", "(Lokhttp3/HttpUrl;)Z") { runtime, args, _ in
+            guard let cookie = payload(runtime, args[0]) else { return .boolean(false) }
+            guard let component = runtime.payload(args[1], as: VMHttpUrlPayload.self),
+                  let url = URL(string: component.string) else { return .boolean(false) }
+            let properties: [HTTPCookiePropertyKey: Any] = [
+                .name: cookie.name, .value: cookie.value, .domain: cookie.domain, .path: cookie.path,
+            ]
+            guard let httpCookie = HTTPCookie(properties: properties) else { return .boolean(false) }
+            return .boolean(VMCookieJar.matches(httpCookie, url))
+        }
+
+        let companion = NativeClass("Lokhttp3/Cookie$Companion;", superclass: "Ljava/lang/Object;")
+        companion.method("parse", "(Lokhttp3/HttpUrl;Ljava/lang/String;)Lokhttp3/Cookie;") { runtime, args, _ in
+            guard let component = runtime.payload(args[1], as: VMHttpUrlPayload.self),
+                  let url = URL(string: component.string),
+                  let header = runtime.stringValue(args[2]) else { return .null }
+            return OkHttpRuntime.makeCookie(runtime, header: header, for: url) ?? .null
+        }
+        companion.method("parseAll", "(Lokhttp3/HttpUrl;Lokhttp3/Headers;)Ljava/util/List;") { runtime, args, _ in
+            guard let component = runtime.payload(args[1], as: VMHttpUrlPayload.self),
+                  let url = URL(string: component.string),
+                  let headers = runtime.payload(args[2], as: VMHeadersPayload.self) else { return .null }
+            var values: [VMValue] = []
+            for (name, value) in headers.entries where name.caseInsensitiveCompare("Set-Cookie") == .orderedSame {
+                for chunk in VMCookieJar.splitSetCookie(value) {
+                    if let cookie = OkHttpRuntime.makeCookie(runtime, header: chunk, for: url) { values.append(cookie) }
+                }
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+        }
+        return [cookie, companion]
+    }
+
+    static func makeCookie(_ runtime: VMRuntime, header: String, for url: URL) -> VMValue? {
+        let text = header.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        var segments = text.components(separatedBy: ";")
+        let pair = segments.removeFirst()
+        guard let equals = pair.firstIndex(of: "=") else { return nil }
+        let name = String(pair[..<equals]).trimmingCharacters(in: .whitespaces)
+        let value = String(pair[pair.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+        var payload = VMCookiePayload(
+            name: name,
+            value: value,
+            domain: (url.host ?? "").lowercased(),
+            path: "/",
+            expiresAt: 253402300799000
+        )
+        for segment in segments {
+            let item = segment.trimmingCharacters(in: .whitespaces)
+            guard let separator = item.firstIndex(of: "=") else {
+                let flag = item.lowercased()
+                if flag == "secure" { payload.secure = true }
+                if flag == "httponly" { payload.httpOnly = true }
+                continue
+            }
+            let key = String(item[..<separator]).trimmingCharacters(in: .whitespaces).lowercased()
+            let raw = String(item[item.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
+            switch key {
+            case "domain":
+                if !raw.isEmpty {
+                    payload.domain = raw.hasPrefix(".") ? raw.lowercased() : raw.lowercased()
+                    payload.hostOnly = false
+                }
+            case "path":
+                if raw.hasPrefix("/") { payload.path = raw }
+            case "max-age":
+                if let seconds = Int64(raw) {
+                    payload.persistent = true
+                    payload.expiresAt = Int64(Date().timeIntervalSince1970 * 1000) + seconds * 1000
+                }
+            case "expires":
+                if let date = OkHttpRuntime.parseCookieDate(raw) {
+                    payload.persistent = true
+                    payload.expiresAt = Int64(date.timeIntervalSince1970 * 1000)
+                }
+            default:
+                break
+            }
+        }
+        return runtime.makeNative("Lokhttp3/Cookie;", payload: payload)
+    }
+
+    private static func parseCookieDate(_ text: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        for format in ["EEE, dd MMM yyyy HH:mm:ss zzz", "EEE, dd-MMM-yyyy HH:mm:ss zzz", "dd MMM yyyy HH:mm:ss zzz"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: text) { return date }
+        }
+        return nil
+    }
+
     private static func miscClasses() -> [NativeClass] {
         let timeout = NativeClass("Lokhttp3/Timeout;", superclass: "Ljava/lang/Object;")
         timeout.method("timeout", "(JLjava/util/concurrent/TimeUnit;)Lokhttp3/Timeout;") { _, args, _ in args[0] }
@@ -1145,11 +1901,14 @@ enum OkHttpRuntime {
         let connection = NativeClass("Lokhttp3/Connection;", superclass: "Ljava/lang/Object;")
         connection.method("protocol", "()Lokhttp3/Protocol;") { _, _, _ in .null }
         let protocolClass = NativeClass("Lokhttp3/Protocol;", superclass: "Ljava/lang/Enum;")
+        protocolClass.staticField("HTTP_1_0", "Lokhttp3/Protocol;")
         protocolClass.staticField("HTTP_1_1", "Lokhttp3/Protocol;")
+        protocolClass.staticField("SPDY_3", "Lokhttp3/Protocol;")
         protocolClass.staticField("HTTP_2", "Lokhttp3/Protocol;")
         protocolClass.prepare = { runtime, cls in
-            cls.staticValues[0] = runtime.makeNative("Lokhttp3/Protocol;", payload: NSNull())
-            cls.staticValues[1] = runtime.makeNative("Lokhttp3/Protocol;", payload: NSNull())
+            for index in 0..<cls.staticFields.count {
+                cls.staticValues[index] = runtime.makeNative("Lokhttp3/Protocol;", payload: NSNull())
+            }
         }
         return [timeout, connection, protocolClass]
     }
@@ -1166,13 +1925,58 @@ final class VMFormBodyPayload {
     }
 }
 
+/// Browser-check interstitials (Cloudflare, DDoS-Guard, and pages built the
+/// same way) that a host transport can return instead of the requested page.
+/// The status code alone is never enough: the headers or body must also carry
+/// a marker from the challenge page itself, so an ordinary error response from
+/// the same host is left alone.
+enum VMChallengeDetector {
+    /// Cookies the protections issue for the cleared browser.
+    static let clearanceCookieNames: [String] = ["cf_clearance"]
+    static let clearanceCookiePrefixes: [String] = ["__ddg1_", "__ddg2_", "__ddg5_"]
+
+    /// Markers the interstitial documents embed in their scripts and copy.
+    static let bodyMarkers: [String] = [
+        "cf-chl",
+        "cf-browser-verification",
+        "_cf_chl_opt",
+        "challenge-platform",
+        "just a moment",
+        "checking your browser before accessing",
+        "ddos-guard.net",
+    ] + clearanceCookiePrefixes
+
+    /// Cookie names a protection sets once the browser has passed the check.
+    static func isClearanceCookie(_ name: String) -> Bool {
+        clearanceCookieNames.contains(name)
+            || clearanceCookiePrefixes.contains { name.hasPrefix($0) }
+    }
+
+    static func isChallenge(status: Int, headers: [(String, String)], body: Data) -> Bool {
+        guard status == 403 || status == 429 || status == 503 else { return false }
+        let server = headers.first { $0.0.caseInsensitiveCompare("Server") == .orderedSame }?.1.lowercased() ?? ""
+        if server.contains("cloudflare") || server.contains("ddos-guard") { return true }
+        // A protection can also answer with only its cookie family in the
+        // headers, before its script has had a chance to render the page.
+        for (name, value) in headers where name.caseInsensitiveCompare("Set-Cookie") == .orderedSame {
+            let lowered = value.lowercased()
+            if clearanceCookiePrefixes.contains(where: { lowered.contains($0) }) { return true }
+        }
+        let text = String(decoding: body.prefix(8192), as: UTF8.self)
+        return textLooksLikeInterstitial(text)
+    }
+
+    /// Also used by the solver to tell whether a loaded document is still the
+    /// interstitial rather than the page the extension asked for.
+    static func textLooksLikeInterstitial(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return bodyMarkers.contains { lowered.contains($0) }
+    }
+}
+
 extension VMRuntime {
     static func isChallenge(_ response: VMHTTPResponse) -> Bool {
-        guard response.code == 403 || response.code == 503 || response.code == 429 else { return false }
-        let server = response.headers.first { $0.0.caseInsensitiveCompare("Server") == .orderedSame }?.1.lowercased() ?? ""
-        if server.contains("cloudflare") { return true }
-        let body = String(decoding: response.body.prefix(8192), as: UTF8.self).lowercased()
-        return body.contains("cf-chl") || body.contains("cf-browser-verification") || body.contains("just a moment")
+        VMChallengeDetector.isChallenge(status: response.code, headers: response.headers, body: response.body)
     }
 
     func executeOkHttp(request: VMValue, client: VMValue) throws -> VMValue {
@@ -1224,7 +2028,18 @@ extension VMRuntime {
                 body = Data()
             }
         }
-        let vmRequest = VMHTTPRequest(
+        // BridgeInterceptor: the cookie jar supersedes an extension-provided
+        // Cookie header whenever it holds cookies for this URL.
+        let cookieStorage = host.cookieStorage()
+        func applyJarCookies(_ headers: inout [(String, String)]) {
+            guard let url = URL(string: payload.url) else { return }
+            let jarCookies = VMCookieJar.cookies(storage: cookieStorage, for: url)
+            guard !jarCookies.isEmpty else { return }
+            headers.removeAll { $0.0.caseInsensitiveCompare("Cookie") == .orderedSame }
+            headers.append(("Cookie", jarCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")))
+        }
+        applyJarCookies(&headers)
+        var vmRequest = VMHTTPRequest(
             url: payload.url,
             method: payload.method,
             headers: headers,
@@ -1233,8 +2048,21 @@ extension VMRuntime {
         var response: VMHTTPResponse
         do {
             response = try host.performRequest(vmRequest)
+            VMCookieJar.store(headers: response.headers, for: payload.url, storage: cookieStorage)
             if Self.isChallenge(response), try host.solveChallenge(vmRequest) {
+                // Solving writes the freshly issued clearance cookie into the
+                // jar, so the retry has to send the cookie set as it stands
+                // now instead of the one captured before the challenge.
+                var retryHeaders = headers
+                applyJarCookies(&retryHeaders)
+                vmRequest = VMHTTPRequest(
+                    url: payload.url,
+                    method: payload.method,
+                    headers: retryHeaders,
+                    body: body
+                )
                 response = try host.performRequest(vmRequest)
+                VMCookieJar.store(headers: response.headers, for: payload.url, storage: cookieStorage)
             }
         } catch let exception as VMJavaException {
             throw exception

@@ -14,9 +14,12 @@ Liquid Glass.
 - Runs installed lib-1.4–1.6 extensions on a **custom Dalvik engine** inside
   `MihonCompat`: an in-process interpreter plus native Android, Kotlin, OkHttp,
   okio, Jsoup and `eu.kanade.tachiyomi` hosts. Request/parse-style sources use
-  native `HttpSource`/`ParsedHttpSource` defaults. No JVM is embedded; a source
-  call is the only time the engine does work, and its arena is recycled so idle
-  RAM stays flat.
+  native `HttpSource`/`ParsedHttpSource` defaults. Reader pages are fetched
+  through the extension's own client, so its headers and interceptors apply;
+  source capability flags (`supportsLatest`, `isNsfw`) drive the browse UI, and
+  every source call runs under a wall-clock budget. No JVM is embedded; a
+  source call is the only time the engine does work, and its arena is recycled
+  so idle RAM stays flat.
 - Browses sources with **search filters** rendered from the extension's
   `FilterList`, and edits source preferences (text, toggles, single-choice
   lists, multi-select values) from a settings sheet.
@@ -39,13 +42,14 @@ updates, source filters and the reader UI. `MihonCompat` owns execution: it
 interprets the extension's Dalvik bytecode and supplies the platform surface.
 Extensions whose API use falls inside that surface run without any
 site-specific Swift code; `MihonCompat/README.md` lists the exact surface and
-the known gaps (RxJava-only fetch overrides, WebView screens, zstd response
-transcoding, and image codecs inside extensions). See
+the known gaps (RxJava-only fetch overrides, entropy-coded zstd response
+bodies, merged duplicate response headers, and library surface that needs Apple
+frameworks). See
 [`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md) and
 [`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md).
 
-Still out of scope: CBR, CB7, and Android framework features the engine does not
-provide (WebView, image codecs inside extensions, JNI).
+Still out of scope: CBR, CB7, and Android framework pieces the engine does not
+provide (constructor reflection, JNI).
 
 ## Requirements
 

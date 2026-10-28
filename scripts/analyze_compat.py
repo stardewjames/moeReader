@@ -47,6 +47,8 @@ HOST_PREFIXES = (
     "Lorg/intellij/",
     "Leu/kanade/tachiyomi/",
     "Lcom/squareup/",
+    "Lapp/cash/quickjs/",
+    "Luy/kohesive/injekt/",
     "Lorg/slf4j/",
     "Lio/reactivex/",
     "Lrx/",

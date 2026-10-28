@@ -19,6 +19,8 @@ struct MihonBrowseView: View {
     @State private var showsFilters = false
     @State private var filterTree: [MihonFilter] = []
     @State private var filterSelections: [String: MihonFilterSelection] = [:]
+    /// Mihon API defaults until the source reports its own flags.
+    @State private var capabilities = MihonSourceCapabilities()
 
     init(source: MihonSource, packageName: String, runtime: (any MihonSourceRuntime)? = nil) {
         let store = MihonFilterSelectionStore()
@@ -104,11 +106,23 @@ struct MihonBrowseView: View {
         VStack(spacing: 0) {
             VStack(spacing: 10) {
                 Picker("Feed", selection: $mode) {
-                    ForEach(FeedMode.allCases) { mode in
+                    ForEach(availableModes) { mode in
                         Text(mode.title).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
+
+                if capabilities.isNsfw {
+                    HStack(spacing: 6) {
+                        Text("NSFW")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Palette.amber)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Palette.amber.opacity(0.18), in: Capsule())
+                        Spacer()
+                    }
+                }
 
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
@@ -200,6 +214,9 @@ struct MihonBrowseView: View {
             }
         }
         .background(Palette.background.ignoresSafeArea())
+        .task {
+            await loadCapabilities(runtime: runtime)
+        }
         .task(id: reloadKey) {
             await load(reset: true, runtime: runtime)
         }
@@ -210,6 +227,27 @@ struct MihonBrowseView: View {
 
     private var reloadKey: String {
         "\(mode.rawValue)|\(searchGeneration)|\(source.identity)|\(filterKey)"
+    }
+
+    /// Feed modes the source actually implements. Mihon hides the latest feed
+    /// for sources that declare `supportsLatest = false`; calling it would
+    /// throw an unsupported-operation error from the extension.
+    private var availableModes: [FeedMode] {
+        capabilities.supportsLatest ? FeedMode.allCases : FeedMode.allCases.filter { $0 != .latest }
+    }
+
+    private func loadCapabilities(runtime: any MihonSourceRuntime) async {
+        do {
+            let reported = try await runtime.capabilities(source: source)
+            if !reported.supportsLatest, mode == .latest {
+                mode = .popular
+            }
+            capabilities = reported
+        } catch is CancellationError {
+            return
+        } catch {
+            // Capabilities are advisory: keep the API defaults on failure.
+        }
     }
 
     private var filterKey: String {

@@ -430,6 +430,13 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
         }
     }
 
+    func capabilities(source: MihonSource) async throws -> MihonSourceCapabilities {
+        try await perform(source: source) { engine, index in
+            let info = engine.sourceInfo(at: index)
+            return MihonSourceCapabilities(supportsLatest: info.supportsLatest, isNsfw: info.isNsfw)
+        }
+    }
+
     func search(query: String, source: MihonSource, page: Int) async throws -> MihonMangaPage {
         try await search(query: query, source: source, page: page, selections: [:])
     }
@@ -458,8 +465,12 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
     }
 
     func manga(id: String, source: MihonSource) async throws -> MihonManga {
+        try await manga(id: id, source: source, title: nil)
+    }
+
+    func manga(id: String, source: MihonSource, title: String?) async throws -> MihonManga {
         try await perform(source: source) { engine, index in
-            try engine.manga(sourceIndex: index, url: id)
+            try engine.manga(sourceIndex: index, url: id, title: title)
         }
     }
 
@@ -472,6 +483,20 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
     func pages(chapter: MihonChapter, manga: MihonManga, source: MihonSource) async throws -> [MihonPage] {
         try await perform(source: source) { engine, index in
             try engine.pages(sourceIndex: index, chapterURL: chapter.id, chapterName: chapter.title)
+        }
+    }
+
+    func pageImage(page: MihonPage, chapter: MihonChapter, source: MihonSource) async throws -> Data {
+        try await perform(source: source) { engine, index in
+            guard let image = try engine.imageData(
+                sourceIndex: index,
+                chapterURL: chapter.id,
+                chapterName: chapter.title,
+                pageIndex: page.index
+            ), !image.data.isEmpty else {
+                throw MihonEngineFailure("no image data for page \(page.index + 1) of \(chapter.displayTitle)")
+            }
+            return image.data
         }
     }
 
@@ -565,19 +590,34 @@ struct MihonEngineFailure: Error, LocalizedError {
 
 
 #if canImport(WebKit)
-/// Clears a Cloudflare interstitial by loading it in an off-screen WKWebView and
-/// waiting for the clearance cookie. The engine queue is not the main queue, so
-/// the wait is a semaphore; all WebKit work happens on the main actor.
+/// Clears a browser-check interstitial by loading it in an off-screen WKWebView
+/// and waiting until the check is done: either the protection has issued its
+/// clearance cookie, or the loaded document no longer carries interstitial
+/// markers. The engine queue is not the main queue, so the wait polls the
+/// main-queue-created WebKit state; every WebKit call runs on the main queue
+/// and the wait is bounded.
 final class MihonChallengeSolver: NSObject, @unchecked Sendable {
+    private static let pollInterval: TimeInterval = 0.5
+    private static let timeout: TimeInterval = 25
+    /// A WebKit callback that never arrives must not stretch the wait past the
+    /// deadline, so each main-queue reply is awaited with its own limit.
+    private static let replyTimeout: TimeInterval = 5
+
+    /// A committed main-frame document; `nil` while WKWebView is still on
+    /// `about:blank`, which is never evidence that the check passed.
+    private struct DocumentState {
+        let readyState: String
+        let html: String
+    }
+
     private var webView: WKWebView?
 
-    private final class CookieBox: @unchecked Sendable {
-        var value: HTTPCookie?
+    private final class ValueBox<T>: @unchecked Sendable {
+        var value: T?
     }
 
     func solve(url: URL) -> Bool {
         guard !Thread.isMainThread else { return false }
-        var cleared = false
         DispatchQueue.main.sync {
             let configuration = WKWebViewConfiguration()
             configuration.websiteDataStore = .default()
@@ -586,45 +626,114 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
             webView.load(URLRequest(url: url))
         }
 
-        let deadline = Date().addingTimeInterval(25)
+        let deadline = Date().addingTimeInterval(Self.timeout)
+        var cleared = false
         while Date() < deadline {
-            if clearanceCookie(for: url) != nil {
-                copyWebCookiesToHTTPStorage()
-                cleared = true
-                break
+            if let document = currentDocument() {
+                // A finished document without a marker is the page the
+                // extension asked for; the protection already reloaded it.
+                if document.readyState != "loading", !document.html.isEmpty,
+                   !VMChallengeDetector.textLooksLikeInterstitial(document.html) {
+                    cleared = true
+                    break
+                }
+                // Otherwise the protection may have set its clearance cookie
+                // without replacing the interstitial document yet.
+                if hasClearanceCookie(for: url) {
+                    cleared = true
+                    break
+                }
             }
-            Thread.sleep(forTimeInterval: 0.5)
+            Thread.sleep(forTimeInterval: Self.pollInterval)
         }
-        DispatchQueue.main.sync { self.webView?.stopLoading(); self.webView = nil }
+        if cleared { copyCookiesToHTTPStorage(for: url) }
+        DispatchQueue.main.sync {
+            self.webView?.stopLoading()
+            self.webView = nil
+        }
         return cleared
     }
 
-    private func clearanceCookie(for url: URL) -> HTTPCookie? {
+    // MARK: - WebKit state, read on the main queue
+
+    private func currentDocument() -> DocumentState? {
         let semaphore = DispatchSemaphore(value: 0)
-        let box = CookieBox()
+        let box = ValueBox<DocumentState>()
         DispatchQueue.main.async {
-            guard let webView = self.webView else { semaphore.signal(); return }
-            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-                box.value = cookies.first { $0.name == "cf_clearance" && url.host?.hasSuffix($0.domain) == true }
+            guard let webView = self.webView else {
+                semaphore.signal()
+                return
+            }
+            let script = """
+            (function () {
+                var root = document.documentElement;
+                return [String(location.href), document.readyState, root ? root.outerHTML : ""];
+            })()
+            """
+            webView.evaluateJavaScript(script) { value, _ in
+                if let parts = value as? [Any], parts.count == 3,
+                   let address = parts[0] as? String,
+                   let readyState = parts[1] as? String,
+                   let html = parts[2] as? String,
+                   let scheme = URL(string: address)?.scheme?.lowercased(),
+                   scheme == "http" || scheme == "https" {
+                    box.value = DocumentState(readyState: readyState, html: html)
+                }
                 semaphore.signal()
             }
         }
-        semaphore.wait()
+        guard semaphore.wait(timeout: .now() + Self.replyTimeout) == .success else { return nil }
         return box.value
     }
 
-    private func copyWebCookiesToHTTPStorage() {
+    private func hasClearanceCookie(for url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = ValueBox<Bool>()
+        DispatchQueue.main.async {
+            guard let webView = self.webView else {
+                semaphore.signal()
+                return
+            }
+            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+                box.value = cookies.contains {
+                    Self.cookie($0, appliesTo: host) && VMChallengeDetector.isClearanceCookie($0.name)
+                }
+                semaphore.signal()
+            }
+        }
+        guard semaphore.wait(timeout: .now() + Self.replyTimeout) == .success else { return false }
+        return box.value ?? false
+    }
+
+    /// Copies every cookie that belongs to the loaded host, not only the
+    /// clearance one: the protection's flow can leave several cookies and the
+    /// retry has to look exactly like the browser that passed the check.
+    private func copyCookiesToHTTPStorage(for url: URL) {
+        guard let host = url.host?.lowercased() else { return }
         let semaphore = DispatchSemaphore(value: 0)
         DispatchQueue.main.async {
-            guard let webView = self.webView else { semaphore.signal(); return }
+            guard let webView = self.webView else {
+                semaphore.signal()
+                return
+            }
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-                for cookie in cookies where cookie.name == "cf_clearance" {
+                for cookie in cookies where Self.cookie(cookie, appliesTo: host) {
                     HTTPCookieStorage.shared.setCookie(cookie)
                 }
                 semaphore.signal()
             }
         }
-        semaphore.wait()
+        _ = semaphore.wait(timeout: .now() + Self.replyTimeout)
+    }
+
+    /// RFC 6265 domain matching: the host equals the cookie domain or is one of
+    /// its subdomains; the leading dot is optional.
+    private static func cookie(_ cookie: HTTPCookie, appliesTo host: String) -> Bool {
+        var domain = cookie.domain.lowercased()
+        while domain.hasPrefix(".") { domain.removeFirst() }
+        guard !domain.isEmpty else { return false }
+        return host == domain || host.hasSuffix("." + domain)
     }
 }
 #endif

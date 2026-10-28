@@ -340,7 +340,13 @@ extension VMRuntime {
                         throw failure("Ljava/lang/NullPointerException;", "throw null")
                     }
                     let cls = VMObjectLayout.cls(pointer)
-                    var exception = VMJavaException(cls.descriptor, nil)
+                    // Java and Kotlin exceptions keep their message in the
+                    // inherited `detailMessage` field; without it a rethrown
+                    // serialization/parse error surfaces without a cause.
+                    let detail = cls.field(named: "detailMessage").flatMap {
+                        stringValue(VMObjectLayout.slot(pointer, $0.offset).pointee)
+                    }
+                    var exception = VMJavaException(cls.descriptor, detail)
                     exception.object = value
                     throw exception
                 case 0x28: // goto

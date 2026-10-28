@@ -440,7 +440,7 @@ enum JavaCore {
             runtime.newString(units: [UInt16(truncatingIfNeeded: args[0].asInt32)])
         }
         cls.staticMethod("valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
-            args[1].bits == 0 ? runtime.newString("null") : runtime.javaToString(args[1])
+            args[0].bits == 0 ? runtime.newString("null") : runtime.javaToString(args[0])
         }
         cls.staticMethod("format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
             runtime.format(template: args[0], arguments: args[1])
@@ -491,6 +491,25 @@ enum JavaCore {
             ("(C)Ljava/lang/StringBuilder;", "char"),
             ("([C)Ljava/lang/StringBuilder;", "chars"),
             ("(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;", "sequence"),
+        ] {
+            cls.method("append", signature) { runtime, args, _ in
+                runtime.appendString(args[0], kind: kind, value: args[1])
+                return args[0]
+            }
+        }
+        // Bridge signatures: `StringBuilder` is used as an `Appendable`, so the
+        // compiler emits the interface's covariant return type.
+        for (signature, kind) in [
+            ("(C)Ljava/lang/Appendable;", "char"),
+            ("(Ljava/lang/CharSequence;)Ljava/lang/Appendable;", "sequence"),
+            ("(Ljava/lang/String;)Ljava/lang/Appendable;", "string"),
+            ("(Ljava/lang/Object;)Ljava/lang/Appendable;", "object"),
+            ("(I)Ljava/lang/Appendable;", "int"),
+            ("(J)Ljava/lang/Appendable;", "long"),
+            ("(F)Ljava/lang/Appendable;", "float"),
+            ("(D)Ljava/lang/Appendable;", "double"),
+            ("(Z)Ljava/lang/Appendable;", "bool"),
+            ("([C)Ljava/lang/Appendable;", "chars"),
         ] {
             cls.method("append", signature) { runtime, args, _ in
                 runtime.appendString(args[0], kind: kind, value: args[1])
@@ -796,6 +815,13 @@ enum JavaCore {
             VMObjectLayout.slot(pointer, 0).pointee = .int64(value)
             return .reference(pointer)
         }
+        cls.staticMethod("hashCode", "(\(letter))I") { _, args, _ in
+            let raw: Int64 = letter == "J" ? args[0].asInt64 : Int64(args[0].asInt32)
+            if letter == "J" {
+                return .int32(Int32(truncatingIfNeeded: raw ^ (raw >> 32)))
+            }
+            return .int32(Int32(truncatingIfNeeded: raw))
+        }
         cls.staticMethod("parseInt", "(Ljava/lang/String;)I") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
             guard let value = Int32(text) else {
@@ -934,6 +960,37 @@ enum JavaCore {
             let text = String(UnicodeScalar(args[0].asUInt32) ?? " ").uppercased()
             return .int32(Int32(text.utf16.first ?? 0))
         }
+        cls.staticMethod("isHighSurrogate", "(C)Z") { _, args, _ in
+            let value = args[0].asChar()
+            return .boolean(value >= 0xD800 && value <= 0xDBFF)
+        }
+        cls.staticMethod("isLowSurrogate", "(C)Z") { _, args, _ in
+            let value = args[0].asChar()
+            return .boolean(value >= 0xDC00 && value <= 0xDFFF)
+        }
+        cls.staticMethod("isSurrogate", "(C)Z") { _, args, _ in
+            let value = args[0].asChar()
+            return .boolean(value >= 0xD800 && value <= 0xDFFF)
+        }
+        cls.staticMethod("isSurrogatePair", "(CC)Z") { _, args, _ in
+            let high = args[0].asChar()
+            let low = args[1].asChar()
+            return .boolean(high >= 0xD800 && high <= 0xDBFF && low >= 0xDC00 && low <= 0xDFFF)
+        }
+        cls.staticMethod("charCount", "(I)I") { _, args, _ in
+            .int32(args[0].asInt32 >= 0x10000 ? 2 : 1)
+        }
+        cls.staticMethod("toChars", "(I)[C") { runtime, args, _ in
+            let scalar = UInt32(bitPattern: args[0].asInt32)
+            let text = UnicodeScalar(scalar).map { String($0) } ?? ""
+            let units = Array(text.utf16)
+            let array = runtime.newArray(component: "C", count: units.count)
+            for (offset, unit) in units.enumerated() {
+                runtime.setArrayElement(array, index: offset, value: .int32(Int32(unit)))
+            }
+            return array
+        }
+        cls.staticMethod("hashCode", "(C)I") { _, args, _ in .int32(Int32(args[0].asChar())) }
         cls.staticMethod("digit", "(CI)I") { _, args, _ in
             guard let digit = Int(String(UnicodeScalar(args[0].asUInt32) ?? " "), radix: Int(args[1].asInt32)) else {
                 return .int32(-1)
@@ -1186,6 +1243,85 @@ enum JavaCore {
     /// fields are already flattened down the hierarchy (offsets are relative to
     /// the queried class); static fields are declared per class, so walk the
     /// superclass chain and return the declaring owner that holds their slot.
+    /// Binary name (`java.lang.String`, `[B`, `int`) to a dex descriptor.
+    static func descriptor(forBinaryName name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return trimmed }
+        if trimmed.hasPrefix("[") || trimmed.hasPrefix("L") { return trimmed }
+        if trimmed.count == 1, "VZBCSIJFD".contains(trimmed) { return trimmed }
+        return "L" + trimmed.replacingOccurrences(of: ".", with: "/") + ";"
+    }
+
+    static func forName(_ runtime: VMRuntime, _ binaryName: String, initialize: Bool) throws -> VMValue {
+        let descriptor = descriptor(forBinaryName: binaryName)
+        guard let cls = runtime.findClass(descriptor) else {
+            throw VMJavaException("Ljava/lang/ClassNotFoundException;", binaryName)
+        }
+        if initialize {
+            try runtime.ensureInitialized(cls)
+        }
+        return runtime.classObject(cls)
+    }
+
+    /// Parameter descriptors of a `Class[]`; nil when the array is null.
+    static func parameterDescriptors(_ runtime: VMRuntime, _ array: VMValue) -> [String]? {
+        guard array.bits != 0 else { return nil }
+        var descriptors: [String] = []
+        for index in 0..<runtime.arrayLength(array) {
+            guard let type: VMClass = runtime.payload(runtime.arrayElement(array, index), as: VMClass.self) else {
+                return nil
+            }
+            descriptors.append(type.descriptor)
+        }
+        return descriptors
+    }
+
+    /// Resolves a reflected method by name and (optionally) exact parameter
+    /// types. `getMethod` also searches superclasses and interface defaults.
+    static func reflectedMethod(
+        in target: VMClass,
+        named name: String,
+        parameters: [String]?,
+        includeInherited: Bool
+    ) -> (VMClass, VMMethod)? {
+        var visited: Set<ObjectIdentifier> = []
+        var stack: [VMClass] = [target]
+        while let cls = stack.popLast() {
+            guard visited.insert(ObjectIdentifier(cls)).inserted else { continue }
+            for method in cls.methods.values where method.name == name {
+                if let parameters, method.parameterTypes != parameters { continue }
+                return (cls, method)
+            }
+            if includeInherited {
+                if let superclass = cls.superclass { stack.append(superclass) }
+                stack.append(contentsOf: cls.interfaces)
+            }
+        }
+        return nil
+    }
+
+    /// APK asset path for `Class.getResource`. Absolute names are resolved from
+    /// the package root, relative ones from the declaring class's package.
+    static func resourcePath(_ name: String, relativeTo target: VMClass) -> String? {
+        if name.hasPrefix("/") {
+            let path = String(name.dropFirst())
+            return path.isEmpty ? nil : path
+        }
+        let package = target.displayName.split(separator: ".").dropLast().joined(separator: "/")
+        return package.isEmpty ? name : package + "/" + name
+    }
+
+    static func resourceURL(_ runtime: VMRuntime, name: String, relativeTo target: VMClass) -> VMValue {
+        guard let path = resourcePath(name, relativeTo: target), runtime.assetLoader?(path) != nil else {
+            return .null
+        }
+        let url = runtime.makeNative("Ljava/net/URL;", payload: NSNull())
+        if let pointer = url.object, let field = VMObjectLayout.cls(pointer).field(named: "value") {
+            VMObjectLayout.slot(pointer, field.offset).pointee = runtime.newString("file:/" + path)
+        }
+        return url
+    }
+
     private static func reflectedField(in target: VMClass, named name: String) -> (VMClass, VMField)? {
         if let field = target.instanceFields.last(where: { $0.name == name }) {
             return (target, field)
@@ -1240,6 +1376,67 @@ enum JavaCore {
         cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in .boolean(args[0].bits == args[1].bits) }
         cls.method("getClassLoader", "()Ljava/lang/ClassLoader;") { runtime, _, _ in
             runtime.makeNative("Ljava/lang/ClassLoader;", payload: NSNull())
+        }
+        cls.staticMethod("forName", "(Ljava/lang/String;)Ljava/lang/Class;") { runtime, args, _ in
+            try forName(runtime, runtime.stringValue(args[0]) ?? "", initialize: true)
+        }
+        cls.staticMethod("forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;") { runtime, args, _ in
+            try forName(runtime, runtime.stringValue(args[0]) ?? "", initialize: args[1].asBoolean)
+        }
+        cls.method("getSuperclass", "()Ljava/lang/Class;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self),
+                  let superclass = target.superclass else { return .null }
+            return runtime.classObject(superclass)
+        }
+        cls.method("getInterfaces", "()[Ljava/lang/Class;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let array = runtime.newArray(component: "Ljava/lang/Class;", count: target.interfaces.count)
+            for (index, proto) in target.interfaces.enumerated() {
+                runtime.setArrayElement(array, index: index, value: runtime.classObject(proto))
+            }
+            return array
+        }
+        cls.method("getResource", "(Ljava/lang/String;)Ljava/net/URL;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            return resourceURL(runtime, name: name, relativeTo: target)
+        }
+        cls.method("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let name = runtime.stringValue(args[1]) ?? ""
+            guard let path = resourcePath(name, relativeTo: target), let data = runtime.assetLoader?(path) else {
+                return .null
+            }
+            return runtime.makeNative("Ljava/io/ByteArrayInputStream;", payload: data)
+        }
+        for (name, signature) in [
+            ("getDeclaredMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"),
+            ("getMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"),
+        ] {
+            let includeInherited = name == "getMethod"
+            cls.method(name, signature) { runtime, args, _ in
+                guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+                let methodName = runtime.stringValue(args[1]) ?? ""
+                let parameters = parameterDescriptors(runtime, args[2])
+                guard let resolved = reflectedMethod(
+                    in: target, named: methodName,
+                    parameters: parameters, includeInherited: includeInherited
+                ) else {
+                    throw VMJavaException("Ljava/lang/NoSuchMethodException;", "\(target.displayName).\(methodName)")
+                }
+                return runtime.makeNative(
+                    "Ljava/lang/reflect/Method;",
+                    payload: VMMethodRefPayload(owner: resolved.0, method: resolved.1)
+                )
+            }
+        }
+        cls.method("getDeclaredConstructor", "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") { runtime, args, _ in
+            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
+            let parameters = parameterDescriptors(runtime, args[1])
+            guard let resolved = reflectedMethod(in: target, named: "<init>", parameters: parameters, includeInherited: false) else {
+                throw VMJavaException("Ljava/lang/NoSuchMethodException;", "\(target.displayName).<init>")
+            }
+            return runtime.makeNative("Ljava/lang/reflect/Constructor;", payload: VMMethodRefPayload(owner: resolved.0, method: resolved.1))
         }
         cls.method("getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
             guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }

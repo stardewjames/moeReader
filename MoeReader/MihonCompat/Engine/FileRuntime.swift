@@ -22,6 +22,8 @@ final class VMOkioSinkPayload {
     /// flush instead of writing a file.
     let downstream: VMOkioSinkPayload?
     let encode: ((Data) -> Data)?
+    /// Set by `Okio.sink(OutputStream)`: flushed bytes go to that stream.
+    let stream: VMValue?
     /// A non-appending file sink truncates on its first flush only; later
     /// flushes append, matching an open FileOutputStream.
     var truncated = false
@@ -31,12 +33,21 @@ final class VMOkioSinkPayload {
         self.append = append
         self.downstream = nil
         self.encode = nil
+        self.stream = nil
+    }
+    init(stream: VMValue) {
+        self.path = nil
+        self.append = true
+        self.downstream = nil
+        self.encode = nil
+        self.stream = stream
     }
     init(downstream: VMOkioSinkPayload, encode: @escaping (Data) -> Data) {
         self.path = nil
         self.append = true
         self.downstream = downstream
         self.encode = encode
+        self.stream = nil
     }
 }
 
@@ -317,8 +328,34 @@ enum FileRuntime {
             (runtime.payload(args[0], as: VMOkioBufferPayload.self))?.clearAll()
             return args[0]
         }
+        buffer.method("outputStream", "()Ljava/io/OutputStream;") { runtime, args, _ in
+            let payload = try runtime.payloadBox(args[0], as: VMOkioBufferPayload.self)
+            return runtime.makeNative("Lokio/Buffer$outputStream$1;", payload: payload)
+        }
         buffer.method("close", "()V") { _, _, _ in .zero }
         result.append(buffer)
+
+        // okio's anonymous OutputStream view over a Buffer.
+        let bufferStream = NativeClass("Lokio/Buffer$outputStream$1;", superclass: "Ljava/io/OutputStream;")
+        bufferStream.method("write", "(I)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMOkioBufferPayload.self) else { return .zero }
+            payload.append(Data([UInt8(truncatingIfNeeded: args[1].asInt32)]))
+            return .zero
+        }
+        bufferStream.method("write", "([B)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMOkioBufferPayload.self) else { return .zero }
+            payload.append(bytes(runtime, args[1], from: 0, to: runtime.arrayLength(args[1])))
+            return .zero
+        }
+        bufferStream.method("write", "([BII)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMOkioBufferPayload.self) else { return .zero }
+            let offset = Int(args[2].asInt32), count = Int(args[3].asInt32)
+            payload.append(bytes(runtime, args[1], from: offset, to: offset + count))
+            return .zero
+        }
+        bufferStream.method("flush", "()V") { _, _, _ in .zero }
+        bufferStream.method("close", "()V") { _, _, _ in .zero }
+        result.append(bufferStream)
 
         let bufferedSource = NativeClass("Lokio/BufferedSource;", superclass: "Ljava/lang/Object;", interfaces: ["Lokio/Source;", "Ljava/io/Closeable;"])
         bufferedSource.method("readUtf8", "()Ljava/lang/String;") { runtime, args, _ in
@@ -457,10 +494,24 @@ enum FileRuntime {
             runtime.makeNative("Lokio/Sink;", payload: VMOkioSinkPayload(path: absolutePath(runtime, filePath(runtime, args[0])), append: false))
         }
         okio.staticMethod("sink", "(Ljava/io/File;Z)Lokio/Sink;") { runtime, args, _ in
-            runtime.makeNative("Lokio/Sink;", payload: VMOkioSinkPayload(path: absolutePath(runtime, filePath(runtime, args[0])), append: args[2].asBoolean))
+            runtime.makeNative("Lokio/Sink;", payload: VMOkioSinkPayload(path: absolutePath(runtime, filePath(runtime, args[0])), append: args[1].asBoolean))
         }
         okio.staticMethod("sink$default", "(Ljava/io/File;ZILjava/lang/Object;)Lokio/Sink;") { runtime, args, _ in
             runtime.makeNative("Lokio/Sink;", payload: VMOkioSinkPayload(path: absolutePath(runtime, filePath(runtime, args[0])), append: args[1].asBoolean))
+        }
+        okio.staticMethod("source", "(Ljava/io/InputStream;)Lokio/Source;") { runtime, args, _ in
+            guard let stream = runtime.inputStreamPayload(args[0]) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;", "input == null")
+            }
+            let remaining = stream.offset < stream.data.count
+                ? stream.data.subdata(in: stream.offset..<stream.data.count)
+                : Data()
+            stream.offset = stream.data.count
+            return runtime.makeNative("Lokio/Source;", payload: VMBufferedSourcePayload(data: remaining))
+        }
+        okio.staticMethod("sink", "(Ljava/io/OutputStream;)Lokio/Sink;") { runtime, args, _ in
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;", "out == null") }
+            return runtime.makeNative("Lokio/Sink;", payload: VMOkioSinkPayload(stream: args[0]))
         }
         okio.staticMethod("buffer", "(Lokio/Source;)Lokio/BufferedSource;") { runtime, args, _ in
             guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .null }
@@ -523,12 +574,22 @@ enum FileRuntime {
 
     private static func flush(_ runtime: VMRuntime, sink value: VMValue) {
         guard let sink = runtime.payload(value, as: VMOkioSinkPayload.self) else { return }
+        if let stream = sink.stream {
+            if !sink.data.isEmpty { try? runtime.writeAllBytes(stream, data: sink.data) }
+            sink.data.removeAll()
+            return
+        }
         write(sink)
         sink.data.removeAll()
     }
 
     private static func flush(_ runtime: VMRuntime, bufferedSink value: VMValue) {
         guard let sink = runtime.payload(value, as: VMOkioBufferedSinkPayload.self) else { return }
+        if let stream = sink.sink.stream {
+            if !sink.sink.data.isEmpty { try? runtime.writeAllBytes(stream, data: sink.sink.data) }
+            sink.sink.data.removeAll()
+            return
+        }
         write(sink.sink)
         sink.sink.data.removeAll()
     }

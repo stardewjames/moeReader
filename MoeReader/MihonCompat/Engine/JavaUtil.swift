@@ -64,7 +64,7 @@ final class VMMapPayload {
 }
 
 final class VMListIteratorPayload {
-    let snapshot: [VMValue]
+    var snapshot: [VMValue]
     var index = 0
     var owner: VMListPayload?
     var lastIndex: Int?
@@ -223,7 +223,9 @@ enum JavaUtil {
         result += interfaces()
         result += arrayListClasses()
         result += linkedListClasses()
+        result += vectorClasses()
         result += setClasses()
+        result += copyOnWriteClasses()
         result += mapClasses()
         result += collectionViews()
         result += iteratorClasses()
@@ -270,6 +272,7 @@ enum JavaUtil {
             ("sort", "(Ljava/util/Comparator;)V"),
             ("subList", "(II)Ljava/util/List;"),
             ("listIterator", "()Ljava/util/ListIterator;"),
+            ("listIterator", "(I)Ljava/util/ListIterator;"),
         ] {
             list.method(name, signature) { _, _, _ in .zero }
         }
@@ -286,6 +289,7 @@ enum JavaUtil {
             ("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
             ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
             ("putAll", "(Ljava/util/Map;)V"),
             ("clear", "()V"),
             ("keySet", "()Ljava/util/Set;"),
@@ -309,7 +313,9 @@ enum JavaUtil {
         listIterator.method("hasPrevious", "()Z") { _, _, _ in .boolean(false) }
         listIterator.method("previous", "()Ljava/lang/Object;") { _, _, _ in .null }
 
-        return [collection, list, set, map, mapEntry, comparator, listIterator]
+        let randomAccess = NativeClass("Ljava/util/RandomAccess;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+
+        return [collection, list, set, map, mapEntry, comparator, listIterator, randomAccess]
     }
 
     // MARK: - java.util.ArrayList
@@ -414,7 +420,134 @@ enum JavaUtil {
         return [cls, deque, queue, abstractCollection]
     }
 
-    private static func listMethods(_ cls: NativeClass) {
+    /// `java.util.Vector` behaves like a synchronized `ArrayList` and exposes the
+    /// legacy `Enumeration` accessors, so it reuses the list method table and
+    /// adds the element-based API on top.
+    private static func vectorClasses() -> [NativeClass] {
+        let cls = NativeClass(
+            "Ljava/util/Vector;",
+            superclass: "Ljava/util/AbstractList;",
+            interfaces: ["Ljava/util/List;", "Ljava/util/RandomAccess;", "Ljava/lang/Cloneable;", "Ljava/io/Serializable;"]
+        )
+        cls.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload())
+            return .zero
+        }
+        cls.method("<init>", "(I)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload())
+            return .zero
+        }
+        cls.method("<init>", "(Ljava/util/Collection;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload(runtime.listItems(args[1]) ?? []))
+            return .zero
+        }
+        listMethods(cls)
+        cls.method("capacity", "()I") { runtime, args, _ in .int32(Int32(runtime.listPayload(args[0])?.items.count ?? 0)) }
+        cls.method("ensureCapacity", "(I)V") { _, _, _ in .zero }
+        cls.method("trimToSize", "()V") { _, _, _ in .zero }
+        cls.method("elementAt", "(I)Ljava/lang/Object;") { runtime, args, _ in
+            guard let list = runtime.listPayload(args[0]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < list.items.count else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "index \(index), size \(list.items.count)")
+            }
+            return list.items[index]
+        }
+        cls.method("firstElement", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let list = runtime.listPayload(args[0]), let first = list.items.first else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;")
+            }
+            return first
+        }
+        cls.method("lastElement", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let list = runtime.listPayload(args[0]), let last = list.items.last else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;")
+            }
+            return last
+        }
+        cls.method("addElement", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            try runtime.mutableList(args[0]).items.append(args[1])
+            return .zero
+        }
+        cls.method("insertElementAt", "(Ljava/lang/Object;I)V") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let index = Int(args[2].asInt32)
+            guard index >= 0, index <= list.items.count else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "index \(index), size \(list.items.count)")
+            }
+            list.items.insert(args[1], at: index)
+            return .zero
+        }
+        cls.method("setElementAt", "(Ljava/lang/Object;I)V") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let index = Int(args[2].asInt32)
+            guard index >= 0, index < list.items.count else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "index \(index), size \(list.items.count)")
+            }
+            list.items[index] = args[1]
+            return .zero
+        }
+        cls.method("removeElementAt", "(I)V") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < list.items.count else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "index \(index), size \(list.items.count)")
+            }
+            list.items.remove(at: index)
+            return .zero
+        }
+        cls.method("removeElement", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let list = try runtime.mutableList(args[0])
+            if let index = list.items.firstIndex(where: { runtime.javaEquals($0, args[1]) }) {
+                list.items.remove(at: index)
+                return .boolean(true)
+            }
+            return .boolean(false)
+        }
+        cls.method("removeAllElements", "()V") { runtime, args, _ in
+            try runtime.mutableList(args[0]).items.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        cls.method("elements", "()Ljava/util/Enumeration;") { runtime, args, _ in
+            let iterator = VMListIteratorPayload(runtime.listPayload(args[0])?.items ?? [])
+            return runtime.makeNative("Ljava/util/VectorEnumerator;", payload: iterator)
+        }
+        cls.method("copyInto", "([Ljava/lang/Object;)V") { runtime, args, _ in
+            let items = runtime.listPayload(args[0])?.items ?? []
+            let capacity = runtime.arrayLength(args[1])
+            for (index, item) in items.enumerated() where index < capacity {
+                runtime.setArrayElement(args[1], index: index, value: item)
+            }
+            return .zero
+        }
+
+        let enumeration = NativeClass(
+            "Ljava/util/Enumeration;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        enumeration.method("hasMoreElements", "()Z") { _, _, _ in .boolean(false) }
+        enumeration.method("nextElement", "()Ljava/lang/Object;") { _, _, _ in .null }
+
+        let enumerator = NativeClass("Ljava/util/VectorEnumerator;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/Enumeration;"])
+        enumerator.method("hasMoreElements", "()Z") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .boolean(false) }
+            return .boolean(iterator.index < iterator.snapshot.count)
+        }
+        enumerator.method("nextElement", "()Ljava/lang/Object;") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .null }
+            guard iterator.index < iterator.snapshot.count else {
+                throw VMJavaException("Ljava/util/NoSuchElementException;")
+            }
+            let value = iterator.snapshot[iterator.index]
+            iterator.index += 1
+            return value
+        }
+        return [cls, enumeration, enumerator]
+    }
+
+    static func listMethods(_ cls: NativeClass) {
         cls.method("size", "()I") { runtime, args, _ in .int32(Int32(runtime.listPayload(args[0])?.items.count ?? 0)) }
         cls.method("isEmpty", "()Z") { runtime, args, _ in .boolean((runtime.listPayload(args[0])?.items.count ?? 0) == 0) }
         cls.method("get", "(I)Ljava/lang/Object;") { runtime, args, _ in
@@ -491,6 +624,16 @@ enum JavaUtil {
         cls.method("listIterator", "()Ljava/util/ListIterator;") { runtime, args, _ in
             let payload = runtime.listPayload(args[0])
             return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(payload?.items ?? [], owner: payload))
+        }
+        cls.method("listIterator", "(I)Ljava/util/ListIterator;") { runtime, args, _ in
+            let payload = runtime.listPayload(args[0])
+            let iterator = VMListIteratorPayload(payload?.items ?? [], owner: payload)
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index <= iterator.snapshot.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(iterator.snapshot.count)")
+            }
+            iterator.index = index
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
         }
         cls.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
             let items = runtime.listItems(args[0]) ?? []
@@ -643,6 +786,77 @@ enum JavaUtil {
         }
     }
 
+    // MARK: - Copy-on-write collections
+
+    /// The engine runs one operation at a time, so a copy-on-write list behaves
+    /// exactly like an array-backed list; the class still exists because
+    /// extensions type their fields with it and iterate it.
+    private static func copyOnWriteClasses() -> [NativeClass] {
+        let list = NativeClass(
+            "Ljava/util/concurrent/CopyOnWriteArrayList;",
+            superclass: "Ljava/util/ArrayList;",
+            interfaces: ["Ljava/util/List;", "Ljava/util/RandomAccess;", "Ljava/lang/Cloneable;", "Ljava/io/Serializable;"]
+        )
+        list.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload())
+            return .zero
+        }
+        list.method("<init>", "(I)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload())
+            return .zero
+        }
+        list.method("<init>", "(Ljava/util/Collection;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMListPayload(runtime.listItems(args[1]) ?? []))
+            return .zero
+        }
+        list.method("addIfAbsent", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let items = try runtime.mutableList(args[0])
+            if items.items.contains(where: { runtime.javaEquals($0, args[1]) }) { return .boolean(false) }
+            items.items.append(args[1])
+            return .boolean(true)
+        }
+        list.method("addAllAbsent", "(Ljava/util/Collection;)I") { runtime, args, _ in
+            let items = try runtime.mutableList(args[0])
+            var added = 0
+            for item in runtime.listItems(args[1]) ?? [] where !items.items.contains(where: { runtime.javaEquals($0, item) }) {
+                items.items.append(item)
+                added += 1
+            }
+            return .int32(Int32(added))
+        }
+        list.method("addAll", "(Ljava/util/Collection;)Z") { runtime, args, _ in
+            let items = try runtime.mutableList(args[0])
+            items.items.append(contentsOf: runtime.listItems(args[1]) ?? [])
+            return .boolean(true)
+        }
+        list.method("clone", "()Ljava/lang/Object;") { runtime, args, _ in
+            runtime.makeNative("Ljava/util/concurrent/CopyOnWriteArrayList;", payload: VMListPayload(runtime.listItems(args[0]) ?? []))
+        }
+
+        let set = NativeClass(
+            "Ljava/util/concurrent/CopyOnWriteArraySet;",
+            superclass: "Ljava/util/AbstractSet;",
+            interfaces: ["Ljava/util/Set;", "Ljava/io/Serializable;"]
+        )
+        set.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMSetPayload())
+            return .zero
+        }
+        set.method("<init>", "(Ljava/util/Collection;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMSetPayload(runtime.listItems(args[1]) ?? []))
+            return .zero
+        }
+        set.method("addIfAbsent", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let payload = try runtime.mutableSet(args[0])
+            if payload.items.contains(where: { runtime.javaEquals($0, args[1]) }) { return .boolean(false) }
+            payload.items.append(args[1])
+            return .boolean(true)
+        }
+        setMethods(set)
+
+        return [list, set]
+    }
+
     // MARK: - Map
 
     private static func mapClasses() -> [NativeClass] {
@@ -686,7 +900,7 @@ enum JavaUtil {
         return [hashMap, linked, abstractMap]
     }
 
-    private static func mapMethods(_ cls: NativeClass) {
+    static func mapMethods(_ cls: NativeClass) {
         cls.method("size", "()I") { runtime, args, _ in .int32(Int32(runtime.mapPayload(args[0])?.entries.count ?? 0)) }
         cls.method("isEmpty", "()Z") { runtime, args, _ in .boolean((runtime.mapPayload(args[0])?.entries.count ?? 0) == 0) }
         cls.method("get", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
@@ -741,6 +955,15 @@ enum JavaUtil {
                 return map.entries.remove(at: index).value
             }
             return .null
+        }
+        cls.method("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z") { runtime, args, _ in
+            let map = try runtime.mutableMap(args[0])
+            guard let index = map.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else {
+                return .boolean(false)
+            }
+            guard runtime.javaEquals(map.entries[index].value, args[2]) else { return .boolean(false) }
+            map.entries.remove(at: index)
+            return .boolean(true)
         }
         cls.method("clear", "()V") { runtime, args, _ in
             try runtime.mutableMap(args[0]).entries.removeAll(keepingCapacity: true)
@@ -1003,6 +1226,15 @@ enum JavaUtil {
         cls.method("listIterator", "()Ljava/util/ListIterator;") { runtime, args, _ in
             runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(try viewItems(runtime, args[0]), immutable: true))
         }
+        cls.method("listIterator", "(I)Ljava/util/ListIterator;") { runtime, args, _ in
+            let iterator = VMListIteratorPayload(try viewItems(runtime, args[0]), immutable: true)
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index <= iterator.snapshot.count else {
+                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "index \(index), size \(iterator.snapshot.count)")
+            }
+            iterator.index = index
+            return runtime.makeNative("Ljava/util/ListItr;", payload: iterator)
+        }
         cls.method("subList", "(II)Ljava/util/List;") { runtime, args, _ in
             guard let view: VMArrayViewList = runtime.payload(args[0], as: VMArrayViewList.self) else {
                 throw VMJavaException("Ljava/lang/IllegalStateException;", "not an array-backed list")
@@ -1257,7 +1489,36 @@ enum JavaUtil {
             guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .null }
             guard iterator.index > 0 else { throw VMJavaException("Ljava/util/NoSuchElementException;") }
             iterator.index -= 1
+            iterator.lastIndex = iterator.index
             return iterator.snapshot[iterator.index]
+        }
+        cls.method("nextIndex", "()I") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .int32(0) }
+            return .int32(Int32(iterator.index))
+        }
+        cls.method("previousIndex", "()I") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .int32(-1) }
+            return .int32(Int32(iterator.index - 1))
+        }
+        cls.method("set", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .zero }
+            if iterator.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+            guard let last = iterator.lastIndex, last >= 0, last < iterator.snapshot.count,
+                  let owner = iterator.owner else { return .zero }
+            owner.items[last] = args[1]
+            iterator.snapshot[last] = args[1]
+            return .zero
+        }
+        cls.method("add", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .zero }
+            if iterator.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+            guard let owner = iterator.owner else { return .zero }
+            let position = max(0, min(iterator.index, iterator.snapshot.count))
+            owner.items.insert(args[1], at: position)
+            iterator.snapshot.insert(args[1], at: position)
+            iterator.index = position + 1
+            iterator.lastIndex = nil
+            return .zero
         }
         cls.method("remove", "()V") { runtime, args, _ in
             guard let iterator = runtime.payload(args[0], as: VMListIteratorPayload.self) else { return .zero }
@@ -1701,29 +1962,182 @@ enum JavaUtil {
         }
         result.append(classLoader)
 
+        let flushable = NativeClass(
+            "Ljava/io/Flushable;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        flushable.method("flush", "()V") { _, _, _ in .zero }
+        result.append(flushable)
+
+        let outputStream = NativeClass("Ljava/io/OutputStream;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Closeable;", "Ljava/io/Flushable;"])
+        outputStream.method("write", "(I)V") { _, _, _ in .zero }
+        outputStream.method("write", "([B)V") { _, _, _ in .zero }
+        outputStream.method("write", "([BII)V") { _, _, _ in .zero }
+        outputStream.method("flush", "()V") { _, _, _ in .zero }
+        outputStream.method("close", "()V") { _, _, _ in .zero }
+        result.append(outputStream)
+
         let inputStream = NativeClass("Ljava/io/InputStream;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Closeable;"])
-        inputStream.method("read", "()I") { _, _, _ in .int32(-1) }
-        inputStream.method("available", "()I") { _, _, _ in .int32(0) }
+        inputStream.method("read", "()I") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(-1) }
+            guard payload.offset < payload.data.count else { return .int32(-1) }
+            let byte = payload.data[payload.data.startIndex + payload.offset]
+            payload.offset += 1
+            return .int32(Int32(byte))
+        }
+        inputStream.method("read", "([B)I") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(-1) }
+            let count = runtime.arrayLength(args[1])
+            return .int32(Int32(readBytes(runtime, payload: payload, into: args[1], offset: 0, count: count)))
+        }
+        inputStream.method("read", "([BII)I") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(-1) }
+            return .int32(Int32(readBytes(
+                runtime, payload: payload, into: args[1],
+                offset: Int(args[2].asInt32), count: Int(args[3].asInt32)
+            )))
+        }
+        inputStream.method("skip", "(J)J") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .int64(0) }
+            let remaining = max(0, payload.data.count - payload.offset)
+            let skipped = min(remaining, Int(max(0, args[1].asInt64)))
+            payload.offset += skipped
+            return .int64(Int64(skipped))
+        }
+        inputStream.method("available", "()I") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(0) }
+            return .int32(Int32(max(0, payload.data.count - payload.offset)))
+        }
         inputStream.method("close", "()V") { _, _, _ in .zero }
-        inputStream.method("read", "([BII)I") { _, _, _ in .int32(-1) }
+        inputStream.method("mark", "(I)V") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .zero }
+            payload.markOffset = payload.offset
+            return .zero
+        }
+        inputStream.method("reset", "()V") { runtime, args, _ in
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .zero }
+            payload.offset = payload.markOffset
+            return .zero
+        }
+        inputStream.method("markSupported", "()Z") { _, _, _ in .boolean(true) }
         result.append(inputStream)
 
         let byteStream = NativeClass("Ljava/io/ByteArrayInputStream;", superclass: "Ljava/io/InputStream;")
         byteStream.method("<init>", "([B)V") { runtime, args, _ in
-            var data = Data()
-            for index in 0..<runtime.arrayLength(args[1]) {
-                data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(args[1], index).asInt32))
-            }
-            runtime.setPayload(args[0], data)
+            runtime.setPayload(args[0], VMInputStreamPayload(data(from: args[1], runtime: runtime, offset: 0, count: runtime.arrayLength(args[1]))))
+            return .zero
+        }
+        byteStream.method("<init>", "([BII)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMInputStreamPayload(data(
+                from: args[1], runtime: runtime,
+                offset: Int(args[2].asInt32), count: Int(args[3].asInt32)
+            )))
             return .zero
         }
         byteStream.method("available", "()I") { runtime, args, _ in
-            let payload: Data = try runtime.payloadBox(args[0])
-            return .int32(Int32(payload.count))
+            guard let payload = runtime.inputStreamPayload(args[0]) else { return .int32(0) }
+            return .int32(Int32(max(0, payload.data.count - payload.offset)))
         }
         byteStream.method("close", "()V") { _, _, _ in .zero }
         result.append(byteStream)
+
+        let byteOut = NativeClass("Ljava/io/ByteArrayOutputStream;", superclass: "Ljava/io/OutputStream;")
+        byteOut.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMByteArrayOutputStreamPayload())
+            return .zero
+        }
+        byteOut.method("<init>", "(I)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMByteArrayOutputStreamPayload())
+            return .zero
+        }
+        byteOut.method("write", "(I)V") { runtime, args, _ in
+            let payload = runtime.mutableByteArrayOutputStream(args[0])
+            payload.data.append(UInt8(truncatingIfNeeded: args[1].asInt32))
+            return .zero
+        }
+        byteOut.method("write", "([B)V") { runtime, args, _ in
+            let payload = runtime.mutableByteArrayOutputStream(args[0])
+            payload.data.append(data(from: args[1], runtime: runtime, offset: 0, count: runtime.arrayLength(args[1])))
+            return .zero
+        }
+        byteOut.method("write", "([BII)V") { runtime, args, _ in
+            let payload = runtime.mutableByteArrayOutputStream(args[0])
+            payload.data.append(data(
+                from: args[1], runtime: runtime,
+                offset: Int(args[2].asInt32), count: Int(args[3].asInt32)
+            ))
+            return .zero
+        }
+        byteOut.method("toByteArray", "()[B") { runtime, args, _ in
+            let payload = runtime.mutableByteArrayOutputStream(args[0])
+            return byteArray(payload.data, runtime: runtime)
+        }
+        byteOut.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.mutableByteArrayOutputStream(args[0]).data.count))
+        }
+        byteOut.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let payload = runtime.mutableByteArrayOutputStream(args[0])
+            return runtime.newString(String(decoding: payload.data, as: UTF8.self))
+        }
+        byteOut.method("toString", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            let payload = runtime.mutableByteArrayOutputStream(args[0])
+            let charset = runtime.stringValue(args[1]) ?? "UTF-8"
+            return runtime.newString(runtime.decode(bytes: Array(payload.data), charset: charset))
+        }
+        byteOut.method("reset", "()V") { runtime, args, _ in
+            runtime.mutableByteArrayOutputStream(args[0]).data.removeAll(keepingCapacity: true)
+            return .zero
+        }
+        byteOut.method("flush", "()V") { _, _, _ in .zero }
+        byteOut.method("close", "()V") { _, _, _ in .zero }
+        byteOut.method("writeTo", "(Ljava/io/OutputStream;)V") { runtime, args, _ in
+            guard let target = runtime.byteArrayOutputStreamPayload(args[1]) else { return .zero }
+            target.data.append(runtime.mutableByteArrayOutputStream(args[0]).data)
+            return .zero
+        }
+        result.append(byteOut)
         return result
+    }
+
+    // MARK: - Byte stream helpers
+
+    static func data(from array: VMValue, runtime: VMRuntime, offset: Int, count: Int) -> Data {
+        let total = runtime.arrayLength(array)
+        let start = max(0, min(offset, total))
+        let length = max(0, min(count, total - start))
+        var data = Data(capacity: length)
+        for index in start..<(start + length) {
+            data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(array, index).asInt32))
+        }
+        return data
+    }
+
+    static func byteArray(_ data: Data, runtime: VMRuntime) -> VMValue {
+        let array = runtime.newArray(component: "B", count: data.count)
+        for (offset, byte) in data.enumerated() {
+            runtime.setArrayElement(array, index: offset, value: .int32(Int32(Int8(bitPattern: byte))))
+        }
+        return array
+    }
+
+    /// Copies up to `count` bytes into `target`, returning how many were read
+    /// (`-1` at end of stream, like `InputStream.read`).
+    static func readBytes(_ runtime: VMRuntime, payload: VMInputStreamPayload, into target: VMValue, offset: Int, count: Int) -> Int {
+        let total = runtime.arrayLength(target)
+        let start = max(0, min(offset, total))
+        let room = max(0, min(count, total - start))
+        guard room > 0 else { return 0 }
+        let available = max(0, payload.data.count - payload.offset)
+        guard available > 0 else { return -1 }
+        let length = min(available, room)
+        let base = payload.data.startIndex + payload.offset
+        for index in 0..<length {
+            runtime.setArrayElement(target, index: start + index, value: .int32(Int32(Int8(bitPattern: payload.data[base + index]))))
+        }
+        payload.offset += length
+        return length
     }
 
     private static func objectsClass() -> [NativeClass] {
@@ -1819,5 +2233,53 @@ final class VMEntrySetPayload {
     init(entries: [(key: VMValue, value: VMValue)], owner: VMMapPayload? = nil) {
         self.snapshot = entries
         self.owner = owner
+    }
+}
+
+/// Byte-stream cursor shared by `java.io.InputStream` subclasses. Several host
+/// classes hand an InputStream a plain `Data` payload; `inputStreamPayload`
+/// upgrades those lazily so a stream always has a position.
+final class VMInputStreamPayload {
+    var data: Data
+    var offset = 0
+    var markOffset = 0
+
+    init(_ data: Data) {
+        self.data = data
+    }
+
+    init(bytes: [UInt8]) {
+        self.data = Data(bytes)
+    }
+}
+
+final class VMByteArrayOutputStreamPayload {
+    var data = Data()
+}
+
+extension VMRuntime {
+    func inputStreamPayload(_ value: VMValue) -> VMInputStreamPayload? {
+        if let existing: VMInputStreamPayload = payload(value, as: VMInputStreamPayload.self) {
+            return existing
+        }
+        if let data: Data = payload(value, as: Data.self) {
+            let wrapped = VMInputStreamPayload(data)
+            setPayload(value, wrapped)
+            return wrapped
+        }
+        return nil
+    }
+
+    func byteArrayOutputStreamPayload(_ value: VMValue) -> VMByteArrayOutputStreamPayload? {
+        payload(value, as: VMByteArrayOutputStreamPayload.self)
+    }
+
+    func mutableByteArrayOutputStream(_ value: VMValue) -> VMByteArrayOutputStreamPayload {
+        if let existing: VMByteArrayOutputStreamPayload = payload(value, as: VMByteArrayOutputStreamPayload.self) {
+            return existing
+        }
+        let created = VMByteArrayOutputStreamPayload()
+        setPayload(value, created)
+        return created
     }
 }

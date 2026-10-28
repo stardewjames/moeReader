@@ -41,14 +41,20 @@ enum MihonFilters {
         case .text:
             filter.value = runtime.stringValue(payload.state) ?? ""
         case .checkbox:
-            filter.value = payload.state.bits == 0 ? "false" : (payload.state.asBoolean ? "true" : "false")
+            // `Filter.getState()` may hand back a boxed `java.lang.Boolean`
+            // (non-null bits would read as true under raw `asBoolean`).
+            let state = payload.state
+            let enabled = state.bits == 0
+                ? false
+                : (runtime.isObjectValue(state) ? state.asBoolean2() : state.asBoolean)
+            filter.value = enabled ? "true" : "false"
         case .tristate:
-            filter.value = String(payload.state.asInt32)
+            filter.value = String(stateInt(runtime, payload.state))
         case .select:
             let values = arrayValues(runtime, value: payload.values)
             filter.entries = values.map { runtime.stringValue(runtime.javaToString($0)) ?? "" }
             filter.entryValues = filter.entries.indices.map(String.init)
-            filter.value = String(payload.state.asInt32)
+            filter.value = String(stateInt(runtime, payload.state))
         case .sort:
             let values = arrayValues(runtime, value: payload.values).compactMap { runtime.stringValue($0) }
             filter.entries = values
@@ -106,6 +112,14 @@ enum MihonFilters {
             payload.sortSelection = object
             payload.state = object
         }
+    }
+
+    /// Filter state is an `Object` on the Java side, so tri-state and select
+    /// values arrive either as a primitive int or boxed `java.lang.Integer`.
+    private static func stateInt(_ runtime: VMRuntime, _ value: VMValue) -> Int32 {
+        guard value.bits != 0 else { return 0 }
+        if runtime.isObjectValue(value) { return value.asBoxedInt(runtime) }
+        return value.asInt32
     }
 
     private static func arrayValues(_ runtime: VMRuntime, value: VMValue) -> [VMValue] {

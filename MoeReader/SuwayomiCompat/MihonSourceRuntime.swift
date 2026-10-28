@@ -197,15 +197,50 @@ protocol MihonSourceFilterProviding: Sendable {
     ) async throws -> MihonMangaPage
 }
 
+/// Static properties of a source that gate what the UI may offer. Runtimes
+/// that cannot report them keep the Mihon API defaults.
+struct MihonSourceCapabilities: Sendable, Hashable {
+    /// `CatalogueSource.supportsLatest`: false when the source has no latest feed.
+    var supportsLatest: Bool
+    /// `Source.isNsfw`: the source explicitly serves adult content.
+    var isNsfw: Bool
+
+    init(supportsLatest: Bool = true, isNsfw: Bool = false) {
+        self.supportsLatest = supportsLatest
+        self.isNsfw = isNsfw
+    }
+}
+
 /// Page numbers follow the Mihon source API: the first page is 1.
 protocol MihonSourceRuntime: Sendable {
     var descriptor: MihonRuntimeDescriptor { get }
     func popular(source: MihonSource, page: Int) async throws -> MihonMangaPage
     func latest(source: MihonSource, page: Int) async throws -> MihonMangaPage
     func search(query: String, source: MihonSource, page: Int) async throws -> MihonMangaPage
+    /// Ask the source which optional feeds it implements.
+    func capabilities(source: MihonSource) async throws -> MihonSourceCapabilities
     func manga(id: String, source: MihonSource) async throws -> MihonManga
+    /// Same lookup with the title known from the browse list. Sources that
+    /// derive their details URL from it need the title; others ignore it.
+    func manga(id: String, source: MihonSource, title: String?) async throws -> MihonManga
     func chapters(manga: MihonManga, source: MihonSource) async throws -> [MihonChapter]
     func pages(chapter: MihonChapter, manga: MihonManga, source: MihonSource) async throws -> [MihonPage]
+    /// Bytes of one reader page. Routed through the extension's own client so
+    /// its image interceptors (descrambling, merging, text pages) run.
+    func pageImage(page: MihonPage, chapter: MihonChapter, source: MihonSource) async throws -> Data
+}
+
+extension MihonSourceRuntime {
+    /// Runtimes that cannot use the title fall back to the plain lookup.
+    func manga(id: String, source: MihonSource, title: String?) async throws -> MihonManga {
+        try await manga(id: id, source: source)
+    }
+
+    /// Mihon's API defaults: every catalogue source has a latest feed and no
+    /// source is marked NSFW unless it says so.
+    func capabilities(source: MihonSource) async throws -> MihonSourceCapabilities {
+        MihonSourceCapabilities()
+    }
 }
 
 struct MihonRuntimeRegistry: Sendable {

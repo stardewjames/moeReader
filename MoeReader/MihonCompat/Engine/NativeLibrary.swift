@@ -23,6 +23,7 @@ enum NativeLibrary {
         result += JavaCore.classes()
         result += JavaUtil.classes()
         result += KotlinRuntime.classes()
+        result += KotlinSupportRuntime.classes()
         result += OkHttpRuntime.classes()
         result += JsoupRuntime.classes()
         result += MihonAPI.classes()
@@ -34,9 +35,14 @@ enum NativeLibrary {
         result += I18nRuntime.classes()
         result += PlatformRuntime.classes()
         result += JavaTimeRuntime.classes()
+        result += JavaTextRuntime.classes()
+        result += CryptoRuntime.classes()
         result += JavaShared.classes()
         result += FileRuntime.classes()
         result += ZstdRuntime.classes()
+        result += WebKitRuntime.classes()
+        result += GraphicsRuntime.classes()
+        result += QuickJSRuntime.classes()
         return result
     }
 }

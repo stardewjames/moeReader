@@ -8,16 +8,22 @@
 //
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 protocol VMHost: AnyObject {
     func performRequest(_ request: VMHTTPRequest) throws -> VMHTTPResponse
     func preferences() -> VMPreferences
     func log(_ message: String)
-    /// Called once when a response looks like a Cloudflare interstitial. Return
-    /// true after the challenge has been cleared (cookies now available).
+    /// Called once when a response looks like a browser-check interstitial
+    /// (Cloudflare or DDoS-Guard). Return true after the challenge has been
+    /// cleared (clearance cookies are now in `cookieStorage()`).
     func solveChallenge(_ request: VMHTTPRequest) throws -> Bool
     /// Per-extension writable directory used by `java.io.File` and okio.
     func extensionFileRoot() -> String
+    /// Cookie jar shared with the host transport (`CookieManager`, WebView).
+    func cookieStorage() -> HTTPCookieStorage
 }
 
 extension VMHost {
@@ -26,6 +32,7 @@ extension VMHost {
     func extensionFileRoot() -> String {
         (NSTemporaryDirectory() as NSString).appendingPathComponent("mihoncompat")
     }
+    func cookieStorage() -> HTTPCookieStorage { HTTPCookieStorage.shared }
 }
 
 struct VMHTTPRequest {
@@ -62,6 +69,8 @@ extension VMPreferences {
 
 final class VMRuntime: @unchecked Sendable {
     let heap = VMHeap()
+    /// Host callbacks (WebView, JS bridge) waiting to run on the engine thread.
+    let hostEvents = VMHostEventQueue()
 
     private(set) var dexFiles: [DexFile] = []
     var nativeClasses: [String: NativeClass] = [:]
@@ -82,6 +91,24 @@ final class VMRuntime: @unchecked Sendable {
     /// Guards runaway execution in a hostile extension.
     var instructionBudget = 50_000_000
     private var instructionsExecuted = 0
+    /// Wall-clock bound for the source operation in flight. Extensions cannot be
+    /// pre-empted, so interpreted code checks this tick and native helpers call
+    /// `checkOperationDeadline()` from their own loops: a pathological page or
+    /// a retry loop ends in `VMCallTimeout` instead of wedging the host.
+    var operationDeadline: DispatchTime?
+    /// Budget for one operation; generous enough for a large page on a slow
+    /// device, short enough that a hang surfaces instead of blocking forever.
+    /// Hosts can tune it (`MIHON_OP_TIMEOUT`, seconds).
+    var operationTimeout: TimeInterval = ProcessInfo.processInfo.environment["MIHON_OP_TIMEOUT"]
+        .flatMap(Double.init) ?? 60
+    var operationName = ""
+    private var operationDepth = 0
+    /// Set when a timeout aborted an operation; the engine reloads the
+    /// extension before the next call so half-finished extension state (a manga
+    /// mid-update, an open coroutine) cannot poison later operations.
+    private var operationTimedOut = false
+    private var hostEventPumpCountdown = VMRuntime.hostEventPumpInterval
+    private var pumpingHostEvents = false
 
     var stringClass: VMClass { cachedClass("Ljava/lang/String;") }
     var objectClass: VMClass { cachedClass("Ljava/lang/Object;") }
@@ -97,6 +124,11 @@ final class VMRuntime: @unchecked Sendable {
     var jsonKindValue: VMValue?
     var primitiveSerializerCache: [String: VMValue] = [:]
     var callDepth = 0
+    /// Thread whose native stack bounds `stackGuardLimit` describes.
+    private var stackGuardThread: pthread_t?
+    /// Lowest native stack address an invocation may start below; deeper
+    /// calls throw `StackOverflowError` instead of overflowing the thread stack.
+    private var stackGuardLimit: UInt = 0
     var discoveredSerializerCache: [String: VMValue] = [:]
     var discoveredSerializers = false
     /// Loads an asset from the installed package, by path as written in the APK
@@ -258,6 +290,15 @@ final class VMRuntime: @unchecked Sendable {
         return nativeObjects[index] as? T
     }
 
+    /// True when `value` holds a reference into the VM heap. A value cell also
+    /// carries raw primitives (`1` for `true`, small ints), whose bits are not
+    /// valid pointers, so callers that accept either representation must check
+    /// the address before dereferencing.
+    @inline(__always) func isObjectValue(_ value: VMValue) -> Bool {
+        guard let pointer = value.object else { return false }
+        return heap.contains(pointer)
+    }
+
     @inline(__always) func payloadBox<T>(_ value: VMValue, as type: T.Type) throws -> T {
         try payloadBox(value)
     }
@@ -394,14 +435,20 @@ final class VMRuntime: @unchecked Sendable {
 
     // MARK: - Invocation
 
+    /// Extra zeroed slots after native arguments: a native that reads past its
+    /// declared parameters sees `null` instead of foreign stack memory.
+    private static let nativeArgumentPadding = 4
+
     @discardableResult
     func invoke(_ method: VMMethod, arguments: UnsafePointer<VMValue>, count: Int) throws -> VMValue {
         if traceEnabled {
             FileHandle.standardError.write("CALL \(method.ownerDescriptor).\(method.key)\n".data(using: .utf8)!)
         }
+        try checkNativeStack()
         if let body = method.body {
             let parameterCount = (method.isStatic ? 0 : 1) + method.parameterTypes.count
-            return try withUnsafeTemporaryAllocation(of: VMValue.self, capacity: max(parameterCount, 1)) { buffer in
+            let capacity = parameterCount + VMRuntime.nativeArgumentPadding
+            return try withUnsafeTemporaryAllocation(of: VMValue.self, capacity: capacity) { buffer in
                 var output = 0
                 var input = 0
                 if !method.isStatic {
@@ -414,6 +461,7 @@ final class VMRuntime: @unchecked Sendable {
                     output += 1
                     input += DexDescriptor.isWide(type) ? 2 : 1
                 }
+                for index in output..<capacity { buffer[index] = .zero }
                 return try body(self, buffer.baseAddress!, parameterCount)
             }
         }
@@ -429,6 +477,47 @@ final class VMRuntime: @unchecked Sendable {
             arguments: arguments,
             argumentCount: count
         )
+    }
+
+    /// Throws `StackOverflowError` when the current thread is about to run out
+    /// of native stack. Interpreted calls recurse on the host stack, so deep
+    /// Java recursion must fail as a Java error, never as a host crash.
+    @inline(__always)
+    func checkNativeStack() throws {
+        var marker: UInt8 = 0
+        let address = withUnsafeMutablePointer(to: &marker) { UInt(bitPattern: $0) }
+        let thread = pthread_self()
+        if stackGuardThread == nil || pthread_equal(stackGuardThread!, thread) == 0 {
+            stackGuardThread = thread
+            stackGuardLimit = VMRuntime.stackGuardLimit(for: thread)
+        }
+        if address < stackGuardLimit {
+            throw VMJavaException("Ljava/lang/StackOverflowError;", "stack size exhausted")
+        }
+    }
+
+    /// Low stack bound plus a reserve for the native work (parsing, regex,
+    /// networking) a frame may still do; 0 when the bounds are unknown.
+    private static func stackGuardLimit(for thread: pthread_t) -> UInt {
+        var low: UInt = 0
+        var size: UInt = 0
+        #if canImport(Darwin)
+        size = UInt(pthread_get_stacksize_np(thread))
+        let high = UInt(bitPattern: pthread_get_stackaddr_np(thread))
+        guard high > size else { return 0 }
+        low = high - size
+        #elseif canImport(Glibc)
+        var attributes = pthread_attr_t()
+        guard glibcThreadAttributes(thread, &attributes) == 0 else { return 0 }
+        defer { pthread_attr_destroy(&attributes) }
+        var base: UnsafeMutableRawPointer?
+        var length = 0
+        guard pthread_attr_getstack(&attributes, &base, &length) == 0, let base else { return 0 }
+        low = UInt(bitPattern: base)
+        size = UInt(length)
+        #endif
+        guard size > 0 else { return 0 }
+        return low + min(256 * 1024, size / 4)
     }
 
     func invoke(_ method: VMMethod, _ arguments: [VMValue]) throws -> VMValue {
@@ -456,13 +545,98 @@ final class VMRuntime: @unchecked Sendable {
 
     func instructionTick(_ count: Int) throws {
         instructionsExecuted += count
+        try checkOperationDeadline()
         if instructionsExecuted > instructionBudget {
             throw VMJavaException("Ljava/lang/StackOverflowError;", "instruction budget exhausted")
         }
+        // Host callbacks posted by other threads (WebView navigation finished,
+        // JS bridge, console) run on the engine thread here: an extension that
+        // spins in interpreted code waiting for a completion still observes it.
+        // Pumping every 64th tick keeps the queue lock off the hot path.
+        if hostEventPumpCountdown == 0 {
+            hostEventPumpCountdown = VMRuntime.hostEventPumpInterval
+            pumpHostEvents()
+        } else {
+            hostEventPumpCountdown -= 1
+        }
     }
+
+    /// Runs host-posted callbacks on the caller (engine) thread. Hosts that
+    /// block on an asynchronous callback call this in their wait loop.
+    @discardableResult
+    func pumpHostEvents(waitingUpTo seconds: TimeInterval = 0) -> Bool {
+        // A callback that runs interpreted code reaches `instructionTick`
+        // again; never nest a second drain inside the first.
+        guard !pumpingHostEvents else { return false }
+        pumpingHostEvents = true
+        defer { pumpingHostEvents = false }
+        return hostEvents.drain(waitingUpTo: seconds)
+    }
+
+    private static let hostEventPumpInterval = 64
 
     func resetBudget() {
         instructionsExecuted = 0
+    }
+
+    /// Runs `body` as one bounded source operation: instruction budget reset,
+    /// wall-clock deadline armed, deadline cleared afterwards.
+    @discardableResult
+    func withOperation<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        resetBudget()
+        beginOperation(name)
+        defer { endOperation() }
+        return try body()
+    }
+
+    // MARK: - Operation budget
+
+    /// Marks the start of a host-initiated source operation (`load`, `popular`,
+    /// `details`, ...). Nested operations share the outermost deadline so an
+    /// extension cannot extend its budget by recursing through the base class.
+    func beginOperation(_ name: String) {
+        operationDepth += 1
+        guard operationDepth == 1 else { return }
+        resetBudget()
+        operationName = name
+        operationDeadline = DispatchTime.now() + operationTimeout
+    }
+
+    func endOperation() {
+        operationDepth = max(0, operationDepth - 1)
+        guard operationDepth == 0 else { return }
+        operationDeadline = nil
+        operationName = ""
+    }
+
+    /// Throw a typed timeout once the current operation has run past its
+    /// wall-clock budget. Safe (and cheap) to call from native inner loops.
+    func checkOperationDeadline() throws {
+        guard let deadline = operationDeadline else { return }
+        guard DispatchTime.now().uptimeNanoseconds > deadline.uptimeNanoseconds else { return }
+        operationDeadline = nil
+        operationTimedOut = true
+        throw VMCallTimeout(operation: operationName, seconds: operationTimeout)
+    }
+
+    /// True once after a timeout, so the caller can reset the extension state.
+    func consumeOperationTimeout() -> Bool {
+        defer { operationTimedOut = false }
+        return operationTimedOut
+    }
+}
+
+/// A source operation ran past its wall-clock budget. Distinct from
+/// `VMJavaException` so interpreted `catch` blocks cannot swallow it: the host
+/// sees a typed failure and the engine stays usable.
+struct VMCallTimeout: Error, CustomStringConvertible, Equatable {
+    let operation: String
+    let seconds: TimeInterval
+
+    var description: String {
+        operation.isEmpty
+            ? "source operation timed out after \(Int(seconds))s"
+            : "\(operation) timed out after \(Int(seconds))s"
     }
 }
 
@@ -476,3 +650,10 @@ extension VMClass {
         return nil
     }
 }
+
+#if canImport(Glibc)
+/// glibc exports `pthread_getattr_np` only under `_GNU_SOURCE`, which the Swift
+/// Glibc module does not define.
+@_silgen_name("pthread_getattr_np")
+private func glibcThreadAttributes(_ thread: pthread_t, _ attributes: UnsafeMutablePointer<pthread_attr_t>) -> Int32
+#endif

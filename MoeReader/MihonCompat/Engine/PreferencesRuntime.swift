@@ -31,6 +31,12 @@ struct MihonEnginePreference: Identifiable, Hashable, Sendable {
     var values: [String]
 }
 
+/// State a headless `TextView`/`EditText` keeps while a preference dialog lives.
+final class VMTextViewPayload {
+    var text: VMValue = .null
+    var error: VMValue = .null
+}
+
 final class VMUiPreferencePayload {
     var kind: MihonEnginePreference.Kind
     var title = ""
@@ -85,6 +91,24 @@ enum PreferencesRuntime {
         }
         preference.method("getKey", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(try runtime.preference(args[0]).key)
+        }
+        // androidx.preference.Preference carries the dialog attributes; the
+        // EditTextPreference/ListPreference subclasses inherit them.
+        preference.method("setDialogMessage", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            try runtime.preference(args[0]).summary = runtime.stringValue(args[1])
+            return .zero
+        }
+        preference.method("getDialogMessage", "()Ljava/lang/CharSequence;") { runtime, args, _ in
+            guard let summary = try runtime.preference(args[0]).summary else { return .null }
+            return runtime.newString(summary)
+        }
+        preference.method("setDialogTitle", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            try runtime.preference(args[0]).dialogTitle = runtime.stringValue(args[1])
+            return .zero
+        }
+        preference.method("getDialogTitle", "()Ljava/lang/CharSequence;") { runtime, args, _ in
+            guard let title = try runtime.preference(args[0]).dialogTitle else { return .null }
+            return runtime.newString(title)
         }
         preference.method("setEnabled", "(Z)V") { runtime, args, _ in
             try runtime.preference(args[0]).enabled = args[1].asBoolean
@@ -284,13 +308,48 @@ enum PreferencesRuntime {
         switchPref.method("setSummaryOff", "(Ljava/lang/CharSequence;)V") { _, _, _ in .zero }
         result.append(switchPref)
 
-        let editText = NativeClass("Landroid/widget/EditText;", superclass: "Ljava/lang/Object;")
+        // Headless widgets: preference dialogs only observe state through these
+        // accessors, so the values are stored even though nothing renders.
+        let textView = NativeClass("Landroid/widget/TextView;", superclass: "Ljava/lang/Object;")
+        textView.method("<init>", "(Landroid/content/Context;)V") { _, _, _ in .zero }
+        textView.method("setText", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            runtime.setTextViewText(args[0], args[1])
+            return .zero
+        }
+        textView.method("getText", "()Landroid/text/Editable;") { runtime, args, _ in
+            runtime.textViewText(args[0]) ?? .null
+        }
+        textView.method("setHint", "(Ljava/lang/CharSequence;)V") { _, _, _ in .zero }
+        textView.method("getHint", "()Ljava/lang/CharSequence;") { _, _, _ in .null }
+        textView.method("addTextChangedListener", "(Landroid/text/TextWatcher;)V") { _, _, _ in .zero }
+        textView.method("removeTextChangedListener", "(Landroid/text/TextWatcher;)V") { _, _, _ in .zero }
+        textView.method("setError", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            runtime.setTextViewError(args[0], args[1])
+            return .zero
+        }
+        textView.method("getError", "()Ljava/lang/CharSequence;") { runtime, args, _ in
+            runtime.textViewError(args[0]) ?? .null
+        }
+        textView.method("setHorizontallyScrolling", "(Z)V") { _, _, _ in .zero }
+        textView.method("setInputType", "(I)V") { _, _, _ in .zero }
+        textView.method("setSingleLine", "(Z)V") { _, _, _ in .zero }
+        textView.method("setEnabled", "(Z)V") { _, _, _ in .zero }
+        textView.method("isEnabled", "()Z") { _, _, _ in .boolean(true) }
+        textView.method("getSelectionStart", "()I") { _, _, _ in .int32(0) }
+        textView.method("getSelectionEnd", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.stringValue(runtime.textViewText(args[0]) ?? .null)?.utf16.count ?? 0))
+        }
+        result.append(textView)
+
+        let editText = NativeClass("Landroid/widget/EditText;", superclass: "Landroid/widget/TextView;")
         editText.method("<init>", "(Landroid/content/Context;)V") { _, _, _ in .zero }
-        editText.method("setText", "(Ljava/lang/CharSequence;)V") { _, _, _ in .zero }
-        editText.method("getText", "()Landroid/text/Editable;") { _, _, _ in .null }
-        editText.method("addTextChangedListener", "(Landroid/text/TextWatcher;)V") { _, _, _ in .zero }
-        editText.method("setError", "(Ljava/lang/CharSequence;)V") { _, _, _ in .zero }
-        editText.method("getError", "()Ljava/lang/CharSequence;") { _, _, _ in .null }
+        editText.method("selectAll", "()V") { _, _, _ in .zero }
+        editText.method("setSelection", "(I)V") { _, _, _ in .zero }
+        editText.method("append", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
+            let existing = runtime.stringValue(runtime.textViewText(args[0]) ?? .null) ?? ""
+            runtime.setTextViewText(args[0], runtime.newString(existing + (runtime.stringValue(args[1]) ?? "")))
+            return .zero
+        }
         result.append(editText)
         result.append(NativeClass("Landroid/text/Editable;", superclass: nil, interfaces: ["Ljava/lang/CharSequence;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
         result.append(NativeClass("Landroid/text/TextWatcher;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract))
@@ -307,6 +366,29 @@ enum PreferencesRuntime {
 }
 
 extension VMRuntime {
+    private func textViewStore(_ value: VMValue) -> VMTextViewPayload {
+        if let existing: VMTextViewPayload = payload(value, as: VMTextViewPayload.self) { return existing }
+        let created = VMTextViewPayload()
+        setPayload(value, created)
+        return created
+    }
+
+    func setTextViewText(_ value: VMValue, _ text: VMValue) {
+        textViewStore(value).text = text
+    }
+
+    func textViewText(_ value: VMValue) -> VMValue? {
+        payload(value, as: VMTextViewPayload.self)?.text
+    }
+
+    func setTextViewError(_ value: VMValue, _ text: VMValue) {
+        textViewStore(value).error = text
+    }
+
+    func textViewError(_ value: VMValue) -> VMValue? {
+        payload(value, as: VMTextViewPayload.self)?.error
+    }
+
     func preference(_ value: VMValue) throws -> VMUiPreferencePayload {
         try payloadBox(value, as: VMUiPreferencePayload.self)
     }

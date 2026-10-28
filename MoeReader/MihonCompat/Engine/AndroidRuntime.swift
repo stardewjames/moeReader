@@ -39,13 +39,414 @@ final class VMTypePayload {
     init(name: String) { self.name = name }
 }
 
+final class VMLruCachePayload {
+    var maxSize: Int
+    /// Least recently used first, so eviction takes from the front and a hit
+    /// moves the entry to the back.
+    var entries: [(key: VMValue, value: VMValue)] = []
+    init(maxSize: Int) { self.maxSize = max(0, maxSize) }
+}
+
+final class VMLooperPayload {}
+
+final class VMHandlerPayload {
+    let looper: VMValue
+    var pending: [(token: VMValue, runnable: VMValue)] = []
+    init(looper: VMValue) { self.looper = looper }
+}
+
+final class VMMessagePayload {
+    var what: Int32 = 0
+    var arg1: Int32 = 0
+    var arg2: Int32 = 0
+    var obj: VMValue = .null
+    var target: VMValue = .null
+    var callback: VMValue = .null
+}
+
+/// Metrics for the host's virtual display: the engine renders off-screen, so
+/// extensions that size bitmaps or convert dp receive a stable logical screen.
+final class VMDisplayMetricsPayload {
+    var widthPixels: Int32 = 1080
+    var heightPixels: Int32 = 1920
+    var density: Float = 3
+    var densityDpi: Int32 = 480
+    var scaledDensity: Float = 3
+    var xdpi: Float = 480
+    var ydpi: Float = 480
+}
+
+final class VMResourcesPayload {}
+
 enum AndroidRuntime {
     static func classes() -> [NativeClass] {
         var result: [NativeClass] = []
         result += preferenceClasses()
         result += contextClasses()
         result += injektClasses()
+        result += utilityClasses()
+        result += cacheClasses()
+        result += osClasses()
+        result += resourceClasses()
         return result
+    }
+
+    /// `android.util.LruCache`: Android's per-entry-size (1) LRU policy.
+    private static func cacheClasses() -> [NativeClass] {
+        let cache = NativeClass("Landroid/util/LruCache;", superclass: "Ljava/lang/Object;")
+        cache.method("<init>", "(I)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMLruCachePayload(maxSize: Int(args[1].asInt32)))
+            return .zero
+        }
+        func payload(_ runtime: VMRuntime, _ value: VMValue) throws -> VMLruCachePayload {
+            try runtime.payloadBox(value, as: VMLruCachePayload.self)
+        }
+        cache.method("get", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let cache = try payload(runtime, args[0])
+            guard let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else { return .null }
+            let entry = cache.entries.remove(at: index)
+            cache.entries.append(entry)
+            return entry.value
+        }
+        cache.method("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let cache = try payload(runtime, args[0])
+            let previous: VMValue
+            if let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) {
+                previous = cache.entries.remove(at: index).value
+            } else {
+                previous = .null
+            }
+            if args[2].bits != 0 { cache.entries.append((args[1], args[2])) }
+            while cache.entries.count > cache.maxSize, !cache.entries.isEmpty {
+                cache.entries.removeFirst()
+            }
+            return previous
+        }
+        cache.method("remove", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let cache = try payload(runtime, args[0])
+            guard let index = cache.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else { return .null }
+            return cache.entries.remove(at: index).value
+        }
+        cache.method("size", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMLruCachePayload.self)?.entries.count ?? 0))
+        }
+        cache.method("maxSize", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMLruCachePayload.self)?.maxSize ?? 0))
+        }
+        cache.method("evictAll", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMLruCachePayload.self)?.entries.removeAll()
+            return .zero
+        }
+        cache.method("resize", "(I)V") { runtime, args, _ in
+            guard let cache = runtime.payload(args[0], as: VMLruCachePayload.self) else { return .zero }
+            cache.maxSize = max(0, Int(args[1].asInt32))
+            while cache.entries.count > cache.maxSize, !cache.entries.isEmpty { cache.entries.removeFirst() }
+            return .zero
+        }
+        cache.method("snapshot", "()Ljava/util/Map;") { runtime, args, _ in
+            guard let cache = runtime.payload(args[0], as: VMLruCachePayload.self) else { return .null }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(cache.entries.map { ($0.key, $0.value) }))
+        }
+        cache.method("hitCount", "()I") { _, _, _ in .int32(0) }
+        cache.method("missCount", "()I") { _, _, _ in .int32(0) }
+        return [cache]
+    }
+
+    /// `android.os.Handler`, `Looper` and `Message`. The engine has no separate
+    /// UI thread, so posted work runs before the call returns (the same rule
+    /// `android.view.View.post` follows); `myLooper()` is null because the
+    /// interpreter thread never prepared one, which is what extensions use to
+    /// detect "not on the main thread".
+    private static func osClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let looper = NativeClass("Landroid/os/Looper;", superclass: "Ljava/lang/Object;")
+        looper.staticMethod("getMainLooper", "()Landroid/os/Looper;") { runtime, _, _ in
+            runtime.makeNative("Landroid/os/Looper;", payload: VMLooperPayload())
+        }
+        looper.staticMethod("myLooper", "()Landroid/os/Looper;") { _, _, _ in .null }
+        looper.staticMethod("prepare", "()V") { _, _, _ in .zero }
+        looper.staticMethod("prepareMainLooper", "()V") { _, _, _ in .zero }
+        looper.staticMethod("loop", "()V") { _, _, _ in .zero }
+        looper.method("quit", "()V") { _, _, _ in .zero }
+        looper.method("quitSafely", "()V") { _, _, _ in .zero }
+        looper.method("isCurrentThread", "()Z") { _, _, _ in .boolean(false) }
+        looper.method("getThread", "()Ljava/lang/Thread;") { _, _, _ in .null }
+        looper.method("getQueue", "()Landroid/os/MessageQueue;") { _, _, _ in .null }
+        result.append(looper)
+
+        let messageQueue = NativeClass("Landroid/os/MessageQueue;", superclass: "Ljava/lang/Object;")
+        messageQueue.method("quit", "()V") { _, _, _ in .zero }
+        result.append(messageQueue)
+
+        let message = NativeClass("Landroid/os/Message;", superclass: "Ljava/lang/Object;")
+        for name in ["what", "arg1", "arg2"] { message.field(name, "I") }
+        message.field("obj", "Ljava/lang/Object;")
+        message.field("target", "Landroid/os/Handler;")
+        message.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMMessagePayload())
+            return .zero
+        }
+        message.staticMethod("obtain", "()Landroid/os/Message;") { runtime, _, _ in
+            runtime.makeNative("Landroid/os/Message;", payload: VMMessagePayload())
+        }
+        message.staticMethod("obtain", "(Landroid/os/Message;)Landroid/os/Message;") { runtime, args, _ in
+            let copy = VMMessagePayload()
+            if let source = runtime.payload(args[0], as: VMMessagePayload.self) {
+                copy.what = source.what
+                copy.arg1 = source.arg1
+                copy.arg2 = source.arg2
+                copy.obj = source.obj
+                copy.target = source.target
+                copy.callback = source.callback
+            }
+            return runtime.makeNative("Landroid/os/Message;", payload: copy)
+        }
+        message.staticMethod("obtain", "(Landroid/os/Handler;)Landroid/os/Message;") { runtime, args, _ in
+            let payload = VMMessagePayload()
+            payload.target = args[0]
+            return runtime.makeNative("Landroid/os/Message;", payload: payload)
+        }
+        message.staticMethod("obtain", "(Landroid/os/Handler;I)Landroid/os/Message;") { runtime, args, _ in
+            let payload = VMMessagePayload()
+            payload.target = args[0]
+            payload.what = args[1].asInt32
+            return runtime.makeNative("Landroid/os/Message;", payload: payload)
+        }
+        message.staticMethod("obtain", "(Landroid/os/Handler;ILjava/lang/Object;)Landroid/os/Message;") { runtime, args, _ in
+            let payload = VMMessagePayload()
+            payload.target = args[0]
+            payload.what = args[1].asInt32
+            payload.obj = args[2]
+            return runtime.makeNative("Landroid/os/Message;", payload: payload)
+        }
+        message.method("sendToTarget", "()V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMMessagePayload.self), payload.target.bits != 0 else { return .zero }
+            let value = args[0]
+            _ = runtime.callVirtual(payload.target, "sendMessage(Landroid/os/Message;)Z", [value])
+            return .zero
+        }
+        message.method("setTarget", "(Landroid/os/Handler;)V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMMessagePayload.self)?.target = args[1]
+            return .zero
+        }
+        message.method("getTarget", "()Landroid/os/Handler;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMMessagePayload.self)?.target ?? .null
+        }
+        message.method("recycle", "()V") { _, _, _ in .zero }
+        result.append(message)
+
+        let handler = NativeClass("Landroid/os/Handler;", superclass: "Ljava/lang/Object;")
+        handler.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHandlerPayload(looper: .null))
+            return .zero
+        }
+        handler.method("<init>", "(Landroid/os/Looper;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHandlerPayload(looper: args[1]))
+            return .zero
+        }
+        handler.method("<init>", "(Landroid/os/Looper;Landroid/os/Handler$Callback;)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHandlerPayload(looper: args[1]))
+            return .zero
+        }
+        /// Runs pending work immediately; see the enum comment.
+        func run(_ runtime: VMRuntime, _ runnable: VMValue) {
+            guard runnable.bits != 0 else { return }
+            _ = try? runtime.callVirtual(runnable, "run()V", [])
+        }
+        handler.method("post", "(Ljava/lang/Runnable;)Z") { runtime, args, _ in
+            run(runtime, args[1])
+            return .boolean(true)
+        }
+        handler.method("postDelayed", "(Ljava/lang/Runnable;J)Z") { runtime, args, _ in
+            run(runtime, args[1])
+            return .boolean(true)
+        }
+        handler.method("postAtTime", "(Ljava/lang/Runnable;J)Z") { runtime, args, _ in
+            run(runtime, args[1])
+            return .boolean(true)
+        }
+        handler.method("postAtFrontOfQueue", "(Ljava/lang/Runnable;)Z") { runtime, args, _ in
+            run(runtime, args[1])
+            return .boolean(true)
+        }
+        handler.method("removeCallbacks", "(Ljava/lang/Runnable;)V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll { runtime.javaEquals($0.runnable, args[1]) }
+            return .zero
+        }
+        handler.method("removeCallbacks", "(Ljava/lang/Runnable;Ljava/lang/Object;)V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll { runtime.javaEquals($0.runnable, args[1]) }
+            return .zero
+        }
+        handler.method("removeCallbacksAndMessages", "(Ljava/lang/Object;)V") { runtime, args, _ in
+            if args[1].bits == 0 {
+                runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll()
+            } else {
+                runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll { runtime.javaEquals($0.token, args[1]) }
+            }
+            return .zero
+        }
+        handler.method("sendMessage", "(Landroid/os/Message;)Z") { runtime, args, _ in
+            if let payload = runtime.payload(args[1], as: VMMessagePayload.self), payload.callback.bits != 0 {
+                run(runtime, payload.callback)
+            }
+            return .boolean(true)
+        }
+        handler.method("sendMessageDelayed", "(Landroid/os/Message;J)Z") { runtime, args, _ in
+            if let payload = runtime.payload(args[1], as: VMMessagePayload.self), payload.callback.bits != 0 {
+                run(runtime, payload.callback)
+            }
+            return .boolean(true)
+        }
+        handler.method("sendMessageAtTime", "(Landroid/os/Message;J)Z") { runtime, args, _ in
+            if let payload = runtime.payload(args[1], as: VMMessagePayload.self), payload.callback.bits != 0 {
+                run(runtime, payload.callback)
+            }
+            return .boolean(true)
+        }
+        handler.method("sendEmptyMessage", "(I)Z") { _, _, _ in .boolean(true) }
+        handler.method("sendEmptyMessageDelayed", "(IJ)Z") { _, _, _ in .boolean(true) }
+        handler.method("sendEmptyMessageAtTime", "(IJ)Z") { _, _, _ in .boolean(true) }
+        handler.method("hasMessages", "(I)Z") { _, _, _ in .boolean(false) }
+        handler.method("hasMessages", "(ILjava/lang/Object;)Z") { _, _, _ in .boolean(false) }
+        handler.method("getLooper", "()Landroid/os/Looper;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMHandlerPayload.self)?.looper ?? .null
+        }
+        handler.method("obtainMessage", "()Landroid/os/Message;") { runtime, args, _ in
+            let payload = VMMessagePayload()
+            payload.target = args[0]
+            return runtime.makeNative("Landroid/os/Message;", payload: payload)
+        }
+        handler.method("obtainMessage", "(I)Landroid/os/Message;") { runtime, args, _ in
+            let payload = VMMessagePayload()
+            payload.target = args[0]
+            payload.what = args[1].asInt32
+            return runtime.makeNative("Landroid/os/Message;", payload: payload)
+        }
+        handler.method("obtainMessage", "(ILjava/lang/Object;)Landroid/os/Message;") { runtime, args, _ in
+            let payload = VMMessagePayload()
+            payload.target = args[0]
+            payload.what = args[1].asInt32
+            payload.obj = args[2]
+            return runtime.makeNative("Landroid/os/Message;", payload: payload)
+        }
+        result.append(handler)
+
+        let callback = NativeClass("Landroid/os/Handler$Callback;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        callback.method("handleMessage", "(Landroid/os/Message;)Z") { _, _, _ in .boolean(false) }
+        result.append(callback)
+        return result
+    }
+
+    /// `android.content.res.Resources` and `android.util.DisplayMetrics`.
+    private static func resourceClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        let metrics = NativeClass("Landroid/util/DisplayMetrics;", superclass: "Ljava/lang/Object;")
+        for name in ["widthPixels", "heightPixels", "densityDpi"] { metrics.field(name, "I") }
+        for name in ["density", "scaledDensity", "xdpi", "ydpi"] { metrics.field(name, "F") }
+        metrics.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMDisplayMetricsPayload())
+            AndroidRuntime.applyMetrics(runtime, args[0], VMDisplayMetricsPayload())
+            return .zero
+        }
+        result.append(metrics)
+
+        let resources = NativeClass("Landroid/content/res/Resources;", superclass: "Ljava/lang/Object;")
+        resources.staticMethod("getSystem", "()Landroid/content/res/Resources;") { runtime, _, _ in
+            runtime.makeNative("Landroid/content/res/Resources;", payload: VMResourcesPayload())
+        }
+        resources.method("getDisplayMetrics", "()Landroid/util/DisplayMetrics;") { runtime, args, _ in
+            let value = runtime.makeNative("Landroid/util/DisplayMetrics;", payload: VMDisplayMetricsPayload())
+            AndroidRuntime.applyMetrics(runtime, value, VMDisplayMetricsPayload())
+            return value
+        }
+        resources.method("getString", "(I)Ljava/lang/String;") { runtime, args, _ in
+            // No packaged string table exists for extensions; resources they ask
+            // for are their own labels, so an empty value is the faithful answer.
+            runtime.newString("")
+        }
+        resources.method("getString", "(I[Ljava/lang/Object;)Ljava/lang/String;") { runtime, _, _ in
+            runtime.newString("")
+        }
+        resources.method("getText", "(I)Ljava/lang/CharSequence;") { runtime, _, _ in
+            runtime.newString("")
+        }
+        resources.method("getIdentifier", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I") { _, _, _ in .int32(0) }
+        resources.method("getDimension", "(I)F") { _, _, _ in .float(0) }
+        resources.method("getDimensionPixelSize", "(I)I") { _, _, _ in .int32(0) }
+        resources.method("getConfiguration", "()Landroid/content/res/Configuration;") { runtime, _, _ in
+            runtime.makeNative("Landroid/content/res/Configuration;", payload: NSNull())
+        }
+        result.append(resources)
+
+        let configuration = NativeClass("Landroid/content/res/Configuration;", superclass: "Ljava/lang/Object;")
+        configuration.field("orientation", "I")
+        configuration.field("screenWidthDp", "I")
+        configuration.field("screenHeightDp", "I")
+        configuration.field("densityDpi", "I")
+        configuration.method("<init>", "()V") { _, _, _ in .zero }
+        result.append(configuration)
+        return result
+    }
+
+    /// Writes the logical display metrics into an object's instance fields.
+    private static func applyMetrics(_ runtime: VMRuntime, _ value: VMValue, _ metrics: VMDisplayMetricsPayload) {
+        guard let pointer = value.object else { return }
+        let cls = VMObjectLayout.cls(pointer)
+        let ints: [(String, Int32)] = [
+            ("widthPixels", metrics.widthPixels),
+            ("heightPixels", metrics.heightPixels),
+            ("densityDpi", metrics.densityDpi),
+        ]
+        for (name, number) in ints {
+            guard let field = cls.resolveField(key: name + ":I") else { continue }
+            VMObjectLayout.slot(pointer, field.offset).pointee = .int32(number)
+        }
+        let floats: [(String, Float)] = [
+            ("density", metrics.density),
+            ("scaledDensity", metrics.scaledDensity),
+            ("xdpi", metrics.xdpi),
+            ("ydpi", metrics.ydpi),
+        ]
+        for (name, number) in floats {
+            guard let field = cls.resolveField(key: name + ":F") else { continue }
+            VMObjectLayout.slot(pointer, field.offset).pointee = .int32(Int32(bitPattern: number.bitPattern))
+        }
+    }
+
+    /// `android.util.Base64` with the Android flag semantics extensions rely on
+    /// (`DEFAULT`, `NO_WRAP`, `NO_PADDING`, `URL_SAFE`).
+    private static func utilityClasses() -> [NativeClass] {
+        let base64 = NativeClass("Landroid/util/Base64;")
+        let flags = ["DEFAULT", "NO_PADDING", "NO_WRAP", "CRLF", "URL_SAFE", "NO_CLOSE"]
+        for name in flags { base64.staticField(name, "I") }
+        base64.prepare = { _, cls in
+            let values: [Int32] = [0, 1, 2, 4, 8, 16]
+            for (index, value) in values.enumerated() { cls.staticValues[index] = .int32(value) }
+        }
+        func bytes(_ array: VMValue, _ runtime: VMRuntime) -> Data {
+            var data = Data()
+            for index in 0..<runtime.arrayLength(array) {
+                data.append(UInt8(truncatingIfNeeded: runtime.arrayElement(array, index).asInt32))
+            }
+            return data
+        }
+        base64.staticMethod("decode", "(Ljava/lang/String;I)[B") { runtime, args, _ in
+            try VMBase64.decode(runtime.stringValue(args[0]) ?? "", flags: args[1].asInt32, runtime: runtime)
+        }
+        base64.staticMethod("decode", "([BI)[B") { runtime, args, _ in
+            let text = String(decoding: bytes(args[0], runtime), as: UTF8.self)
+            return try VMBase64.decode(text, flags: args[1].asInt32, runtime: runtime)
+        }
+        base64.staticMethod("encodeToString", "([BI)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(VMBase64.encode(bytes(args[0], runtime), flags: args[1].asInt32))
+        }
+        base64.staticMethod("encode", "([BI)[B") { runtime, args, _ in
+            let encoded = Array(VMBase64.encode(bytes(args[0], runtime), flags: args[1].asInt32).utf8)
+            return VMBase64.byteArray(encoded, runtime: runtime)
+        }
+        return [base64]
     }
 
     private static func preferenceClasses() -> [NativeClass] {
@@ -370,5 +771,56 @@ extension VMRuntime {
             default: break
             }
         }
+    }
+}
+
+/// Android `Base64` flag handling shared by both overload families.
+enum VMBase64 {
+    static func decode(_ text: String, flags: Int32, runtime: VMRuntime) throws -> VMValue {
+        var input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if flags & 8 != 0 {
+            input = input.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        }
+        if flags & 1 == 0, input.count % 4 != 0 {
+            input += String(repeating: "=", count: 4 - input.count % 4)
+        }
+        guard let data = Data(base64Encoded: input, options: .ignoreUnknownCharacters) else {
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;", "bad base64")
+        }
+        let array = runtime.newArray(component: "B", count: data.count)
+        for (index, byte) in data.enumerated() {
+            runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: byte))))
+        }
+        return array
+    }
+
+    static func byteArray(_ bytes: [UInt8], runtime: VMRuntime) -> VMValue {
+        let array = runtime.newArray(component: "B", count: bytes.count)
+        for (index, byte) in bytes.enumerated() {
+            runtime.setArrayElement(array, index: index, value: .int32(Int32(Int8(bitPattern: byte))))
+        }
+        return array
+    }
+
+    static func encode(_ data: Data, flags: Int32) -> String {
+        var output = data.base64EncodedString()
+        if flags & 8 != 0 {
+            output = output.replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+        }
+        if flags & 1 != 0 {
+            while output.hasSuffix("=") { output.removeLast() }
+        }
+        if flags & 2 == 0 {
+            // Android wraps at 76 characters unless NO_WRAP is set.
+            var wrapped: [String] = []
+            var index = output.startIndex
+            while index < output.endIndex {
+                let end = output.index(index, offsetBy: 76, limitedBy: output.endIndex) ?? output.endIndex
+                wrapped.append(String(output[index..<end]))
+                index = end
+            }
+            output = wrapped.joined(separator: flags & 4 != 0 ? "\r\n" : "\n")
+        }
+        return output
     }
 }

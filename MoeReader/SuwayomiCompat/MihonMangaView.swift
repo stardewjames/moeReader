@@ -159,7 +159,7 @@ struct MihonMangaView: View {
         defer { isLoading = false }
         errorMessage = nil
         do {
-            async let details = runtime.manga(id: manga.id, source: source)
+            async let details = runtime.manga(id: manga.id, source: source, title: manga.title)
             async let chapterList = runtime.chapters(manga: manga, source: source)
             let (loadedManga, loadedChapters) = try await (details, chapterList)
             manga = loadedManga

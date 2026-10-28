@@ -36,9 +36,11 @@ profiles, and SwiftUI screens.
   for each search, persisted per source, and re-applied after view recreation.
   Source preferences are edited in a sheet, including text, single-choice,
   toggle, and multi-select controls backed by `SharedPreferences` string sets;
-  only changed keys are written. Covers use the source's request headers.
-  Reading progress is stored in `UserDefaults`; it does not touch the local
-  library model.
+  only changed keys are written. Covers use the source's request headers over
+  the shared cookie jar; reader pages are fetched through the engine's
+  `getImage`/`imageRequest` path on the source's own client, so the
+  extension's interceptors apply. Reading progress is stored in `UserDefaults`;
+  it does not touch the local library model.
 
 ## Relationship to the engine
 
@@ -67,7 +69,7 @@ typed error when browsed; its package is never loaded as native code.
 | `MihonAPKVerifier.swift` | Package/version/signature admission |
 | `MihonCompatStore.swift` | Actor-owned persistence and install lifecycle |
 | `MihonSourceRuntime.swift` | Runtime protocol, registry, shared source models |
-| `MihonRemoteImageView.swift` | URLSession image loading, decode cache, prefetch |
+| `MihonRemoteImageView.swift` | Page bytes from the engine client, cover fetch over URLSession, decode cache, prefetch |
 | `MihonCompatView.swift` | Repository/extension manager |
 | `MihonBrowseView.swift`, `MihonMangaView.swift`, `MihonReaderView.swift` | Source browser and reader |
 | `MihonFilterView.swift` | FilterList sheet for source searches |

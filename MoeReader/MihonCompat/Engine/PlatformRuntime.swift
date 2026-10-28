@@ -8,6 +8,9 @@
 //
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 final class VMUriPayload {
     var value: String
@@ -16,6 +19,145 @@ final class VMUriPayload {
 
 final class VMBundlePayload {
     var values: [String: VMValue] = [:]
+}
+
+/// One `okhttp3.Cookie`: name/value plus the attributes OkHttp tracks.
+final class VMHttpCookiePayload {
+    var name = ""
+    var value = ""
+    var domain = ""
+    var path = "/"
+    /// Seconds since the epoch; `.greatestFiniteMagnitude` for session cookies.
+    var expiresAt: TimeInterval = .greatestFiniteMagnitude
+    var secure = false
+    var httpOnly = false
+    var hostOnly = true
+    var persistent = false
+
+    init() {}
+
+    init(_ cookie: HTTPCookie) {
+        name = cookie.name
+        value = cookie.value
+        domain = cookie.domain.lowercased()
+        path = cookie.path
+        if let date = cookie.expiresDate {
+            expiresAt = date.timeIntervalSince1970
+            persistent = true
+        }
+        secure = cookie.isSecure
+        hostOnly = !cookie.domain.hasPrefix(".")
+        httpOnly = cookie.isHTTPOnly
+    }
+
+    var httpCookie: HTTPCookie? {
+        var properties: [HTTPCookiePropertyKey: Any] = [
+            .name: name,
+            .value: value,
+            .path: path,
+        ]
+        if !domain.isEmpty {
+            properties[.domain] = hostOnly ? domain : "." + domain
+        }
+        if persistent, expiresAt.isFinite {
+            properties[.expires] = Date(timeIntervalSince1970: expiresAt)
+        }
+        if secure { properties[.secure] = "TRUE" }
+        return HTTPCookie(properties: properties)
+    }
+
+    var description: String {
+        "\(name)=\(value); domain=\(domain); path=\(path)"
+    }
+
+    func matches(host: String, path requestPath: String, secure isSecure: Bool) -> Bool {
+        if secure && !isSecure { return false }
+        if expiresAt.isFinite && expiresAt < Date().timeIntervalSince1970 { return false }
+        let target = host.lowercased()
+        if hostOnly {
+            if target != domain { return false }
+        } else if target != domain && !target.hasSuffix("." + domain) {
+            return false
+        }
+        if requestPath == path { return true }
+        return requestPath.hasPrefix(path.hasSuffix("/") ? path : path + "/")
+    }
+
+    static func defaultPath(_ requestPath: String) -> String {
+        guard requestPath.hasPrefix("/"), let last = requestPath.lastIndex(of: "/"), last != requestPath.startIndex else {
+            return "/"
+        }
+        return String(requestPath[requestPath.startIndex..<last])
+    }
+
+    /// Parses a `Cookie`/`Set-Cookie` header value the way OkHttp does: the
+    /// first `name=value` pair, then the known attributes.
+    static func parse(_ header: String, defaultDomain: String = "", defaultPath: String = "/") -> VMHttpCookiePayload? {
+        let segments = header.split(separator: ";", omittingEmptySubsequences: true)
+        guard let first = segments.first else { return nil }
+        let pair = first.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+        guard pair.count == 2 else { return nil }
+        let payload = VMHttpCookiePayload()
+        payload.name = pair[0].trimmingCharacters(in: .whitespaces)
+        payload.value = pair[1].trimmingCharacters(in: .whitespaces)
+        guard !payload.name.isEmpty else { return nil }
+        payload.domain = defaultDomain.lowercased()
+        payload.path = defaultPath
+        guard defaultDomain.isEmpty == false || segments.count > 1 else { return nil }
+        for segment in segments.dropFirst() {
+            let trimmed = segment.trimmingCharacters(in: .whitespaces)
+            let parts = trimmed.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let key = parts[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let attribute = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+            switch key {
+            case "domain":
+                payload.domain = attribute.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                payload.hostOnly = false
+            case "path":
+                payload.path = attribute.isEmpty ? defaultPath : attribute
+            case "expires":
+                if let date = VMHttpCookiePayload.parseDate(attribute) {
+                    payload.expiresAt = date.timeIntervalSince1970
+                    payload.persistent = true
+                }
+            case "max-age":
+                if let seconds = TimeInterval(attribute) {
+                    payload.expiresAt = Date().timeIntervalSince1970 + seconds
+                    payload.persistent = true
+                }
+            case "secure":
+                payload.secure = true
+            case "httponly":
+                payload.httpOnly = true
+            default:
+                break
+            }
+        }
+        return payload
+    }
+
+    private static let dateFormatters: [DateFormatter] = {
+        let formats = [
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEEE, dd-MMM-yy HH:mm:ss zzz",
+            "EEE MMM d HH:mm:ss yyyy",
+            "yyyy-MM-dd'T'HH:mm:ssZ",
+        ]
+        return formats.map { format in
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(identifier: "GMT")
+            formatter.dateFormat = format
+            return formatter
+        }
+    }()
+
+    static func parseDate(_ text: String) -> Date? {
+        for formatter in dateFormatters {
+            if let date = formatter.date(from: text) { return date }
+        }
+        return nil
+    }
 }
 
 enum PlatformRuntime {
@@ -71,77 +213,173 @@ enum PlatformRuntime {
         result.append(destructured)
 
         let cookie = NativeClass("Lokhttp3/Cookie;", superclass: "Ljava/lang/Object;")
-        cookie.field("value", "Ljava/lang/String;")
-        cookie.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
-            if let pointer = args[0].object, let field = VMObjectLayout.cls(pointer).field(named: "value") {
-                VMObjectLayout.slot(pointer, field.offset).pointee = args[1]
-            }
-            return .zero
-        }
-        cookie.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let pointer = args[0].object, let field = VMObjectLayout.cls(pointer).field(named: "value") else { return .null }
-            return VMObjectLayout.slot(pointer, field.offset).pointee
-        }
         cookie.method("name", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let pointer = args[0].object, let field = VMObjectLayout.cls(pointer).field(named: "value"),
-                  let text = runtime.stringValue(VMObjectLayout.slot(pointer, field.offset).pointee) else { return .null }
-            return runtime.newString(text.split(separator: "=").first.map(String.init) ?? text)
+            guard let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) else { return .null }
+            return runtime.newString(payload.name)
         }
         cookie.method("value", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let pointer = args[0].object, let field = VMObjectLayout.cls(pointer).field(named: "value"),
-                  let text = runtime.stringValue(VMObjectLayout.slot(pointer, field.offset).pointee) else { return .null }
-            return runtime.newString(text.split(separator: "=").dropFirst().joined(separator: "="))
+            guard let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) else { return .null }
+            return runtime.newString(payload.value)
+        }
+        cookie.method("domain", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) else { return .null }
+            return runtime.newString(payload.domain)
+        }
+        cookie.method("path", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) else { return .null }
+            return runtime.newString(payload.path)
+        }
+        cookie.method("expiresAt", "()J") { runtime, args, _ in
+            .int64(Int64((runtime.payload(args[0], as: VMHttpCookiePayload.self)?.expiresAt ?? 0) * 1000))
+        }
+        cookie.method("secure", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMHttpCookiePayload.self)?.secure ?? false)
+        }
+        cookie.method("httpOnly", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMHttpCookiePayload.self)?.httpOnly ?? false)
+        }
+        cookie.method("hostOnly", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMHttpCookiePayload.self)?.hostOnly ?? false)
+        }
+        cookie.method("persistent", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMHttpCookiePayload.self)?.persistent ?? false)
+        }
+        cookie.method("matches", "(Lokhttp3/HttpUrl;)Z") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self),
+                  let url = runtime.payload(args[1], as: VMHttpUrlPayload.self) else { return .boolean(false) }
+            return .boolean(payload.matches(host: url.host, path: url.components.path, secure: url.scheme == "https"))
+        }
+        cookie.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) else { return .null }
+            return runtime.newString("\(payload.name)=\(payload.value)")
+        }
+        cookie.method("hashCode", "()I") { runtime, args, _ in
+            .int32(Int32(truncatingIfNeeded: runtime.payload(args[0], as: VMHttpCookiePayload.self)?.description.hashValue ?? 0))
+        }
+        cookie.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let lhs = runtime.payload(args[0], as: VMHttpCookiePayload.self)?.description ?? ""
+            let rhs = runtime.payload(args[1], as: VMHttpCookiePayload.self)?.description ?? ""
+            return .boolean(lhs == rhs)
         }
         cookie.staticField("Companion", "Lokhttp3/Cookie$Companion;")
         cookie.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lokhttp3/Cookie$Companion;", payload: NSNull())
         }
+        cookie.method("newBuilder", "()Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) ?? VMHttpCookiePayload()
+            let copy = VMHttpCookiePayload()
+            copy.name = payload.name
+            copy.value = payload.value
+            copy.domain = payload.domain
+            copy.path = payload.path
+            copy.expiresAt = payload.expiresAt
+            copy.secure = payload.secure
+            copy.httpOnly = payload.httpOnly
+            copy.hostOnly = payload.hostOnly
+            copy.persistent = payload.persistent
+            return runtime.makeNative("Lokhttp3/Cookie$Builder;", payload: copy)
+        }
         result.append(cookie)
+
+        let cookieBuilder = NativeClass("Lokhttp3/Cookie$Builder;", superclass: "Ljava/lang/Object;")
+        cookieBuilder.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMHttpCookiePayload())
+            return .zero
+        }
+        cookieBuilder.method("name", "(Ljava/lang/String;)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self).name = runtime.stringValue(args[1]) ?? ""
+            return args[0]
+        }
+        cookieBuilder.method("value", "(Ljava/lang/String;)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self).value = runtime.stringValue(args[1]) ?? ""
+            return args[0]
+        }
+        cookieBuilder.method("domain", "(Ljava/lang/String;)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            let payload = try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self)
+            payload.domain = (runtime.stringValue(args[1]) ?? "").lowercased()
+            payload.hostOnly = false
+            return args[0]
+        }
+        cookieBuilder.method("path", "(Ljava/lang/String;)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self).path = runtime.stringValue(args[1]) ?? "/"
+            return args[0]
+        }
+        cookieBuilder.method("expiresAt", "(J)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            let payload = try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self)
+            payload.expiresAt = TimeInterval(args[1].asInt64) / 1000
+            payload.persistent = true
+            return args[0]
+        }
+        cookieBuilder.method("maxAge", "(J)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            let payload = try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self)
+            payload.expiresAt = Date().timeIntervalSince1970 + TimeInterval(args[1].asInt64)
+            payload.persistent = true
+            return args[0]
+        }
+        cookieBuilder.method("secure", "()Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self).secure = true
+            return args[0]
+        }
+        cookieBuilder.method("httpOnly", "()Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self).httpOnly = true
+            return args[0]
+        }
+        cookieBuilder.method("hostOnlyDomain", "(Ljava/lang/String;)Lokhttp3/Cookie$Builder;") { runtime, args, _ in
+            let payload = try runtime.payloadBox(args[0], as: VMHttpCookiePayload.self)
+            payload.domain = (runtime.stringValue(args[1]) ?? "").lowercased()
+            payload.hostOnly = true
+            return args[0]
+        }
+        cookieBuilder.method("build", "()Lokhttp3/Cookie;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMHttpCookiePayload.self) ?? VMHttpCookiePayload()
+            guard !payload.name.isEmpty else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "cookie name is empty")
+            }
+            return runtime.makeNative("Lokhttp3/Cookie;", payload: payload)
+        }
+        result.append(cookieBuilder)
+
         let cookieCompanion = NativeClass("Lokhttp3/Cookie$Companion;", superclass: "Ljava/lang/Object;")
         cookieCompanion.method("parse", "(Ljava/lang/String;)Lokhttp3/Cookie;") { runtime, args, _ in
-            runtime.makeNative("Lokhttp3/Cookie;", payload: runtime.newString(runtime.stringValue(args[1]) ?? ""))
-                .withCookieValue(runtime.stringValue(args[1]) ?? "", runtime: runtime)
+            guard let parsed = VMHttpCookiePayload.parse(runtime.stringValue(args[1]) ?? "") else { return .null }
+            return runtime.makeNative("Lokhttp3/Cookie;", payload: parsed)
+        }
+        cookieCompanion.method("parse", "(Lokhttp3/HttpUrl;Ljava/lang/String;)Lokhttp3/Cookie;") { runtime, args, _ in
+            guard let url = runtime.payload(args[1], as: VMHttpUrlPayload.self),
+                  let parsed = VMHttpCookiePayload.parse(
+                      runtime.stringValue(args[2]) ?? "",
+                      defaultDomain: url.host,
+                      defaultPath: VMHttpCookiePayload.defaultPath(url.components.path)
+                  ) else { return .null }
+            return runtime.makeNative("Lokhttp3/Cookie;", payload: parsed)
         }
         result.append(cookieCompanion)
+
         let cookieJar = NativeClass("Lokhttp3/CookieJar;", superclass: "Ljava/lang/Object;")
         cookieJar.staticField("NO_COOKIES", "Lokhttp3/CookieJar;")
         cookieJar.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lokhttp3/CookieJar;", payload: NSNull())
         }
-        cookieJar.method("saveFromResponse", "(Lokhttp3/HttpUrl;Ljava/util/List;)V") { _, _, _ in .zero }
-        cookieJar.method("loadForRequest", "(Lokhttp3/HttpUrl;)Ljava/util/List;") { runtime, _, _ in
-            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
-        }
-        result.append(cookieJar)
-
-        let builder = NativeClass("Ljava/time/format/DateTimeFormatterBuilder;", superclass: "Ljava/lang/Object;")
-        builder.method("<init>", "()V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMDateTimeFormatterPayload(pattern: ""))
+        cookieJar.method("saveFromResponse", "(Lokhttp3/HttpUrl;Ljava/util/List;)V") { runtime, args, _ in
+            let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
+            for item in runtime.listItems(args[2]) ?? [] {
+                guard let payload = runtime.payload(item, as: VMHttpCookiePayload.self),
+                      let cookie = payload.httpCookie else { continue }
+                storage.setCookie(cookie)
+            }
             return .zero
         }
-        builder.method("appendPattern", "(Ljava/lang/String;)Ljava/time/format/DateTimeFormatterBuilder;") { runtime, args, _ in
-            let payload: VMDateTimeFormatterPayload = try runtime.payloadBox(args[0])
-            payload.pattern += runtime.stringValue(args[1]) ?? ""
-            return args[0]
+        cookieJar.method("loadForRequest", "(Lokhttp3/HttpUrl;)Ljava/util/List;") { runtime, args, _ in
+            let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
+            var values: [VMValue] = []
+            if let url = runtime.payload(args[1], as: VMHttpUrlPayload.self), let host = URL(string: url.string) {
+                for stored in storage.cookies(for: host) ?? [] {
+                    values.append(runtime.makeNative("Lokhttp3/Cookie;", payload: VMHttpCookiePayload(stored)))
+                }
+            }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
         }
-        builder.method("appendLiteral", "(C)Ljava/time/format/DateTimeFormatterBuilder;") { runtime, args, _ in
-            let payload: VMDateTimeFormatterPayload = try runtime.payloadBox(args[0])
-            payload.pattern += String(UnicodeScalar(UInt32(truncatingIfNeeded: args[1].asInt32)) ?? " ")
-            return args[0]
-        }
-        builder.method("append", "(Ljava/time/format/DateTimeFormatter;)Ljava/time/format/DateTimeFormatterBuilder;") { runtime, args, _ in
-            let payload: VMDateTimeFormatterPayload = try runtime.payloadBox(args[0])
-            payload.pattern += runtime.payload(args[1], as: VMDateTimeFormatterPayload.self)?.pattern ?? ""
-            return args[0]
-        }
-        builder.method("parseCaseInsensitive", "()Ljava/time/format/DateTimeFormatterBuilder;") { _, args, _ in args[0] }
-        builder.method("optionalStart", "()Ljava/time/format/DateTimeFormatterBuilder;") { _, args, _ in args[0] }
-        builder.method("optionalEnd", "()Ljava/time/format/DateTimeFormatterBuilder;") { _, args, _ in args[0] }
-        builder.method("toFormatter", "()Ljava/time/format/DateTimeFormatter;") { runtime, args, _ in
-            let payload: VMDateTimeFormatterPayload = try runtime.payloadBox(args[0])
-            return runtime.makeNative("Ljava/time/format/DateTimeFormatter;", payload: VMDateTimeFormatterPayload(pattern: payload.pattern))
-        }
-        result.append(builder)
+        result.append(cookieJar)
         return result
     }
 
@@ -259,6 +497,14 @@ enum PlatformRuntime {
             log.staticMethod(name, "(Ljava/lang/String;Ljava/lang/String;)I") { _, _, _ in .int32(0) }
             log.staticMethod(name, "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I") { _, _, _ in .int32(0) }
         }
+        log.staticMethod("println", "(ILjava/lang/String;Ljava/lang/String;)I") { runtime, args, _ in
+            runtime.host?.log("\(runtime.stringValue(args[1]) ?? ""): \(runtime.stringValue(args[2]) ?? "")")
+            return .int32(0)
+        }
+        log.staticMethod("isLoggable", "(Ljava/lang/String;I)Z") { _, _, _ in .boolean(true) }
+        log.staticMethod("getStackTraceString", "(Ljava/lang/Throwable;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.stringValue(runtime.javaToString(args[0]) ?? .null) ?? "")
+        }
         result.append(log)
 
         let buildVersion = NativeClass("Landroid/os/Build$VERSION;", superclass: "Ljava/lang/Object;")
@@ -326,6 +572,49 @@ enum PlatformRuntime {
             let text = runtime.stringValue(args[0]) ?? ""
             return runtime.newString(text.removingPercentEncoding ?? text)
         }
+        uri.method("getScheme", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUriPayload.self),
+                  let components = URLComponents(string: payload.value) else { return .null }
+            return components.scheme.map(runtime.newString) ?? .null
+        }
+        uri.method("getHost", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUriPayload.self),
+                  let components = URLComponents(string: payload.value) else { return .null }
+            return components.host.map(runtime.newString) ?? .null
+        }
+        uri.method("getPath", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUriPayload.self),
+                  let components = URLComponents(string: payload.value) else { return .null }
+            return runtime.newString(components.path)
+        }
+        uri.method("getLastPathSegment", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUriPayload.self),
+                  let components = URLComponents(string: payload.value) else { return .null }
+            let segments = components.path.split(separator: "/").filter { !$0.isEmpty }
+            return segments.last.map { runtime.newString(String($0)) } ?? .null
+        }
+        uri.method("getPathSegments", "()Ljava/util/List;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUriPayload.self),
+                  let components = URLComponents(string: payload.value) else { return .null }
+            let segments = components.path.split(separator: "/", omittingEmptySubsequences: true).map { runtime.newString(String($0)) }
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(segments, immutable: true))
+        }
+        uri.method("buildUpon", "()Landroid/net/Uri$Builder;") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMUriPayload.self),
+                  let components = URLComponents(string: payload.value) else { return .null }
+            return runtime.makeNative("Landroid/net/Uri$Builder;", payload: components)
+        }
+        uri.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: VMUriPayload.self)?.value ?? "")
+        }
+        uri.method("hashCode", "()I") { runtime, args, _ in
+            .int32(Int32(truncatingIfNeeded: runtime.payload(args[0], as: VMUriPayload.self)?.value.hashValue ?? 0))
+        }
+        uri.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            let lhs = runtime.payload(args[0], as: VMUriPayload.self)?.value ?? ""
+            let rhs = runtime.payload(args[1], as: VMUriPayload.self)?.value ?? ""
+            return .boolean(lhs == rhs)
+        }
         uri.method("getQueryParameter", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             guard let payload: VMUriPayload = runtime.payload(args[0], as: VMUriPayload.self),
                   let components = URLComponents(string: payload.value),
@@ -333,6 +622,79 @@ enum PlatformRuntime {
             return runtime.newString(value)
         }
         result.append(uri)
+
+        let uriBuilder = NativeClass("Landroid/net/Uri$Builder;", superclass: "Ljava/lang/Object;")
+        uriBuilder.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], URLComponents(string: "//") ?? URLComponents())
+            return .zero
+        }
+        uriBuilder.method("scheme", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.scheme = runtime.stringValue(args[1])
+            return args[0]
+        }
+        uriBuilder.method("authority", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.host = runtime.stringValue(args[1])
+            return args[0]
+        }
+        uriBuilder.method("encodedAuthority", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.host = runtime.stringValue(args[1])
+            return args[0]
+        }
+        uriBuilder.method("path", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.path = runtime.stringValue(args[1]) ?? ""
+            return args[0]
+        }
+        uriBuilder.method("encodedPath", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded(runtime.stringValue(args[1]) ?? "")
+            return args[0]
+        }
+        uriBuilder.method("appendPath", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            let segment = runtime.stringValue(args[1]) ?? ""
+            var path = components.path
+            if !path.hasSuffix("/") { path += "/" }
+            components.path = path + segment
+            return args[0]
+        }
+        uriBuilder.method("appendEncodedPath", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            let segment = runtime.stringValue(args[1]) ?? ""
+            var path = components.percentEncodedPath
+            if !path.hasSuffix("/") { path += "/" }
+            components.percentEncodedPath = VMHttpUrlPayload.sanitizedEncoded(path + segment)
+            return args[0]
+        }
+        uriBuilder.method("fragment", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.fragment = runtime.stringValue(args[1])
+            return args[0]
+        }
+        uriBuilder.method("query", "(Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            components.percentEncodedQuery = runtime.stringValue(args[1]).map { VMHttpUrlPayload.sanitizedEncoded($0, query: true) }
+            return args[0]
+        }
+        uriBuilder.method("appendQueryParameter", "(Ljava/lang/String;Ljava/lang/String;)Landroid/net/Uri$Builder;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            var items = components.queryItems ?? []
+            items.append(URLQueryItem(name: runtime.stringValue(args[1]) ?? "", value: runtime.stringValue(args[2])))
+            components.queryItems = items
+            return args[0]
+        }
+        uriBuilder.method("build", "()Landroid/net/Uri;") { runtime, args, _ in
+            var components: URLComponents = try runtime.payloadBox(args[0])
+            return runtime.makeNative("Landroid/net/Uri;", payload: VMUriPayload(components.string ?? ""))
+        }
+        uriBuilder.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let components = runtime.payload(args[0], as: URLComponents.self) else { return .null }
+            return runtime.newString(components.string ?? "")
+        }
+        result.append(uriBuilder)
 
         let intent = NativeClass("Landroid/content/Intent;", superclass: "Ljava/lang/Object;")
         intent.method("<init>", "()V") { runtime, args, _ in
@@ -453,14 +815,5 @@ extension VMRuntime {
         let created = VMAtomicReferencePayload()
         setPayload(value, created)
         return created
-    }
-}
-
-extension VMValue {
-    func withCookieValue(_ value: String, runtime: VMRuntime) -> VMValue {
-        if let pointer = object, let field = VMObjectLayout.cls(pointer).field(named: "value") {
-            VMObjectLayout.slot(pointer, field.offset).pointee = runtime.newString(value)
-        }
-        return self
     }
 }

@@ -101,6 +101,9 @@ enum VMObjectLayout {
 /// low while still letting a completed operation release everything at once.
 final class VMHeap {
     private var blocks: [VMPointer] = []
+    /// Byte size of each block, parallel to `blocks` (oversized allocations
+    /// grow the block, so the default size is not enough to validate pointers).
+    private var blockSizes: [Int] = []
     private var cursor: VMPointer?
     private var remaining = 0
     private var totalBytes = 0
@@ -134,6 +137,7 @@ final class VMHeap {
         let block = blockSize > size ? blockSize : size
         let memory = UnsafeMutableRawPointer.allocate(byteCount: block, alignment: 16)
         blocks.append(memory)
+        blockSizes.append(block)
         totalBytes += block
 
         let pointer = UnsafeMutableRawPointer(memory)
@@ -145,20 +149,37 @@ final class VMHeap {
         return pointer
     }
 
+    /// Whether `pointer` addresses memory owned by this heap. Value cells hold
+    /// raw primitives and object references alike, so callers that must tell a
+    /// reference from a primitive (for example a boxed `Boolean` versus `1`)
+    /// validate the address here instead of trusting non-zero bits.
+    func contains(_ pointer: VMPointer) -> Bool {
+        let address = UInt(bitPattern: pointer)
+        for (index, block) in blocks.enumerated() {
+            let start = UInt(bitPattern: block)
+            let size = UInt(blockSizes[index])
+            if address >= start, address - start < size { return true }
+        }
+        return false
+    }
+
     /// Rewinds the current block without freeing older ones. Used after each
     /// source call when the caller holds no VM references.
     func rewind() {
         guard let first = blocks.first else { return }
         for block in blocks.dropFirst() { block.deallocate() }
+        let firstSize = blockSizes.first ?? blockSize
         blocks = [first]
-        totalBytes = blockSize
+        blockSizes = [firstSize]
+        totalBytes = firstSize
         cursor = first
-        remaining = blockSize
+        remaining = firstSize
     }
 
     func reset() {
         for block in blocks { block.deallocate() }
         blocks.removeAll(keepingCapacity: false)
+        blockSizes.removeAll(keepingCapacity: false)
         cursor = nil
         remaining = 0
         totalBytes = 0

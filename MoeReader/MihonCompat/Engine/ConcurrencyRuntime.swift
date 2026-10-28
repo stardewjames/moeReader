@@ -12,6 +12,13 @@ final class VMLockPayload {
     var locked = false
 }
 
+/// `ReentrantReadWriteLock` state. The engine runs one operation at a time, so
+/// the lock only records what the extension believes it holds.
+final class VMReadWriteLockPayload {
+    var readHeld = 0
+    var writeHeld = 0
+}
+
 final class VMAtomicPayload {
     var intValue: Int64
     var boolValue: Bool
@@ -174,12 +181,16 @@ enum ConcurrencyRuntime {
             ("size", "()I"), ("isEmpty", "()Z"), ("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
             ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
             ("containsKey", "(Ljava/lang/Object;)Z"),
             ("putIfAbsent", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("keySet", "()Ljava/util/Set;"), ("values", "()Ljava/util/Collection;"),
             ("entrySet", "()Ljava/util/Set;"),
         ] {
-            if let inherited = java.utilMapMethod(named: name) {
+            let key = name == "remove" && signature.contains("Ljava/lang/Object;Ljava/lang/Object;")
+                ? "removeValue"
+                : name
+            if let inherited = java.utilMapMethod(named: key) {
                 concurrentMap.method(name, signature, inherited)
             }
         }
@@ -234,6 +245,74 @@ enum ConcurrencyRuntime {
         lockInterface.method("unlock", "()V") { _, _, _ in .zero }
         result.append(lockInterface)
 
+        let readWrite = NativeClass("Ljava/util/concurrent/locks/ReentrantReadWriteLock;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Serializable;"])
+        readWrite.method("<init>", "()V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMReadWriteLockPayload())
+            return .zero
+        }
+        readWrite.method("<init>", "(Z)V") { runtime, args, _ in
+            runtime.setPayload(args[0], VMReadWriteLockPayload())
+            return .zero
+        }
+        readWrite.method("readLock", "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;") { runtime, args, _ in
+            let owner = runtime.mutableReadWriteLock(args[0])
+            return runtime.makeNative("Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;", payload: owner)
+        }
+        readWrite.method("writeLock", "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;") { runtime, args, _ in
+            let owner = runtime.mutableReadWriteLock(args[0])
+            return runtime.makeNative("Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;", payload: owner)
+        }
+        readWrite.method("isFair", "()Z") { _, _, _ in .boolean(false) }
+        readWrite.method("isWriteLocked", "()Z") { runtime, args, _ in
+            .boolean((runtime.payload(args[0], as: VMReadWriteLockPayload.self)?.writeHeld ?? 0) != 0)
+        }
+        readWrite.method("getReadLockCount", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMReadWriteLockPayload.self)?.readHeld ?? 0))
+        }
+        readWrite.method("getWriteHoldCount", "()I") { runtime, args, _ in
+            .int32(Int32(runtime.payload(args[0], as: VMReadWriteLockPayload.self)?.writeHeld ?? 0))
+        }
+        readWrite.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMReadWriteLockPayload.self) ?? VMReadWriteLockPayload()
+            return runtime.newString("[Read locks = \(payload.readHeld), Write locks = \(payload.writeHeld)]")
+        }
+        result.append(readWrite)
+
+        for (descriptor, isWrite) in [
+            ("Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;", false),
+            ("Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;", true),
+        ] {
+            let lockView = NativeClass(descriptor, superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/concurrent/locks/Lock;"])
+            lockView.method("lock", "()V") { runtime, args, _ in
+                let payload = runtime.mutableReadWriteLockOwner(args[0])
+                if isWrite { payload.writeHeld += 1 } else { payload.readHeld += 1 }
+                return .zero
+            }
+            lockView.method("unlock", "()V") { runtime, args, _ in
+                let payload = runtime.mutableReadWriteLockOwner(args[0])
+                if isWrite { payload.writeHeld = max(0, payload.writeHeld - 1) } else { payload.readHeld = max(0, payload.readHeld - 1) }
+                return .zero
+            }
+            lockView.method("tryLock", "()Z") { runtime, args, _ in
+                let payload = runtime.mutableReadWriteLockOwner(args[0])
+                if isWrite {
+                    if payload.writeHeld > 0 { return .boolean(false) }
+                    payload.writeHeld = 1
+                } else {
+                    payload.readHeld += 1
+                }
+                return .boolean(true)
+            }
+            lockView.method("newCondition", "()Ljava/util/concurrent/locks/Condition;") { runtime, _, _ in
+                runtime.makeNative("Ljava/util/concurrent/locks/Condition;", payload: NSNull())
+            }
+            lockView.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
+                let payload = runtime.payload(args[0], as: VMReadWriteLockPayload.self) ?? VMReadWriteLockPayload()
+                return runtime.newString("[Read locks = \(payload.readHeld), Write locks = \(payload.writeHeld)]")
+            }
+            result.append(lockView)
+        }
+
         return result
     }
 }
@@ -242,6 +321,22 @@ extension VMRuntime {
     func mutableLock(_ value: VMValue) -> VMLockPayload {
         if let existing: VMLockPayload = payload(value, as: VMLockPayload.self) { return existing }
         let created = VMLockPayload()
+        setPayload(value, created)
+        return created
+    }
+
+    func mutableReadWriteLock(_ value: VMValue) -> VMReadWriteLockPayload {
+        if let existing: VMReadWriteLockPayload = payload(value, as: VMReadWriteLockPayload.self) { return existing }
+        let created = VMReadWriteLockPayload()
+        setPayload(value, created)
+        return created
+    }
+
+    /// The read/write lock views carry their owner's payload, so they share
+    /// state with the lock that created them.
+    func mutableReadWriteLockOwner(_ value: VMValue) -> VMReadWriteLockPayload {
+        if let existing: VMReadWriteLockPayload = payload(value, as: VMReadWriteLockPayload.self) { return existing }
+        let created = VMReadWriteLockPayload()
         setPayload(value, created)
         return created
     }
@@ -285,6 +380,16 @@ private enum java {
                     return map.entries.remove(at: index).value
                 }
                 return .null
+            }
+        case "removeValue":
+            return { runtime, args, _ in
+                let map = try runtime.mutableMap(args[0])
+                guard let index = map.entries.firstIndex(where: { runtime.javaEquals($0.key, args[1]) }) else {
+                    return .boolean(false)
+                }
+                guard runtime.javaEquals(map.entries[index].value, args[2]) else { return .boolean(false) }
+                map.entries.remove(at: index)
+                return .boolean(true)
             }
         case "containsKey":
             return { runtime, args, _ in

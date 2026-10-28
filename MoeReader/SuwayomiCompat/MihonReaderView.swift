@@ -47,8 +47,16 @@ struct MihonReaderView: View {
             } else if !pages.isEmpty {
                 TabView(selection: $pageIndex) {
                     ForEach(pages) { page in
-                        MihonReaderPageView(page: page)
-                            .tag(page.index)
+                        MihonReaderPageView(
+                            page: page,
+                            pageSource: MihonPageImageSource(
+                                page: page,
+                                chapter: chapter,
+                                source: source,
+                                provider: runtime
+                            )
+                        )
+                        .tag(page.index)
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
@@ -140,11 +148,18 @@ struct MihonReaderView: View {
             let index = pageIndex + offset
             guard pages.indices.contains(index) else { continue }
             let page = pages[index]
+            let pageSource = MihonPageImageSource(
+                page: page,
+                chapter: chapter,
+                source: source,
+                provider: runtime
+            )
             Task {
                 _ = try? await MihonRemoteImageLoader.shared.image(
                     for: page.url,
                     headers: page.headers,
-                    maxPixelSize: 2_800
+                    maxPixelSize: 2_800,
+                    pageSource: pageSource
                 )
             }
         }
@@ -153,6 +168,7 @@ struct MihonReaderView: View {
 
 private struct MihonReaderPageView: View {
     let page: MihonPage
+    let pageSource: MihonPageImageSource
 
     var body: some View {
         ZStack {
@@ -161,7 +177,8 @@ private struct MihonReaderPageView: View {
                 url: page.url,
                 headers: page.headers,
                 maxPixelSize: 2_800,
-                contentMode: .fit
+                contentMode: .fit,
+                pageSource: pageSource
             )
             .padding(.horizontal, 2)
         }

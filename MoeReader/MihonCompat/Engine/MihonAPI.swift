@@ -998,6 +998,24 @@ enum MihonAPI {
 
     // MARK: - Filters
 
+    /// Class-derived default for `Filter.state` when a filter object has no
+    /// native payload (for example after an arena recycle): Kotlin declares the
+    /// property non-null in every subclass.
+    private static func defaultFilterState(_ runtime: VMRuntime, _ value: VMValue) -> VMValue {
+        var cls = runtime.classOf(value)
+        while let current = cls {
+            let descriptor = current.descriptor
+            if descriptor.hasSuffix("Filter$Select;") || descriptor.hasSuffix("Filter$TriState;") {
+                return runtime.boxInt(0)
+            }
+            if descriptor.hasSuffix("Filter$Text;") { return runtime.newString("") }
+            if descriptor.hasSuffix("Filter$CheckBox;") { return runtime.boxBoolean(false) }
+            if descriptor.hasSuffix("Filter$Group;") { return runtime.emptyList() }
+            cls = current.superclass
+        }
+        return .null
+    }
+
     private static func filterClasses() -> [NativeClass] {
         var result: [NativeClass] = []
         let filter = NativeClass("Leu/kanade/tachiyomi/source/model/Filter;", superclass: "Ljava/lang/Object;")
@@ -1005,7 +1023,13 @@ enum MihonAPI {
             runtime.payload(args[0], as: VMFilterPayload.self)?.name ?? .null
         }
         filter.method("getState", "()Ljava/lang/Object;") { runtime, args, _ in
-            guard let payload = runtime.payload(args[0], as: VMFilterPayload.self) else { return .null }
+            guard let payload = runtime.payload(args[0], as: VMFilterPayload.self) else {
+                // `Filter.state` is a non-null Kotlin property in every subclass
+                // (Int for Select/TriState, String for Text, Boolean for
+                // CheckBox), so a filter object whose payload is gone must still
+                // read as the class default instead of null.
+                return MihonAPI.defaultFilterState(runtime, args[0])
+            }
             switch payload.kind {
             case .checkbox: return runtime.boxBoolean(payload.state.asBoolean)
             case .tristate, .select: return runtime.boxInt(payload.state.asInt32)
@@ -1718,16 +1742,75 @@ extension VMRuntime {
         return newString(base + (path.hasPrefix("/") ? "" : "/") + path)
     }
 
+    /// `HttpSource.getUrlWithoutDomain`: splits the URL with `java.net.URI`
+    /// semantics and returns the *decoded* path, query and fragment. Java's
+    /// `URI.getPath()`/`getQuery()` decode percent escapes, so an encoded path
+    /// (`%2Ffoo%2Fbar`) becomes a real path (`/foo/bar`); anything that isn't a
+    /// syntactically valid URI is returned unchanged, like `URISyntaxException`.
     func withoutDomain(_ url: String) -> String {
         let escaped = url.replacingOccurrences(of: " ", with: "%20")
-        if let components = URLComponents(string: escaped), components.scheme != nil {
-            var path = components.percentEncodedPath
-            if path.isEmpty { path = "/" }
-            if let query = components.percentEncodedQuery { path += "?" + query }
-            if let fragment = components.percentEncodedFragment { path += "#" + fragment }
-            return path
+        var rest = escaped
+        var fragment: String?
+        if let index = rest.firstIndex(of: "#") {
+            fragment = String(rest[rest.index(after: index)...])
+            rest = String(rest[..<index])
         }
-        return url
+        var query: String?
+        if let index = rest.firstIndex(of: "?") {
+            query = String(rest[rest.index(after: index)...])
+            rest = String(rest[..<index])
+        }
+        var path = rest
+        if let schemeRange = rest.range(of: "://") {
+            // Hierarchical URL: drop scheme and authority, keep the remainder.
+            path = rest.range(of: "/", range: schemeRange.upperBound..<rest.endIndex)
+                .map { String(rest[$0.lowerBound...]) } ?? ""
+        } else if let colon = rest.firstIndex(of: ":"), !rest[..<colon].isEmpty,
+                  rest[..<colon].allSatisfy({ $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "." }) {
+            // Opaque URI (`scheme:opaque`): `URI` reports no path at all.
+            if !rest[rest.index(after: colon)...].hasPrefix("/") { path = "" }
+        }
+        guard let decodedPath = percentDecoded(path) else { return url }
+        var out = decodedPath
+        if let query, let decodedQuery = percentDecoded(query) { out += "?" + decodedQuery }
+        if let fragment, let decodedFragment = percentDecoded(fragment) { out += "#" + decodedFragment }
+        return out
+    }
+
+    /// Percent-decodes like `java.net.URI`, returning nil for a malformed escape
+    /// (which `URI` reports as `URISyntaxException`).
+    func percentDecoded(_ text: String) -> String? {
+        guard text.contains("%") else { return text }
+        let units = Array(text.utf16)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(units.count)
+        var index = 0
+        while index < units.count {
+            let unit = units[index]
+            if unit == 0x25 {
+                guard index + 2 < units.count,
+                      let high = hexValue(units[index + 1]),
+                      let low = hexValue(units[index + 2]) else { return nil }
+                bytes.append(high << 4 | low)
+                index += 3
+            } else if unit < 0x80 {
+                bytes.append(UInt8(unit))
+                index += 1
+            } else {
+                bytes.append(contentsOf: Array(String(decoding: [unit], as: UTF16.self).utf8))
+                index += 1
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private func hexValue(_ unit: UInt16) -> UInt8? {
+        switch unit {
+        case 0x30...0x39: return UInt8(unit - 0x30)
+        case 0x41...0x46: return UInt8(unit - 0x41 + 10)
+        case 0x61...0x66: return UInt8(unit - 0x61 + 10)
+        default: return nil
+        }
     }
 }
 
@@ -1826,7 +1909,7 @@ extension MihonAPI {
         if other.thumbnail.bits != 0 { target.thumbnail = other.thumbnail }
         target.status = other.status
         if !target.initialized { target.initialized = other.initialized }
-        target.memo = other.memo
+        if other.memo.bits != 0 { target.memo = other.memo }
     }
 
     private static func copyChapter(_ target: VMChapterPayload, from other: VMChapterPayload) {
@@ -1835,7 +1918,7 @@ extension MihonAPI {
         target.dateUpload = other.dateUpload
         target.chapterNumber = other.chapterNumber
         target.scanlator = other.scanlator
-        target.memo = other.memo
+        if other.memo.bits != 0 { target.memo = other.memo }
     }
 
     private static func concreteManga() -> NativeClass {
@@ -1844,9 +1927,17 @@ extension MihonAPI {
             runtime.setPayload(args[0], VMMangaPayload())
             return .zero
         }
-        cls.method("getUrl", "()Ljava/lang/String;") { r, a, _ in r.manga(a[0]).url }
+        // `SManga.url`/`title` are non-null Kotlin `String`s; an unset slot must
+        // read as "" so extensions can call String members on them.
+        cls.method("getUrl", "()Ljava/lang/String;") { r, a, _ in
+            let value = r.manga(a[0]).url
+            return value.bits == 0 ? r.newString("") : value
+        }
         cls.method("setUrl", "(Ljava/lang/String;)V") { r, a, _ in r.manga(a[0]).url = a[1]; return .zero }
-        cls.method("getTitle", "()Ljava/lang/String;") { r, a, _ in r.manga(a[0]).title }
+        cls.method("getTitle", "()Ljava/lang/String;") { r, a, _ in
+            let value = r.manga(a[0]).title
+            return value.bits == 0 ? r.newString("") : value
+        }
         cls.method("setTitle", "(Ljava/lang/String;)V") { r, a, _ in r.manga(a[0]).title = a[1]; return .zero }
         cls.method("getAltTitles", "()Ljava/util/List;") { r, a, _ in r.manga(a[0]).altTitles.bits != 0 ? r.manga(a[0]).altTitles : r.emptyList() }
         cls.method("setAltTitles", "(Ljava/util/List;)V") { r, a, _ in r.manga(a[0]).altTitles = a[1]; return .zero }
@@ -1884,7 +1975,13 @@ extension MihonAPI {
         cls.method("setReadingMode", "(Leu/kanade/tachiyomi/source/model/SManga$ReadingMode;)V") { r, a, _ in r.manga(a[0]).readingMode = a[1]; return .zero }
         cls.method("getUpdate_strategy", "()Leu/kanade/tachiyomi/source/model/UpdateStrategy;") { r, a, _ in r.manga(a[0]).updateStrategy }
         cls.method("setUpdate_strategy", "(Leu/kanade/tachiyomi/source/model/UpdateStrategy;)V") { r, a, _ in r.manga(a[0]).updateStrategy = a[1]; return .zero }
-        cls.method("getMemo", "()Lkotlinx/serialization/json/JsonObject;") { r, a, _ in r.manga(a[0]).memo }
+        // `memo` is a non-null Kotlin property initialized in the constructor;
+        // extensions index into it without a null check.
+        cls.method("getMemo", "()Lkotlinx/serialization/json/JsonObject;") { r, a, _ in
+            let payload = r.manga(a[0])
+            if payload.memo.bits == 0 { payload.memo = r.emptyJsonObject() }
+            return payload.memo
+        }
         cls.method("setMemo", "(Lkotlinx/serialization/json/JsonObject;)V") { r, a, _ in r.manga(a[0]).memo = a[1]; return .zero }
         cls.method("getInitialized", "()Z") { r, a, _ in .boolean(r.manga(a[0]).initialized) }
         cls.method("setInitialized", "(Z)V") { r, a, _ in r.manga(a[0]).initialized = a[1].asBoolean; return .zero }
@@ -1912,7 +2009,10 @@ extension MihonAPI {
         }
         cls.method("getUrl", "()Ljava/lang/String;") { r, a, _ in r.chapter(a[0]).url }
         cls.method("setUrl", "(Ljava/lang/String;)V") { r, a, _ in try r.chapter(a[0]).url = a[1]; return .zero }
-        cls.method("getName", "()Ljava/lang/String;") { r, a, _ in r.chapter(a[0]).name }
+        cls.method("getName", "()Ljava/lang/String;") { r, a, _ in
+            let value = r.chapter(a[0]).name
+            return value.bits == 0 ? r.newString("") : value
+        }
         cls.method("setName", "(Ljava/lang/String;)V") { r, a, _ in try r.chapter(a[0]).name = a[1]; return .zero }
         cls.method("getVolume", "()Ljava/lang/String;") { r, a, _ in r.chapter(a[0]).volume }
         cls.method("setVolume", "(Ljava/lang/String;)V") { r, a, _ in try r.chapter(a[0]).volume = a[1]; return .zero }
@@ -1932,7 +2032,11 @@ extension MihonAPI {
         cls.method("setLocked", "(Z)V") { r, a, _ in try r.chapter(a[0]).locked = a[1].asBoolean; return .zero }
         cls.method("getNote", "()Ljava/lang/String;") { r, a, _ in r.chapter(a[0]).note }
         cls.method("setNote", "(Ljava/lang/String;)V") { r, a, _ in try r.chapter(a[0]).note = a[1]; return .zero }
-        cls.method("getMemo", "()Lkotlinx/serialization/json/JsonObject;") { r, a, _ in r.chapter(a[0]).memo }
+        cls.method("getMemo", "()Lkotlinx/serialization/json/JsonObject;") { r, a, _ in
+            let payload = r.chapter(a[0])
+            if payload.memo.bits == 0 { payload.memo = r.emptyJsonObject() }
+            return payload.memo
+        }
         cls.method("setMemo", "(Lkotlinx/serialization/json/JsonObject;)V") { r, a, _ in try r.chapter(a[0]).memo = a[1]; return .zero }
         cls.method("copyFrom", "(Leu/kanade/tachiyomi/source/model/SChapter;)V") { runtime, args, _ in
             MihonAPI.copyChapter(runtime.chapter(args[0]), from: runtime.chapter(args[1]))
@@ -1971,5 +2075,11 @@ extension VMRuntime {
 
     func emptyList() -> VMValue {
         makeNative("Ljava/util/ArrayList;", payload: VMListPayload([], immutable: true))
+    }
+
+    /// The model classes initialize their `memo`/`extra` JSON slot in the
+    /// constructor, so a freshly built object must never expose `null` there.
+    func emptyJsonObject() -> VMValue {
+        makeNative("Lkotlinx/serialization/json/JsonObject;", payload: VMJsonTree(.object([:])))
     }
 }

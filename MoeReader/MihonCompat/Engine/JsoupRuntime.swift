@@ -35,6 +35,28 @@ final class JNode {
 
     var isElement: Bool { kind == .element }
 
+    /// jsoup's text normalisation: whitespace runs collapse to one space and
+    /// the edges are trimmed. Scanning characters avoids a regex match and
+    /// UTF-16 range conversion per node, which dominated large-page
+    /// `:contains` scans.
+    static func collapsedWhitespace(_ text: String) -> String {
+        var output = ""
+        output.reserveCapacity(text.count)
+        var pendingSpace = false
+        for character in text {
+            if character.isWhitespace {
+                if !output.isEmpty { pendingSpace = true }
+            } else {
+                if pendingSpace {
+                    output.append(" ")
+                    pendingSpace = false
+                }
+                output.append(character)
+            }
+        }
+        return output
+    }
+
     func attribute(_ name: String) -> String? {
         attributes.first { $0.0.caseInsensitiveCompare(name) == .orderedSame }?.1
     }
@@ -81,8 +103,7 @@ final class JNode {
             }
         }
         if ownOnly { return output }
-        let collapsed = output.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        return collapsed.trimmingCharacters(in: .whitespaces)
+        return JNode.collapsedWhitespace(output)
     }
 
     func outerHTML() -> String {
@@ -104,6 +125,16 @@ final class JNode {
 
     func innerHTML() -> String {
         children.map { $0.outerHTML() }.joined()
+    }
+
+    /// jsoup's `hasText`: any descendant text that is not blank.
+    var hasTextContent: Bool {
+        switch kind {
+        case .text, .data:
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        default:
+            return children.contains { $0.hasTextContent }
+        }
     }
 }
 
@@ -220,6 +251,30 @@ enum JsoupHTML {
         "h3": ["h1", "h2", "h3", "h4", "h5", "h6"],
     ]
 
+    /// jsoup's `abs:` resolution: absolute URLs are kept, protocol-relative
+    /// URLs adopt the base scheme, and everything else resolves against the
+    /// document base URI (`java.net.URL` semantics). Unresolvable input maps to
+    /// the empty string, like jsoup.
+    static func absoluteUrl(_ raw: String, base: String) -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty { return "" }
+        if value.hasPrefix("http://") || value.hasPrefix("https://") { return value }
+        if value.hasPrefix("//") {
+            let scheme = base.hasPrefix("https") ? "https:" : "http:"
+            return scheme + value
+        }
+        guard !base.isEmpty, let baseURL = URL(string: base),
+              let resolved = URL(string: value, relativeTo: baseURL) else { return "" }
+        return resolved.absoluteString
+    }
+
+    /// `Jsoup.parseBodyFragment`: the fragments land in a synthetic body element
+    /// while the document keeps `html`/`head` wrappers, so `body()`, `select()`
+    /// and `wholeText()` all observe the same tree as a full parse.
+    static func parseBodyFragment(_ fragment: String, baseUri: String) -> JDocumentPayload {
+        parse(fragment, baseUri: baseUri)
+    }
+
     static func parse(_ html: String, baseUri: String) -> JDocumentPayload {
         let documentNode = JNode(kind: .document)
         let htmlElement = JNode(kind: .element, tag: "html")
@@ -234,11 +289,20 @@ enum JsoupHTML {
 
         var stack: [JNode] = [body]
         var index = html.startIndex
+        // Document preamble: `html`, `head`, `body` wrappers are implicit, and
+        // metadata elements before body content belong in `head` (jsoup's
+        // insertion mode), so `head meta[...]` selectors resolve.
+        var inHead = true
+        let headContentTags: Set<String> = ["base", "basefont", "bgsound", "link", "meta", "title", "style", "script", "noscript", "template"]
 
         func current() -> JNode { stack.last ?? body }
         func appendText(_ text: String) {
             let decoded = decodeEntities(text)
             guard !decoded.isEmpty else { return }
+            if inHead, stack.count == 1 {
+                if decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+                inHead = false
+            }
             let node = JNode(kind: .text, text: decoded)
             node.parent = current()
             current().children.append(node)
@@ -287,6 +351,14 @@ enum JsoupHTML {
                 }
                 index = end.upperBound
 
+                if tag == "html" || tag == "head" {
+                    continue
+                }
+                if tag == "body" {
+                    inHead = false
+                    continue
+                }
+
                 if !selfClosing, let closes = autoClose[tag] {
                     while let top = stack.last, closes.contains(top.tag), stack.count > 1 {
                         stack.removeLast()
@@ -298,9 +370,16 @@ enum JsoupHTML {
                     }
                 }
 
+                let parent: JNode
+                if inHead, stack.count == 1, headContentTags.contains(tag) {
+                    parent = head
+                } else {
+                    inHead = false
+                    parent = current()
+                }
                 let element = JNode(kind: .element, tag: tag, attributes: tokenizer.attributes)
-                element.parent = current()
-                current().children.append(element)
+                element.parent = parent
+                parent.children.append(element)
 
                 if !selfClosing, !voidTags.contains(tag) {
                     if rawTags.contains(tag) {
@@ -437,12 +516,42 @@ extension JsoupHTML {
 // MARK: - Selectors
 
 struct JsoupSelector {
+    struct AttributeConstraint {
+        var name: String
+        var op: String
+        var value: String?
+        /// Compiled pattern for jsoup's `~=` (regex match) operator.
+        var regex: NSRegularExpression?
+    }
+
+    struct Pseudo {
+        /// Lowercased pseudo-class name.
+        var name: String
+        /// Raw argument text between the parentheses.
+        var argument: String?
+        /// `:contains*` needle: quote-trimmed and lowercased once, at parse time.
+        var needle: String? = nil
+        /// Compiled pattern for `:matches` / `:matchesown`.
+        var regex: NSRegularExpression? = nil
+        /// Parsed argument for `:not`, `:is`, `:has`.
+        var inner: [Complex]? = nil
+        /// `:has(> ...)`: only direct children can match.
+        var childScoped = false
+        /// `:has(...)` whose argument ends in a set-level positional filter needs
+        /// per-candidate evaluation to keep `select` semantics.
+        var innerHasPositional = false
+        /// This pseudo filters the matched set (`:first`, `:eq(2)`, ...).
+        var isPositional = false
+        /// Pre-parsed `:nth-child` formula.
+        var nth: (Int, Int)? = nil
+    }
+
     struct Compound {
         var tag: String?
         var ids: [String] = []
         var classes: [String] = []
-        var attributes: [(name: String, operator: String, value: String?)] = []
-        var pseudos: [(name: String, argument: String?)] = []
+        var attributes: [AttributeConstraint] = []
+        var pseudos: [Pseudo] = []
     }
 
     struct Complex {
@@ -450,32 +559,234 @@ struct JsoupSelector {
         var combinators: [Character]
     }
 
+    /// State for one `select`/`matches` evaluation. Everything expensive is
+    /// computed at most once per node and dropped when the call returns:
+    ///
+    /// - normalized text, built bottom-up so a parent reuses the cached text of
+    ///   its children instead of re-walking every subtree;
+    /// - class splits;
+    /// - `:has(...)` answer sets, so the inner selector is evaluated over the
+    ///   document once instead of once per candidate element.
+    ///
+    /// The owning runtime honours the per-operation deadline, so a pathological
+    /// page aborts with `VMCallTimeout` instead of blocking the host thread.
+    final class Context {
+        let root: JNode
+        let runtime: VMRuntime?
+        /// Topmost node of the tree. `:has` scans this whole tree because a
+        /// selector can test an ancestor of `root` (descendant combinators).
+        let scanRoot: JNode
+
+        private var texts: [ObjectIdentifier: String] = [:]
+        private var lowerTexts: [ObjectIdentifier: String] = [:]
+        private var ownTexts: [ObjectIdentifier: String] = [:]
+        private var lowerOwnTexts: [ObjectIdentifier: String] = [:]
+        private var dataTexts: [ObjectIdentifier: String] = [:]
+        private var classLists: [ObjectIdentifier: [String]] = [:]
+        private var descendantHas: [String: Set<ObjectIdentifier>] = [:]
+        private var childHas: [String: Set<ObjectIdentifier>] = [:]
+        private var ticks = 0
+
+        init(root: JNode, runtime: VMRuntime?) {
+            self.root = root
+            self.runtime = runtime
+            var top = root
+            while let parent = top.parent { top = parent }
+            self.scanRoot = top
+        }
+
+        /// Bounded-work probe: one deadline check per few hundred nodes keeps the
+        /// clock syscall off the hot path while still aborting a runaway select.
+        func tick() throws {
+            guard let runtime else { return }
+            ticks += 1
+            guard ticks >= 512 else { return }
+            ticks = 0
+            try runtime.checkOperationDeadline()
+        }
+
+        /// jsoup `Element.text()` for `node`, memoized bottom-up.
+        func text(of node: JNode) -> String {
+            let key = ObjectIdentifier(node)
+            if let cached = texts[key] { return cached }
+            var output = ""
+            for child in node.children {
+                switch child.kind {
+                case .text, .data:
+                    output += child.text
+                case .element:
+                    let childText = text(of: child)
+                    if !childText.isEmpty { output += childText }
+                    if JsoupHTML.blockTags.contains(child.tag) || child.tag == "br" { output += " " }
+                default:
+                    break
+                }
+            }
+            let value = JNode.collapsedWhitespace(output)
+            texts[key] = value
+            return value
+        }
+
+        func lowerText(of node: JNode) -> String {
+            let key = ObjectIdentifier(node)
+            if let cached = lowerTexts[key] { return cached }
+            let value = text(of: node).lowercased()
+            lowerTexts[key] = value
+            return value
+        }
+
+        func ownText(of node: JNode) -> String {
+            let key = ObjectIdentifier(node)
+            if let cached = ownTexts[key] { return cached }
+            var output = ""
+            for child in node.children {
+                switch child.kind {
+                case .text, .data: output += child.text
+                default: break
+                }
+            }
+            ownTexts[key] = output
+            return output
+        }
+
+        func lowerOwnText(of node: JNode) -> String {
+            let key = ObjectIdentifier(node)
+            if let cached = lowerOwnTexts[key] { return cached }
+            let value = ownText(of: node).lowercased()
+            lowerOwnTexts[key] = value
+            return value
+        }
+
+        func lowerDataText(of node: JNode) -> String {
+            let key = ObjectIdentifier(node)
+            if let cached = dataTexts[key] { return cached }
+            var data = ""
+            for child in node.children where child.kind == .data || child.kind == .text {
+                data += child.text
+            }
+            let value = data.lowercased()
+            dataTexts[key] = value
+            return value
+        }
+
+        func classList(of node: JNode) -> [String] {
+            let key = ObjectIdentifier(node)
+            if let cached = classLists[key] { return cached }
+            let value = (node.attribute("class") ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            classLists[key] = value
+            return value
+        }
+
+        /// Every node that has a descendant matching the `:has` argument.
+        func ancestorsWithMatchingDescendant(key: String, groups: [Complex]) throws -> Set<ObjectIdentifier> {
+            if let cached = descendantHas[key] { return cached }
+            var ancestors: Set<ObjectIdentifier> = []
+            for candidate in scanRoot.descendants() {
+                try tick()
+                guard try JsoupSelector.anyMatch(candidate, groups: groups, self) else { continue }
+                var cursor = candidate.parent
+                while let parent = cursor {
+                    ancestors.insert(ObjectIdentifier(parent))
+                    cursor = parent.parent
+                }
+            }
+            descendantHas[key] = ancestors
+            return ancestors
+        }
+
+        /// Parents with an element child matching the `:has(> ...)` argument.
+        func parentsWithMatchingChild(key: String, groups: [Complex]) throws -> Set<ObjectIdentifier> {
+            if let cached = childHas[key] { return cached }
+            var parents: Set<ObjectIdentifier> = []
+            for candidate in scanRoot.descendants() {
+                try tick()
+                guard try JsoupSelector.anyMatch(candidate, groups: groups, self) else { continue }
+                if let parent = candidate.parent { parents.insert(ObjectIdentifier(parent)) }
+            }
+            childHas[key] = parents
+            return parents
+        }
+    }
+
+    /// Parsed selector ASTs, keyed by source text. Selectors repeat heavily and
+    /// parsing is pure.
+    nonisolated(unsafe) private static var parsedCache: [String: [Complex]] = [:]
+
+    /// Compiled patterns for `:matches` and `[attr~=]`, shared between selector
+    /// strings that use the same pattern.
+    nonisolated(unsafe) private static var regexCache: [String: NSRegularExpression] = [:]
+
+    static func compiledRegex(_ pattern: String) -> NSRegularExpression? {
+        if let cached = regexCache[pattern] { return cached }
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
+        if regexCache.count > 256 { regexCache.removeAll(keepingCapacity: true) }
+        regexCache[pattern] = expression
+        return expression
+    }
+
+    static func parsed(_ selector: String) -> [Complex] {
+        if let cached = parsedCache[selector] { return cached }
+        let value = parse(selector)
+        if parsedCache.count > 512 { parsedCache.removeAll(keepingCapacity: true) }
+        parsedCache[selector] = value
+        return value
+    }
+
     static func matches(_ node: JNode, selector: String) -> Bool {
-        parse(selector).contains { match(node, $0) }
+        (try? matches(node, selector: selector, runtime: nil)) ?? false
+    }
+
+    static func matches(_ node: JNode, selector: String, runtime: VMRuntime?) throws -> Bool {
+        let groups = parsed(selector)
+        guard !groups.isEmpty else { return false }
+        return try anyMatch(node, groups: groups, Context(root: node, runtime: runtime))
     }
 
     static func select(_ root: JNode, selector: String) -> [JNode] {
-        let groups = parse(selector)
+        let groups = parsed(selector)
         guard !groups.isEmpty else { return [] }
+        return (try? select(groups: groups, context: Context(root: root, runtime: nil))) ?? []
+    }
+
+    static func select(_ root: JNode, selector: String, runtime: VMRuntime?) throws -> [JNode] {
+        let groups = parsed(selector)
+        guard !groups.isEmpty else { return [] }
+        return try select(groups: groups, context: Context(root: root, runtime: runtime))
+    }
+
+    static func select(groups: [Complex], context: Context) throws -> [JNode] {
+        let candidates = context.root.descendants()
         var selected = Set<ObjectIdentifier>()
         var result: [JNode] = []
-        let candidates = root.descendants()
         for group in groups {
-            var matched = candidates.filter { match($0, group) }
+            var matched: [JNode] = []
+            for node in candidates {
+                try context.tick()
+                if try match(node, group, context) { matched.append(node) }
+            }
             matched = applyPositionalFilters(matched, group.compounds.last?.pseudos ?? [])
             for node in matched where selected.insert(ObjectIdentifier(node)).inserted {
                 result.append(node)
             }
         }
+        guard groups.count > 1 else { return result }
+        // Union of several selector groups keeps document order.
         var order: [ObjectIdentifier: Int] = [:]
         for (index, node) in candidates.enumerated() { order[ObjectIdentifier(node)] = index }
         return result.sorted { (order[ObjectIdentifier($0)] ?? 0) < (order[ObjectIdentifier($1)] ?? 0) }
     }
 
-    private static func applyPositionalFilters(_ nodes: [JNode], _ pseudos: [(name: String, argument: String?)]) -> [JNode] {
+    static func anyMatch(_ node: JNode, groups: [Complex], _ context: Context) throws -> Bool {
+        for group in groups {
+            if try match(node, group, context) { return true }
+        }
+        return false
+    }
+
+    private static func applyPositionalFilters(_ nodes: [JNode], _ pseudos: [Pseudo]) -> [JNode] {
         var values = nodes
-        for pseudo in pseudos {
-            switch pseudo.name.lowercased() {
+        for pseudo in pseudos where pseudo.isPositional {
+            switch pseudo.name {
             case "first": values = Array(values.prefix(1))
             case "last": values = values.isEmpty ? [] : [values[values.count - 1]]
             case "eq":
@@ -610,7 +921,7 @@ struct JsoupSelector {
                         argument = String(text[start..<end])
                         cursor = end < text.endIndex ? text.index(after: end) : end
                     }
-                    compound.pseudos.append((name.trimmingCharacters(in: .whitespaces), argument))
+                    compound.pseudos.append(makePseudo(name, argument))
                     index = cursor
                     mode = "t"
                     continue
@@ -618,11 +929,7 @@ struct JsoupSelector {
                 mode = character
                 index = text.index(after: index)
             default:
-                if mode != "t" {
-                    buffer.append(character)
-                } else {
-                    buffer.append(character)
-                }
+                buffer.append(character)
                 index = text.index(after: index)
                 // Flush single-character selector kinds lazily when next delimiter arrives.
                 if mode == "#" || mode == "." {
@@ -639,7 +946,42 @@ struct JsoupSelector {
         return compound
     }
 
-    static func parseAttribute(_ body: String) -> (name: String, operator: String, value: String?) {
+    /// Resolves everything a pseudo needs once, when the selector is parsed:
+    /// lowercased name and needle, compiled regex, parsed inner selector and
+    /// parsed `an+b` formula.
+    static func makePseudo(_ rawName: String, _ argument: String?) -> Pseudo {
+        let name = rawName.trimmingCharacters(in: .whitespaces).lowercased()
+        var pseudo = Pseudo(name: name, argument: argument)
+        switch name {
+        case "contains", "containsown", "containsdata":
+            pseudo.needle = (argument ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "\"'")).lowercased()
+        case "matches", "matchesown":
+            pseudo.regex = argument.flatMap { compiledRegex($0) }
+        case "not", "is":
+            pseudo.inner = argument.map { parse($0) }
+        case "has":
+            guard let argument else { return pseudo }
+            if argument.hasPrefix(">") {
+                let childSelector = String(argument.dropFirst()).trimmingCharacters(in: .whitespaces)
+                pseudo.childScoped = true
+                pseudo.inner = parse(childSelector)
+            } else {
+                pseudo.inner = parse(argument)
+            }
+            pseudo.innerHasPositional = (pseudo.inner ?? []).contains { group in
+                (group.compounds.last?.pseudos ?? []).contains { $0.isPositional }
+            }
+        case "nth-child":
+            pseudo.nth = argument.flatMap(parseNth)
+        case "first", "last", "eq", "gt", "lt", "even", "odd":
+            pseudo.isPositional = true
+        default:
+            break
+        }
+        return pseudo
+    }
+
+    static func parseAttribute(_ body: String) -> AttributeConstraint {
         let patterns = ["^=", "$=", "*=", "~=", "|=", "="]
         for pattern in patterns {
             if let range = body.range(of: pattern) {
@@ -650,39 +992,44 @@ struct JsoupSelector {
                 } else if value.hasPrefix("'"), value.hasSuffix("'"), value.count >= 2 {
                     value = String(value.dropFirst().dropLast())
                 }
-                return (name, pattern, value)
+                return AttributeConstraint(
+                    name: name,
+                    op: pattern,
+                    value: value,
+                    regex: pattern == "~=" ? compiledRegex(value) : nil
+                )
             }
         }
-        return (body.trimmingCharacters(in: .whitespaces), "", nil)
+        return AttributeConstraint(name: body.trimmingCharacters(in: .whitespaces), op: "", value: nil, regex: nil)
     }
 
-    static func match(_ node: JNode, _ complex: Complex) -> Bool {
+    static func match(_ node: JNode, _ complex: Complex, _ context: Context) throws -> Bool {
         guard !complex.compounds.isEmpty else { return false }
-        return matchAt(node, complex, index: complex.compounds.count - 1)
+        return try matchAt(node, complex, index: complex.compounds.count - 1, context)
     }
 
-    private static func matchAt(_ node: JNode, _ complex: Complex, index: Int) -> Bool {
-        guard node.isElement, matchCompound(node, complex.compounds[index]) else { return false }
+    private static func matchAt(_ node: JNode, _ complex: Complex, index: Int, _ context: Context) throws -> Bool {
+        guard node.isElement, try matchCompound(node, complex.compounds[index], context) else { return false }
         if index == 0 { return true }
         let combinator = complex.combinators[index - 1]
         switch combinator {
         case ">":
             guard let parent = node.parent else { return false }
-            return matchAt(parent, complex, index: index - 1)
+            return try matchAt(parent, complex, index: index - 1, context)
         case "+":
             guard let previous = previousElement(node) else { return false }
-            return matchAt(previous, complex, index: index - 1)
+            return try matchAt(previous, complex, index: index - 1, context)
         case "~":
             var cursor = previousElement(node)
             while let sibling = cursor {
-                if matchAt(sibling, complex, index: index - 1) { return true }
+                if try matchAt(sibling, complex, index: index - 1, context) { return true }
                 cursor = previousElement(sibling)
             }
             return false
         default:
             var cursor = node.parent
             while let parent = cursor {
-                if parent.isElement, matchAt(parent, complex, index: index - 1) { return true }
+                if parent.isElement, try matchAt(parent, complex, index: index - 1, context) { return true }
                 cursor = parent.parent
             }
             return false
@@ -709,72 +1056,101 @@ struct JsoupSelector {
         return nil
     }
 
-    static func matchCompound(_ node: JNode, _ compound: Compound) -> Bool {
+    private static func regexMatches(_ expression: NSRegularExpression, _ text: String) -> Bool {
+        expression.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)) != nil
+    }
+
+    static func matchCompound(_ node: JNode, _ compound: Compound, _ context: Context) throws -> Bool {
         if let tag = compound.tag, node.tag != tag { return false }
         if !compound.ids.isEmpty {
             let id = node.attribute("id") ?? ""
             for expected in compound.ids where id != expected { return false }
         }
         if !compound.classes.isEmpty {
-            let classes = (node.attribute("class") ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            let classes = context.classList(of: node)
             for expected in compound.classes where !classes.contains(expected) { return false }
         }
         for attribute in compound.attributes {
             guard let actual = node.attribute(attribute.name) else { return false }
-            switch attribute.operator {
+            switch attribute.op {
             case "=": if actual != (attribute.value ?? "") { return false }
             case "^=": if !actual.hasPrefix(attribute.value ?? "") { return false }
             case "$=": if !actual.hasSuffix(attribute.value ?? "") { return false }
             case "*=": if !actual.contains(attribute.value ?? "") { return false }
             case "~=":
-                let parts = actual.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-                if !parts.contains(attribute.value ?? "") { return false }
+                // jsoup redefines `~=` as a regex match on the value (CSS-Word
+                // containment is not offered), so `[x-data~=scroll]` matches
+                // any value containing "scroll".
+                guard let regex = attribute.regex, regexMatches(regex, actual) else { return false }
             case "|=": if actual != (attribute.value ?? "") && !actual.hasPrefix((attribute.value ?? "") + "-") { return false }
             default: break
             }
         }
-        for pseudo in compound.pseudos where !matchPseudo(node, pseudo.name, pseudo.argument) {
-            return false
+        for pseudo in compound.pseudos {
+            if !(try matchPseudo(node, pseudo, context)) { return false }
         }
         return true
     }
 
-    static func matchPseudo(_ node: JNode, _ name: String, _ argument: String?) -> Bool {
-        let lower = name.lowercased()
-        let siblings = node.parent?.elementChildren ?? [node]
-        let index = siblings.firstIndex(where: { $0 === node }) ?? 0
-        switch lower {
-        case "first-child": return index == 0
-        case "last-child": return index == siblings.count - 1
-        case "only-child": return siblings.count == 1
-        case "empty": return node.elementChildren.isEmpty && node.textContent().isEmpty
-        case "root": return node.parent?.kind == .document
+    static func matchPseudo(_ node: JNode, _ pseudo: Pseudo, _ context: Context) throws -> Bool {
+        switch pseudo.name {
+        case "first-child":
+            return siblingInfo(node).index == 0
+        case "last-child":
+            let info = siblingInfo(node)
+            return info.count > 0 && info.index == info.count - 1
+        case "only-child":
+            return siblingInfo(node).count == 1
+        case "empty":
+            return !node.children.contains(where: { $0.isElement }) && context.text(of: node).isEmpty
+        case "root":
+            return node.parent?.kind == .document
         case "not":
-            guard let argument else { return true }
-            return !matches(node, selector: argument)
+            guard let inner = pseudo.inner else { return true }
+            return !(try anyMatch(node, groups: inner, context))
         case "has":
-            guard let argument else { return false }
-            return !select(node, selector: argument).isEmpty
+            guard let inner = pseudo.inner, !inner.isEmpty else { return false }
+            // `:has(> x)` only inspects children, so the full-subtree scan
+            // (quadratic on pages with many sibling rows) is unnecessary.
+            if pseudo.childScoped {
+                let parents = try context.parentsWithMatchingChild(key: pseudo.argument ?? "", groups: inner)
+                return parents.contains(ObjectIdentifier(node))
+            }
+            // The inner selector is evaluated once over the document and its
+            // matches are folded into the set of ancestors; asking per
+            // candidate would walk every descendant subtree again.
+            if pseudo.innerHasPositional {
+                return try hasDescendantScoped(node, groups: inner, context)
+            }
+            let ancestors = try context.ancestorsWithMatchingDescendant(key: pseudo.argument ?? "", groups: inner)
+            return ancestors.contains(ObjectIdentifier(node))
         case "contains":
-            let text = (argument ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            return node.textContent().lowercased().contains(text.lowercased())
+            return context.lowerText(of: node).contains(pseudo.needle ?? "")
         case "containsown":
-            let text = (argument ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            return node.textContent(ownOnly: true).lowercased().contains(text.lowercased())
-        case "matches", "matchesown":
-            guard let argument, let expression = try? NSRegularExpression(pattern: argument) else { return false }
-            let text = lower == "matchesown" ? node.textContent(ownOnly: true) : node.textContent()
-            let range = NSRange(text.startIndex..<text.endIndex, in: text)
-            return expression.firstMatch(in: text, range: range) != nil
+            return context.lowerOwnText(of: node).contains(pseudo.needle ?? "")
+        case "containsdata":
+            // jsoup: the combined data of the element's direct data nodes
+            // (script/style bodies are stored as data nodes).
+            return context.lowerDataText(of: node).contains(pseudo.needle ?? "")
+        case "matches":
+            guard let regex = pseudo.regex else { return false }
+            return regexMatches(regex, context.text(of: node))
+        case "matchesown":
+            guard let regex = pseudo.regex else { return false }
+            return regexMatches(regex, context.ownText(of: node))
+        case "is":
+            // jsoup 1.16+: `:is(...)` is `:matches` with selector syntax.
+            guard let inner = pseudo.inner else { return false }
+            return try anyMatch(node, groups: inner, context)
         case "nth-child":
-            guard let argument, let (a, b) = parseNth(argument) else { return false }
-            let position = index + 1
+            guard let (a, b) = pseudo.nth else { return false }
+            let position = siblingInfo(node).index + 1
             if a == 0 { return position == b }
             return position >= b && (position - b) % a == 0 && (position - b) / a >= 0
         case "first-of-type":
-            return siblings.filter { $0.tag == node.tag }.first === node
+            return isFirstOfType(node)
         case "last-of-type":
-            return siblings.filter { $0.tag == node.tag }.last === node
+            return isLastOfType(node)
         case "header":
             return ["h1", "h2", "h3", "h4", "h5", "h6"].contains(node.tag)
         case "parent":
@@ -785,6 +1161,59 @@ struct JsoupSelector {
         default:
             return false
         }
+    }
+
+    /// Element index among its parent's element children, and that count.
+    private static func siblingInfo(_ node: JNode) -> (index: Int, count: Int) {
+        guard let parent = node.parent else { return (0, 1) }
+        var index = 0
+        var count = 0
+        for child in parent.children where child.isElement {
+            if child === node { index = count }
+            count += 1
+        }
+        return (index, count)
+    }
+
+    private static func isFirstOfType(_ node: JNode) -> Bool {
+        guard let parent = node.parent else { return true }
+        for child in parent.children where child.isElement {
+            if child.tag == node.tag { return child === node }
+        }
+        return false
+    }
+
+    private static func isLastOfType(_ node: JNode) -> Bool {
+        guard let parent = node.parent else { return true }
+        var last: JNode?
+        for child in parent.children where child.isElement {
+            if child.tag == node.tag { last = child }
+        }
+        return last === node
+    }
+
+    /// Legacy `:has` semantics for arguments that end in a set-level positional
+    /// pseudo (`:eq(1)`, `:gt(0)`, ...): the inner selector is applied to each
+    /// candidate's own subtree and filtered there.
+    private static func hasDescendantScoped(_ node: JNode, groups: [Complex], _ context: Context) throws -> Bool {
+        let candidates = node.descendants()
+        for group in groups {
+            let pseudos = group.compounds.last?.pseudos ?? []
+            if pseudos.contains(where: { $0.isPositional }) {
+                var matched: [JNode] = []
+                for candidate in candidates {
+                    try context.tick()
+                    if try match(candidate, group, context) { matched.append(candidate) }
+                }
+                if !applyPositionalFilters(matched, pseudos).isEmpty { return true }
+            } else {
+                for candidate in candidates {
+                    try context.tick()
+                    if try match(candidate, group, context) { return true }
+                }
+            }
+        }
+        return false
     }
 
     static func parseNth(_ text: String) -> (Int, Int)? {
@@ -806,8 +1235,45 @@ struct JsoupSelector {
 // MARK: - Runtime classes
 
 enum JsoupRuntime {
+    /// `android.text.Html`: markup to plain text through the same tokenizer.
+    private static func htmlClasses() -> [NativeClass] {
+        let spanned = NativeClass("Landroid/text/Spanned;", superclass: nil, interfaces: ["Ljava/lang/CharSequence;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        let html = NativeClass("Landroid/text/Html;")
+        for signature in ["(Ljava/lang/String;)Landroid/text/Spanned;", "(Ljava/lang/String;I)Landroid/text/Spanned;"] {
+            html.staticMethod("fromHtml", signature) { runtime, args, _ in
+                // The text-page interceptor only reads `toString()`, so a plain
+                // string carries the extracted text unchanged.
+                runtime.newString(plainText(fromHtml: runtime.stringValue(args[0]) ?? ""))
+            }
+        }
+        return [html, spanned]
+    }
+
+    static func plainText(fromHtml markup: String) -> String {
+        let document = JsoupHTML.parse(markup, baseUri: "")
+        var output = ""
+        func walk(_ node: JNode) {
+            if node.kind == .element {
+                let tag = node.tag
+                if tag == "br" {
+                    output += "\n"
+                    return
+                }
+                let block = JsoupHTML.blockTags.contains(tag) || tag == "div" || tag == "p"
+                if block, !output.isEmpty, !output.hasSuffix("\n") { output += "\n" }
+                for child in node.children { walk(child) }
+                if block, !output.isEmpty, !output.hasSuffix("\n") { output += "\n" }
+                return
+            }
+            if node.kind == .text { output += node.text }
+        }
+        walk(document.root)
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func classes() -> [NativeClass] {
         var result: [NativeClass] = []
+        result += htmlClasses()
         result += elementClasses().flatMap { $0 }
         result += elementsClasses().flatMap { $0 }
         result += textNodeClasses().flatMap { $0 }
@@ -941,7 +1407,14 @@ enum JsoupRuntime {
         }
         element.method("attr", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
-            return runtime.newString(payload.node.attribute(runtime.stringValue(args[1]) ?? "") ?? "")
+            let name = runtime.stringValue(args[1]) ?? ""
+            // jsoup resolves the `abs:` prefix against the document base URI.
+            if name.hasPrefix("abs:") {
+                let attribute = String(name.dropFirst(4))
+                guard let raw = payload.node.attribute(attribute) else { return runtime.newString("") }
+                return runtime.newString(JsoupHTML.absoluteUrl(raw, base: payload.document.baseUri))
+            }
+            return runtime.newString(payload.node.attribute(name) ?? "")
         }
         element.method("attr", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
             if let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) {
@@ -961,15 +1434,8 @@ enum JsoupRuntime {
         }
         element.method("absUrl", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self),
-                  let raw = payload.node.attribute(runtime.stringValue(args[1]) ?? ""), !raw.isEmpty else { return runtime.newString("") }
-            let base = payload.document.baseUri
-            if raw.hasPrefix("http://") || raw.hasPrefix("https://") || raw.hasPrefix("//") {
-                return runtime.newString(raw.hasPrefix("//") ? "https:" + raw : raw)
-            }
-            if let baseURL = URL(string: base), let resolved = URL(string: raw, relativeTo: baseURL) {
-                return runtime.newString(resolved.absoluteString)
-            }
-            return runtime.newString(raw)
+                  let raw = payload.node.attribute(runtime.stringValue(args[1]) ?? "") else { return runtime.newString("") }
+            return runtime.newString(JsoupHTML.absoluteUrl(raw, base: payload.document.baseUri))
         }
         element.method("text", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
@@ -982,6 +1448,9 @@ enum JsoupRuntime {
         element.method("wholeText", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             return runtime.newString(payload.node.textContent())
+        }
+        element.method("hasText", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: JElementPayload.self)?.node.hasTextContent ?? false)
         }
         element.method("data", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
@@ -1089,17 +1558,17 @@ enum JsoupRuntime {
         }
         element.method("select", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
-            let nodes = JsoupSelector.select(payload.node, selector: runtime.stringValue(args[1]) ?? "")
+            let nodes = try JsoupSelector.select(payload.node, selector: runtime.stringValue(args[1]) ?? "", runtime: runtime)
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("selectFirst", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
-            guard let node = JsoupSelector.select(payload.node, selector: runtime.stringValue(args[1]) ?? "").first else { return .null }
+            guard let node = try JsoupSelector.select(payload.node, selector: runtime.stringValue(args[1]) ?? "", runtime: runtime).first else { return .null }
             return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload.document))
         }
         element.method("is", "(Ljava/lang/String;)Z") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .boolean(false) }
-            return .boolean(JsoupSelector.matches(payload.node, selector: runtime.stringValue(args[1]) ?? ""))
+            return .boolean(try JsoupSelector.matches(payload.node, selector: runtime.stringValue(args[1]) ?? "", runtime: runtime))
         }
         element.method("getElementById", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
@@ -1185,7 +1654,7 @@ enum JsoupRuntime {
         elements.method("select", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
             var nodes: [JNode] = []
-            for root in payload.nodes { nodes.append(contentsOf: JsoupSelector.select(root, selector: runtime.stringValue(args[1]) ?? "")) }
+            for root in payload.nodes { nodes.append(contentsOf: try JsoupSelector.select(root, selector: runtime.stringValue(args[1]) ?? "", runtime: runtime)) }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         elements.method("text", "()Ljava/lang/String;") { runtime, args, _ in
@@ -1195,6 +1664,15 @@ enum JsoupRuntime {
         elements.method("attr", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
+            if name.hasPrefix("abs:") {
+                let attribute = String(name.dropFirst(4))
+                for node in payload.nodes {
+                    if let raw = node.attribute(attribute) {
+                        return runtime.newString(JsoupHTML.absoluteUrl(raw, base: payload.document.baseUri))
+                    }
+                }
+                return runtime.newString("")
+            }
             for node in payload.nodes {
                 if let value = node.attribute(name) { return runtime.newString(value) }
             }
@@ -1232,6 +1710,10 @@ enum JsoupRuntime {
             let name = runtime.stringValue(args[1]) ?? ""
             return .boolean(payload.nodes.contains { $0.attribute(name) != nil })
         }
+        elements.method("hasText", "()Z") { runtime, args, _ in
+            guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .boolean(false) }
+            return .boolean(payload.nodes.contains { $0.hasTextContent })
+        }
         elements.method("eachText", "()Ljava/util/List;") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(payload.nodes.map { runtime.newString($0.textContent()) }))
@@ -1248,7 +1730,10 @@ enum JsoupRuntime {
         elements.method("is", "(Ljava/lang/String;)Z") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .boolean(false) }
             let selector = runtime.stringValue(args[1]) ?? ""
-            return .boolean(payload.nodes.contains { JsoupSelector.matches($0, selector: selector) })
+            for node in payload.nodes {
+                if try JsoupSelector.matches(node, selector: selector, runtime: runtime) { return .boolean(true) }
+            }
+            return .boolean(false)
         }
         elements.method("toArray", "()[Ljava/lang/Object;") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
@@ -1333,8 +1818,12 @@ enum JsoupRuntime {
             let document = JsoupHTML.parse(html, baseUri: runtime.stringValue(args[2]) ?? "")
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
         }
+        jsoup.staticMethod("parseBodyFragment", "(Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
+            let document = JsoupHTML.parseBodyFragment(runtime.stringValue(args[0]) ?? "", baseUri: "")
+            return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
+        }
         jsoup.staticMethod("parseBodyFragment", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Document;") { runtime, args, _ in
-            let document = JsoupHTML.parse(runtime.stringValue(args[0]) ?? "", baseUri: runtime.stringValue(args[1]) ?? "")
+            let document = JsoupHTML.parseBodyFragment(runtime.stringValue(args[0]) ?? "", baseUri: runtime.stringValue(args[1]) ?? "")
             return runtime.makeNative("Lorg/jsoup/nodes/Document;", payload: JElementPayload(node: document.root, document: document))
         }
         jsoup.staticMethod("unescapeEntities", "(Ljava/lang/String;Z)Ljava/lang/String;") { runtime, args, _ in

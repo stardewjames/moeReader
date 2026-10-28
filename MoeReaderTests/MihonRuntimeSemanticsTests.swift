@@ -1,3 +1,7 @@
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import XCTest
 @testable import MoeReader
 
@@ -188,4 +192,148 @@ final class MihonRuntimeSemanticsTests: XCTestCase {
         _ = try invoke(runtime, buffered2, "close()V")
         XCTAssertEqual(try Data(contentsOf: url), Data("live".utf8))
     }
+
+    // MARK: - android.webkit
+
+    private let cookieOrigin = "https://cookies.invalid/dir/page"
+
+    private func clearCookies() throws {
+        let url = try XCTUnwrap(URL(string: cookieOrigin))
+        for cookie in WebKitRuntime.cookies(HTTPCookieStorage.shared, for: url) {
+            HTTPCookieStorage.shared.deleteCookie(cookie)
+        }
+    }
+
+    private func cookieManager(_ runtime: VMRuntime) throws -> (VMClass, VMValue) {
+        let cls = try runtime.linkClass("Landroid/webkit/CookieManager;")
+        let instance = try runtime.invoke(
+            try XCTUnwrap(cls.lookupStatic("getInstance", "()Landroid/webkit/CookieManager;")),
+            []
+        )
+        return (cls, instance)
+    }
+
+    /// `CookieManager` shares the host transport's storage, so a cookie an
+    /// extension stores is the cookie a request sends and vice versa.
+    func testCookieManagerWritesAndReadsHostCookieStorage() throws {
+        let runtime = VMRuntime()
+        let (cls, instance) = try cookieManager(runtime)
+        let setCookie = try XCTUnwrap(cls.lookupVirtual("setCookie", "(Ljava/lang/String;Ljava/lang/String;)Z"))
+        let getCookie = try XCTUnwrap(cls.lookupVirtual("getCookie", "(Ljava/lang/String;)Ljava/lang/String;"))
+
+        try clearCookies()
+        let stored = try runtime.invoke(setCookie, [
+            instance,
+            runtime.newString(cookieOrigin),
+            runtime.newString("session=abc123; Domain=cookies.invalid; Path=/dir; Secure"),
+        ])
+        XCTAssertTrue(stored.asBoolean)
+
+        let url = try XCTUnwrap(URL(string: cookieOrigin))
+        let shared = WebKitRuntime.cookies(HTTPCookieStorage.shared, for: url)
+        XCTAssertEqual(shared.map { $0.name }, ["session"])
+        XCTAssertEqual(shared.first?.value, "abc123")
+
+        let header = try runtime.invoke(getCookie, [instance, runtime.newString(cookieOrigin)])
+        XCTAssertEqual(runtime.stringValue(header), "session=abc123")
+        let other = try runtime.invoke(getCookie, [
+            instance,
+            runtime.newString("https://other.invalid/dir/page"),
+        ])
+        XCTAssertEqual(other.bits, 0)
+    }
+
+    func testCookieManagerDeletesExpiredCookieAndSkipsPlainHTTPForSecureCookies() throws {
+        let runtime = VMRuntime()
+        let (cls, instance) = try cookieManager(runtime)
+        let setCookie = try XCTUnwrap(cls.lookupVirtual("setCookie", "(Ljava/lang/String;Ljava/lang/String;)Z"))
+        let getCookie = try XCTUnwrap(cls.lookupVirtual("getCookie", "(Ljava/lang/String;)Ljava/lang/String;"))
+
+        try clearCookies()
+        _ = try runtime.invoke(setCookie, [
+            instance,
+            runtime.newString(cookieOrigin),
+            runtime.newString("token=one; Domain=cookies.invalid; Path=/dir"),
+        ])
+        let beforeDeletion = try runtime.invoke(getCookie, [instance, runtime.newString(cookieOrigin)])
+        XCTAssertEqual(runtime.stringValue(beforeDeletion), "token=one")
+
+        // `Max-Age=0` is the platform's deletion form, not a value to store.
+        _ = try runtime.invoke(setCookie, [
+            instance,
+            runtime.newString(cookieOrigin),
+            runtime.newString("token=one; Domain=cookies.invalid; Path=/dir; Max-Age=0"),
+        ])
+        let afterDeletion = try runtime.invoke(getCookie, [instance, runtime.newString(cookieOrigin)])
+        XCTAssertEqual(afterDeletion.bits, 0)
+
+        _ = try runtime.invoke(setCookie, [
+            instance,
+            runtime.newString(cookieOrigin),
+            runtime.newString("secure=yes; Domain=cookies.invalid; Path=/dir; Secure"),
+        ])
+        let insecure = try runtime.invoke(getCookie, [
+            instance,
+            runtime.newString("http://cookies.invalid/dir/page"),
+        ])
+        XCTAssertEqual(insecure.bits, 0)
+    }
+
+    func testCookieManagerRemoveAllCookiesClearsHostStorage() throws {
+        let runtime = VMRuntime()
+        let (cls, instance) = try cookieManager(runtime)
+        let setCookie = try XCTUnwrap(cls.lookupVirtual("setCookie", "(Ljava/lang/String;Ljava/lang/String;)Z"))
+        let flush = try XCTUnwrap(cls.lookupVirtual("flush", "()V"))
+        let removeAll = try XCTUnwrap(cls.lookupVirtual("removeAllCookies", "(Landroid/webkit/ValueCallback;)V"))
+
+        try clearCookies()
+        for pair in ["a=1", "b=2"] {
+            _ = try runtime.invoke(setCookie, [
+                instance,
+                runtime.newString(cookieOrigin),
+                runtime.newString("\(pair); Domain=cookies.invalid; Path=/dir"),
+            ])
+        }
+        _ = try runtime.invoke(flush, [instance])
+        let url = try XCTUnwrap(URL(string: cookieOrigin))
+        XCTAssertEqual(WebKitRuntime.cookies(HTTPCookieStorage.shared, for: url).count, 2)
+
+        let callback = runtime.makeNative("Landroid/webkit/ValueCallback;", payload: NSNull())
+        _ = try runtime.invoke(removeAll, [instance, callback])
+        XCTAssertTrue(WebKitRuntime.cookies(HTTPCookieStorage.shared, for: url).isEmpty)
+    }
+
+    func testUrlUtilAcceptsPlatformUrlSchemesOnly() throws {
+        let runtime = VMRuntime()
+        let cls = try runtime.linkClass("Landroid/webkit/URLUtil;")
+        let isValid = try XCTUnwrap(cls.lookupStatic("isValidUrl", "(Ljava/lang/String;)Z"))
+
+        for valid in ["https://example.invalid/a", "http://example.invalid", "about:blank", "data:text/html,x", "file:///tmp/x"] {
+            let result = try runtime.invoke(isValid, [runtime.newString(valid)])
+            XCTAssertTrue(result.asBoolean, "expected \(valid) to be a valid url")
+        }
+        for invalid in ["", "example.invalid/a", "ftp:/x", "//example.invalid"] {
+            let result = try runtime.invoke(isValid, [runtime.newString(invalid)])
+            XCTAssertFalse(result.asBoolean, "expected \(invalid) to be rejected")
+        }
+    }
+
+    #if !canImport(WebKit)
+    /// A host with no WebView provider reports the platform exception instead
+    /// of pretending a page was created.
+    func testWebViewWithoutProviderThrowsTypedJavaException() throws {
+        let runtime = VMRuntime()
+        let cls = try runtime.linkClass("Landroid/webkit/WebView;")
+        let instance = VMValue.reference(runtime.allocateObject(cls))
+        let context = runtime.makeNative("Landroid/content/Context;", payload: NSNull())
+        let initializer = try XCTUnwrap(cls.lookupVirtual(key: "<init>(Landroid/content/Context;)V"))
+
+        XCTAssertThrowsError(try runtime.invoke(initializer, [instance, context])) { error in
+            guard let exception = error as? VMJavaException else {
+                return XCTFail("expected a Java exception, got \(error)")
+            }
+            XCTAssertEqual(exception.classDescriptor, "Ljava/lang/UnsupportedOperationException;")
+        }
+    }
+    #endif
 }
