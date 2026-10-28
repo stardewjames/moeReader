@@ -32,7 +32,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: SuwayomiHost/build/runtime/ios
-          key: suwayomi-openjdk-ios-${{ hashFiles('SuwayomiHost/jvm-ios/**', 'SuwayomiHost/jvm-options/openjdk.options') }}
+          key: suwayomi-openjdk-ios-${{ hashFiles('SuwayomiHost/jvm-ios/fetch-openjdk.sh', 'SuwayomiHost/jvm-ios/build-openjdk-macos.sh', 'SuwayomiHost/jvm-ios/build-openjdk-ios.sh', 'SuwayomiHost/jvm-ios/package.sh', 'SuwayomiHost/jvm-options/openjdk.options') }}
       - name: Refresh the cached runtime
         if: steps.jvm.outputs.cache-hit == 'true'
         run: HOST_ONLY=1 SKIP_HOST_BUILD=1 SuwayomiHost/jvm-ios/package.sh
