@@ -39,29 +39,40 @@ fi
 cd "$SRC"
 
 # HotSpot's macOS/arm64 write-xor-execute helpers live in
-# os_cpu/bsd_aarch64/os_bsd_aarch64.cpp, but a Zero build compiles
-# os_cpu/bsd_zero instead and still defines MACOS_AARCH64 (macros.hpp keys it on
-# __APPLE__ && AARCH64), so every inline W^X transition in shared code
-# references os::thread_wx_enable_write_impl, os::_jit_exec_enabled and
-# DefaultWXWriteMode, which nothing defines: the static link fails. Zero never
-# generates code and needs no W^X transition, so the macro is gated on the
-# variant here rather than patching the pinned sources upstream. Idempotent.
-MACROS="src/hotspot/share/utilities/macros.hpp"
-if ! grep -q "defined(ZERO) /\* mihoncompat: no W^X for Zero \*/" "$MACROS"; then
-  python3 - "$MACROS" <<'PY'
+# os_cpu/bsd_aarch64/os_bsd_aarch64.cpp. A Zero build compiles
+# os_cpu/bsd_zero instead, and that file provides current_thread_enable_wx for
+# apple/arm64 but not the W^X switch the shared inline transitions use
+# (os::thread_wx_enable_write_impl, os::_jit_exec_enabled) nor the
+# DefaultWXWriteMode policy value, so the static link fails on them. Zero never
+# generates code, so the helpers are no-ops here; they are injected into the
+# zero file the pinned sources already ship rather than into aarch64 code this
+# variant does not compile. Idempotent.
+ZERO_OS="src/hotspot/os_cpu/bsd_zero/os_bsd_zero.cpp"
+if ! grep -q "mihoncompat: Zero W^X helpers" "$ZERO_OS"; then
+  python3 - "$ZERO_OS" <<'PATCHEOF'
 import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
-old = "#if defined(__APPLE__) && defined(AARCH64)\n#define MACOS_AARCH64 1\n#endif"
-new = ("// Zero builds compile os_cpu/bsd_zero and never generate code, so the\n"
-       "// apple/arm64 W^X helpers in os_cpu/bsd_aarch64 are not linked in.\n"
-       "#if defined(__APPLE__) && defined(AARCH64) && !defined(ZERO) /* mihoncompat: no W^X for Zero */\n"
-       "#define MACOS_AARCH64 1\n"
-       "#endif")
-if old not in text:
-    sys.exit("build-openjdk-ios: MACOS_AARCH64 block not found in macros.hpp")
-open(path, "w", encoding="utf-8").write(text.replace(old, new, 1))
-PY
+anchor = """#if defined(AARCH64) && defined(__APPLE__)
+void os::current_thread_enable_wx(WXMode mode) {
+#ifndef __IOS__
+  pthread_jit_write_protect_np(mode == WXExec);
+#endif
+}
+#endif"""
+addition = anchor.replace("#endif", """
+// mihoncompat: Zero W^X helpers. The shared inline transitions in
+// interfaceSupport.inline.hpp reference these on apple/arm64, but only the
+// aarch64 os_cpu file defines them and this variant compiles this file. Zero
+// executes no generated code, so enabling writes is a no-op.
+WXMode DefaultWXWriteMode = WXExec;
+THREAD_LOCAL bool os::_jit_exec_enabled = false;
+void os::thread_wx_enable_write_impl() {}
+#endif""")
+if anchor not in text:
+    sys.exit("build-openjdk-ios: W^X block not found in os_bsd_zero.cpp")
+open(path, "w", encoding="utf-8").write(text.replace(anchor, addition, 1))
+PATCHEOF
 fi
 
 if [ ! -f "build/$CONF/spec.gmk" ]; then
