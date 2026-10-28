@@ -1,0 +1,37 @@
+Suwayomi host — provenance and licenses
+
+The compatibility layer is built on Suwayomi-Server
+(https://github.com/Suwayomi/Suwayomi-Server), licensed under the Mozilla
+Public License 2.0. It is included unmodified as the git submodule
+vendor/suwayomi at the commit pinned by the superproject; the host never edits
+that tree. MPL-2.0 text: LICENSE-MPL-2.0.
+
+The host under host/src/main is MoeReader's own implementation of this app's
+binary wire protocol over that tree. It is not a copy of Suwayomi's server
+(no Javalin, GraphQL, database, downloader or updater) and it is not a copy of
+any other project's host. Files that do adapt existing work say so in their
+headers:
+
+- host/src/main/kotlin/moe/reader/suwayomi/net/NativeNetInterceptor.kt
+  Adapted from the Oneechan runtime's NativeNetInterceptor
+  (https://github.com/leros1337/oneechan-runtime, MPL-2.0). The file keeps its
+  MPL-2.0 header.
+- host/src/overlay/java/com/googlecode/dex2jar/ir/ts/NewTransformer.java
+  dex2jar's file (Apache-2.0) as modified by the Oneechan runtime, then
+  modified for MoeReader. The file stays Apache-2.0; both modifications are
+  named in its header.
+- host/src/main/kotlin/moe/reader/suwayomi/Extensions.kt
+  The dex2jar builder configuration is copied from Suwayomi-Server's
+  PackageTools.dex2jar (MPL-2.0); the exception handler and logging are
+  MoeReader's.
+- host/build.gradle.kts
+  The vendor include/exclude lists started from the Oneechan runtime's
+  source-api build (MPL-2.0 configuration) and were then changed for this app.
+
+The app-side Swift (MoeReader/SuwayomiCompat) and the JNI shim implement this
+project's wire format (SuwayomiWire.swift and Wire.kt). The Oneechan runtime
+repository contains no app-side Swift, and no file in it was copied into
+MoeReader/SuwayomiCompat.
+
+Third-party libraries are resolved by Gradle and keep their own licenses; the
+runtime the app bundles is licensed separately in jvm-ios/NOTICE.

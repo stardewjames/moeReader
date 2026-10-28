@@ -1,0 +1,23 @@
+# HotSpot Zero (OpenJDK Mobile) options for the iOS Suwayomi runtime.
+# package.sh bundles this file as SuwayomiRuntime/jvm.options; SuwayomiJVM
+# appends it after the class path, tmpdir, user.home, encoding and headless
+# options, and fills in ${cacheDir}.
+#
+# Zero is interpreter-only; iOS forbids writable+executable memory, so no JIT
+# is built into libjvm.a. -Xint is explicit for clarity.
+-Xint
+-Xshare:off
+# Serial GC is the collector Zero implements; a single collector thread keeps
+# the boot small. A 32 MB start is committed but only touched as it fills.
+-XX:+UseSerialGC
+-Xms40m
+-Xmx384m
+# Interpreted frames recurse deeply (HTML parsing, regex); reserve room.
+-Xss4m
+# dex2jar output is not verifiable bytecode (extensions are R8-optimised for ART).
+-XX:-BytecodeVerificationRemote
+# No attach API and no perf-data file: both assume a writable /tmp.
+-XX:+DisableAttachMechanism
+-XX:-UsePerfData
+# Fatal error logs go to Caches, never to the sandbox's working directory.
+-XX:ErrorFile=${cacheDir}/hs_err_%p.log

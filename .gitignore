@@ -15,7 +15,7 @@ MoeReader/Info.plist
 __pycache__/
 *.pyc
 
-# Suwayomi host: Gradle outputs, the packaged iOS runtime and the OpenJ9 work tree.
+# Suwayomi host: Gradle outputs, the packaged iOS runtime and the OpenJDK work tree.
 /SuwayomiHost/build/
 /SuwayomiHost/host/build/
 /SuwayomiHost/.gradle/

@@ -10,8 +10,8 @@ scripts that build an interpreter-only JVM for iOS.
 SuwayomiHost/
   vendor/suwayomi/   Suwayomi-Server, git submodule pinned to 6b481e8 (never edited)
   host/              the host jar: a filtered subset of vendor/ + overlays + the bridge
-  jvm-options/       VM option files (OpenJ9 on iOS, HotSpot on desktops)
-  jvm-ios/           Eclipse OpenJ9 for iOS: fetch, patch, cross-build, package
+  jvm-options/       VM option files (HotSpot Zero on iOS, HotSpot on desktops)
+  jvm-ios/           OpenJDK Mobile (HotSpot Zero) for iOS: fetch, cross-build, package
   harness/           Linux harness and Swift tests for the app side
 ```
 
@@ -121,54 +121,67 @@ APKs, site names and recordings never enter the repository.
 
 ## The iOS JVM (`jvm-ios/`)
 
-iOS forbids JIT and writable+executable memory, so the VM is **Eclipse OpenJ9
-0.61 built without a JIT**, with the OpenJDK 21 class library, linked
-statically into the app. The scripts and patches come from the
-[Oneechan runtime](https://github.com/leros1337/oneechan) (MPL-2.0, see
-`jvm-ios/LICENSE-MPL-2.0`), which built and measured this VM for the same
-purpose; only the vendor name and the packaging differ (`package.sh` writes
-MoeReader's layout and keeps per-SDK copies of the prelinked archive).
-OpenJ9 was chosen over HotSpot Zero because Oneechan measured similar speed
-with about 100 MB less peak memory, and because OpenJ9 is usable under
-Apache-2.0 while HotSpot is GPL-2.0 without the Classpath Exception.
+iOS forbids JIT and writable+executable memory, so the VM is **OpenJDK
+Mobile's HotSpot Zero** (the interpreter-only HotSpot, upstream in
+[`openjdk/mobile`](https://github.com/openjdk/mobile)), linked statically into
+the app together with the OpenJDK class library. The sources are pinned to one
+commit (`fetch-openjdk.sh`) and built by this repository's scripts; nothing is
+downloaded as a prebuilt VM.
 
-On a Mac with Xcode (a cold build takes about 40 minutes on an M4 Pro; longer
-on CI runners):
+**Licensing:** HotSpot is GPL-2.0 *only* (no Classpath Exception; the class
+library is GPL-2.0 with the Classpath Exception). An app that links `libjvm.a`
+is a GPLv2 combined work. Complete corresponding source is this repository
+(the build scripts and the app) plus `openjdk/mobile` at the pinned commit;
+`package.sh` writes that notice and OpenJDK's licence files into the bundle.
+Such a build is for sideloading only: GPLv2's no-additional-restrictions rule
+is incompatible with App Store distribution.
+
+On a Mac with Xcode 26 and GNU make 4 (`brew install autoconf make`):
 
 ```bash
 cd SuwayomiHost/jvm-ios
-brew install autoconf cmake
-./fetch-openj9.sh                  # Semeru 21, GNU make, OpenJ9/OMR/OpenJDK at pinned commits
-./build-openj9-macos.sh            # the build JDK that jlinks the iOS image
-./build-openj9-ios.sh iphoneos     # and/or iphonesimulator
+export JAVA_HOME=$(/usr/libexec/java_home -v 26)   # boot JDK; the build is JDK 27
+./fetch-openjdk.sh                 # pinned openjdk/mobile + libffi (SHA-256 pinned)
+./build-openjdk-macos.sh           # jmod/jlink of the same source (required by jlink)
+./build-openjdk-ios.sh iphoneos    # and/or iphonesimulator
 ./package.sh                       # -> SuwayomiHost/build/runtime/ios
-HOST_ONLY=1 ./package.sh           # later: refresh only the host jar
+HOST_ONLY=1 ./package.sh           # later: refresh only the host jar and options
 ```
 
-`package.sh` writes `SuwayomiRuntime/` (jlinked `jre/`, `jvm.options` from
-`jvm-options/openj9.options`, the host jar, licence files), `lib/<sdk>/libopenj9.a`
-and `jvm.xcconfig`. XcodeGen copies `SuwayomiRuntime/` as a folder resource,
-preserving the layout used by bundle discovery. JNI headers are imported through
-the module map, not compiled as app sources. The app and test module-search
-paths and the generated archive path are quoted for checkout paths with spaces.
-`MoeReader/SuwayomiCompat/Suwayomi.xcconfig` pulls in link flags only for packaged
-SDKs and disables dead stripping only for those SDKs. Without the package (or
-for an SDK whose VM was not built), the app still builds and the backend reports
-itself unavailable.
+`package.sh` uses the `jmod`/`jlink` of the macOS JDK built from the same
+source (jlink rejects modules from a different JDK build) to turn the iOS
+build's module classes into the jlinked image, links the static libraries, and
+writes:
 
-CI builds the VM on a cache miss (keyed by `jvm-ios/**` and the OpenJ9 options)
-and otherwise refreshes only the host jar and options. `HOST_ONLY=1` requires
-the restored config, jlinked modules, an archive and bundled licences; it does
-not fetch sources or invoke the native build tools. Full packaging replaces
-the bundled licence directory rather than nesting another copy on each run.
+- `SuwayomiRuntime/` — host jar, `jvm.options` from
+  `jvm-options/openjdk.options`, licences and the GPL source notice;
+- `lib/` — the runtime image. A statically linked HotSpot derives
+  `java.home` as `<bundle>/lib`, so the image's `lib/modules`, `conf/` and
+  `lib/security/` live here and land at `<bundle>/lib/lib/modules`,
+  `<bundle>/lib/conf` and so on;
+- `native/<sdk>/lib*.a` and `jvm.xcconfig` — the static VM, the class-library
+  natives (`java`, `zip`, `net`, `nio`, `jimage`, `management`,
+  `management_ext`) and their linker flags, per SDK.
 
-The jlinked modules are what `jdeps` reports for the host jar (minus
-`jdk.javadoc`), plus `jdk.charsets`, `jdk.localedata` and `jdk.zipfs`.
+Module image: `java.base java.desktop java.logging java.management
+java.naming java.net.http java.scripting java.sql java.xml jdk.charsets
+jdk.localedata jdk.management jdk.unsupported jdk.zipfs`. `java.desktop`'s AWT
+natives are not linked, so bitmap-descrambling extensions fail exactly as they
+did with the previous runtime; `java.management` is linked because
+AndroidCompat's `SystemClock` reads `ManagementFactory` uptime.
 
-Not verified from this repository's development host (no Mac): the OpenJ9
-build itself, the app link, and the VM on a device. Oneechan reports the same
-VM booting and running extensions in the iOS simulator and linking for
-device.
+XcodeGen copies `SuwayomiRuntime/` and `lib/` as folder resources; JNI
+headers are imported through the module map. `Suwayomi.xcconfig` pulls in link
+flags only for packaged SDKs and disables dead stripping only for those SDKs.
+Without the package (or for an SDK whose VM was not built), the app still
+builds and the backend reports itself unavailable.
+
+CI builds the VM on a cache miss (keyed by `jvm-ios/**` and the HotSpot
+options), using JDK 26 as the boot JDK, and otherwise refreshes only the host
+jar and options. A cold build takes tens of minutes.
+
+Not verified from this repository's development host (Windows, no Mac): the
+OpenJDK Mobile build, the app link and the VM on a device or simulator.
 
 ## Updating Suwayomi
 
@@ -178,12 +191,12 @@ changes upstream, port the change into the overlay (`git diff` the upstream
 file between the two commits). `HostVersion.CONVERTER` must be bumped when the
 conversion changes, so cached jars are rebuilt.
 
-## Licences
+## Licences and provenance
 
-The host's original code is BSD-2-Clause like the app. Suwayomi overlays and
-the adapted `net/NativeNetInterceptor.kt` remain MPL-2.0; the dex2jar overlay
-is Apache-2.0 (see their headers). `jvm-ios/` is MPL-2.0 (Oneechan runtime).
-The vendored submodule is MPL-2.0.
-The packaged runtime carries the OpenJ9 and OMR (Apache-2.0), OpenJDK
-(GPL-2.0 with the Classpath Exception), libffi and zlib notices in
-`SuwayomiRuntime/licenses/`.
+The host's original code is BSD-2-Clause like the app. The vendored submodule
+is unchanged upstream Suwayomi-Server (MPL-2.0). The files adapted from the
+Oneechan runtime, the Suwayomi-Server snippets and the dex2jar overlay are
+listed in [`NOTICE`](NOTICE); they keep MPL-2.0/Apache-2.0 as stated there.
+`jvm-ios/` is MoeReader's build of OpenJDK Mobile; the app built with it is
+GPLv2 (see above). Licences shipped in the bundle: OpenJDK (GPLv2, and
+Classpath Exception for the class library) and libffi (MIT).

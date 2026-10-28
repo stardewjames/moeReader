@@ -20,12 +20,22 @@ Liquid Glass.
   every source call runs under a wall-clock budget. No JVM is embedded; a
   source call is the only time the engine does work, and its arena is recycled
   so idle RAM stays flat.
-- Or runs them on the **Suwayomi runtime**: Suwayomi's Android compatibility
-  layer and the real extension libraries on an embedded, interpreter-only
-  OpenJ9 JVM, selectable in Settings → Extension runtime.
+- Or runs them on the **Suwayomi runtime**: Suwayomi-Server's Android
+  compatibility layer and the real OkHttp, Jsoup and Kotlin libraries on an
+  embedded, interpreter-only **HotSpot Zero** JVM (OpenJDK Mobile), selectable
+  in Settings → Extension runtime. The VM is GPL-2.0-only, so builds that
+  bundle it are GPLv2 combined works for sideloading, not the App Store.
 - Browses sources with **search filters** rendered from the extension's
   `FilterList`, and edits source preferences (text, toggles, single-choice
   lists, multi-select values) from a settings sheet.
+- **Settings → Encrypted DNS** (off by default): resolves source and
+  repository hostnames over HTTPS using a public resolver or a custom endpoint,
+  then connects to the resolved address while keeping the hostname as TLS SNI
+  and `Host`. The lookup is not exposed and the connection targets the resolved
+  address, which helps on a network that filters names. Certificates are still
+  checked against the name, bodies are capped and requests timed out, and an
+  HTTPS request is never downgraded to plain HTTP.
+  See `MoeReader/MihonCompat/README.md`.
 - ZIP central-directory random access: archives are opened, not extracted.
 - Stored ZIP/TAR pages are decoded directly from the mapped file (zero-copy payloads).
 - Off-main ImageIO downsampling with a bounded decoded-image cache and ±2-page prefetch.
@@ -51,21 +61,18 @@ backend**, chosen in Settings → Extension runtime:
   (RxJava-only fetch overrides, entropy-coded zstd response bodies, merged
   duplicate response headers, and library surface that needs Apple frameworks).
 - **Suwayomi runtime** (`SuwayomiCompat` + `SuwayomiHost`) runs a cut-down
-  Suwayomi-Server — its Android compatibility layer and the real OkHttp, Jsoup,
-  RxJava and Kotlin libraries — on an interpreter-only OpenJ9 JVM linked into
-  the app. It starts on the first source call, adds no background polling,
-  sends every request through the app's `URLSession`, and lets the app download
-  plain page images without the JVM. It is available in builds that bundle the
-  runtime (CI does).
+  Suwayomi-Server on an embedded, interpreter-only HotSpot Zero JVM. It starts
+  on the first source call, sends every request through the app's `URLSession`,
+  and lets the app download plain page images without the JVM. Builds that
+  bundle it link GPL-2.0-only HotSpot, so the combined app is GPLv2 and
+  sideload-only; the Swift engine remains the default.
 
 Repositories and installs are shared; switching drops the previous backend's
-source caches (the JVM remains loaded until app exit). Backends are isolated
-behind `App/MihonRuntimeBackends.swift`; the removal guide also lists packaging
-and build entries to delete. See
+source caches (a started JVM stays loaded until app exit). Backends are
+isolated behind `App/MihonRuntimeBackends.swift`. See
 [`MoeReader/MihonExtensions/README.md`](MoeReader/MihonExtensions/README.md),
-[`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md),
-[`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md) and
-[`SuwayomiHost/README.md`](SuwayomiHost/README.md).
+[`MoeReader/MihonCompat/README.md`](MoeReader/MihonCompat/README.md) and
+[`MoeReader/SuwayomiCompat/README.md`](MoeReader/SuwayomiCompat/README.md).
 
 Still out of scope: CBR, CB7, and Android framework pieces the engine does not
 provide (constructor reflection, JNI).
@@ -118,17 +125,22 @@ This produces `MoeReader.ipa` in the repository root, built for
 `generic/platform=iOS` without code signing. Successful CI runs upload the same
 file as the `MoeReader-unsigned-ipa` artifact.
 
-To include the Suwayomi runtime, build it once on a Mac before generating the
-project (the app builds without it; Settings then lists the backend as
-unavailable):
+To include the Suwayomi runtime, build the VM once on a Mac with Xcode 26 and
+GNU make 4 before generating the project (the app builds without it; Settings
+then lists the backend as unavailable):
 
 ```bash
 git submodule update --init                # SuwayomiHost/vendor/suwayomi
-cd SuwayomiHost/jvm-ios && ./fetch-openj9.sh && ./build-openj9-macos.sh \
-  && ./build-openj9-ios.sh iphoneos && ./package.sh
+cd SuwayomiHost/jvm-ios
+export JAVA_HOME=$(/usr/libexec/java_home -v 26)
+./fetch-openjdk.sh && ./build-openjdk-macos.sh \
+  && ./build-openjdk-ios.sh iphoneos && ./package.sh
 ```
 
-CI does the same and caches the VM; see
+That links HotSpot Zero, which is GPL-2.0-only: the resulting app is a GPLv2
+combined work (source: this repository plus the `openjdk/mobile` commit pinned
+in `fetch-openjdk.sh`) and must not be distributed through the App Store. CI
+builds and caches the runtime; see
 [`SuwayomiHost/README.md`](SuwayomiHost/README.md#the-ios-jvm-jvm-ios).
 
 ### Install with Sideloadly
@@ -180,10 +192,8 @@ MoeReader/
   Library/      Book model, persistence, import, covers, library UI, settings
   MihonExtensions/  Mihon repositories, APK verification, backend seam, browse/reader UI
   MihonCompat/  Swift engine backend: Dalvik interpreter, platform hosts, Mihon source API
-  SuwayomiCompat/   Suwayomi backend, app side: JVM lifecycle, JNI shim, transport
   Reader/       Reader model, scroll modes, zoom, chrome
 MoeReaderTests/ Unit tests and fixtures
-SuwayomiHost/   Suwayomi backend, JVM side: host jar (Gradle), Suwayomi-Server submodule, OpenJ9 for iOS
 scripts/        Fixture generation and local test script
 ```
 
@@ -200,15 +210,23 @@ timers, background work, or JIT. To run the manual benchmark, set
 `MOEREADER_BENCH_CBZ` to a real CBZ path in the scheme's Test action environment
 and run `testRealArchiveBenchmark`; it is skipped when the variable is absent.
 
-The Suwayomi runtime follows the same rule on a JVM: it starts on the first
-source call, its two worker threads park between calls, and idle extension
-loaders are evicted above a three-extension limit. In-flight calls may exceed
-that limit. No battery measurements have been taken on a device.
-`MoeReader/SuwayomiCompat/README.md` lists the CPU, radio and memory tradeoffs.
+## License and provenance
 
-## License
+MoeReader's own code is BSD 2-Clause; see [LICENSE](LICENSE).
 
-BSD 2-Clause. See [LICENSE](LICENSE). `SuwayomiHost/` builds on MPL-2.0 code
-(Suwayomi-Server, the Oneechan runtime's `jvm-ios` scripts) and bundles
-OpenJ9/OMR (Apache-2.0) and the OpenJDK class library (GPL-2.0 with the
-Classpath Exception); see `SuwayomiHost/README.md`.
+`SuwayomiHost/` compiles the unmodified **Suwayomi-Server** submodule
+(`vendor/suwayomi`, MPL-2.0) and a small set of files adapted from the
+**Oneechan runtime** (MPL-2.0). Those adapted files remain MPL-2.0 and are
+listed in [`SuwayomiHost/NOTICE`](SuwayomiHost/NOTICE); the third-party
+tree's license is [`SuwayomiHost/LICENSE-MPL-2.0`](SuwayomiHost/LICENSE-MPL-2.0).
+The rest of the host, the app-side Swift and the JNI shim are MoeReader's own.
+No Suwayomi source was replaced by a copy from another project: the vendored
+submodule is fetched from `Suwayomi/Suwayomi-Server` at the pinned commit.
+
+The iOS VM the app bundles is built from OpenJDK Mobile's **HotSpot Zero**
+(GPL-2.0 *only*, no Classpath Exception) and the OpenJDK class library
+(GPL-2.0 with the Classpath Exception). An app built with that runtime is a
+GPLv2 combined work: complete corresponding source is this repository plus
+`openjdk/mobile` at the commit pinned by `SuwayomiHost/jvm-ios/fetch-openjdk.sh`;
+`package.sh` bundles the licence texts and that source notice. Builds without
+the runtime keep the BSD-2-Clause licence.

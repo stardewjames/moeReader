@@ -3,5 +3,3 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 /SuwayomiHost/gradlew text eol=lf
-/SuwayomiHost/jvm-ios/tools/run-ios-tool text eol=lf
-/SuwayomiHost/jvm-ios/patches/** text eol=lf

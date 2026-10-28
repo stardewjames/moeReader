@@ -31,8 +31,14 @@ targets:
           - "SuwayomiCompat/JNI/**/*.h"
       - path: MoeReader/Resources
         buildPhase: resources
-      # Suwayomi runtime (JVM, host jar), written by SuwayomiHost/jvm-ios/package.sh.
+      # Host jar, VM options and licenses written by SuwayomiHost/jvm-ios/package.sh.
       - path: SuwayomiHost/build/runtime/ios/SuwayomiRuntime
+        type: folder
+        buildPhase: resources
+        optional: true
+      # The jlinked module image. HotSpot derives java.home as <bundle>/lib, so
+      # this folder must land at the bundle root as lib/ (it contains lib/modules).
+      - path: SuwayomiHost/build/runtime/ios/lib
         type: folder
         buildPhase: resources
         optional: true

@@ -12,6 +12,16 @@ screens are shared ([`../MihonExtensions`](../MihonExtensions/README.md)).
 This folder is the app side (Swift and a C JNI shim). The host jar and the iOS
 JVM build live in [`../../SuwayomiHost`](../../SuwayomiHost/README.md).
 
+## Provenance
+
+The Swift files and the JNI shim implement this app's own positional wire
+protocol (`SuwayomiWire.swift` against `SuwayomiHost/host/src/main/kotlin/.../Wire.kt`);
+they are not a copy of another app's client. The compatibility layer they talk
+to is the unmodified `Suwayomi/Suwayomi-Server` submodule at
+`SuwayomiHost/vendor/suwayomi`, plus the host code and the few Oneechan-derived
+files enumerated in [`../../SuwayomiHost/NOTICE`](../../SuwayomiHost/NOTICE).
+The Oneechan runtime repository contains no app-side Swift to copy from.
+
 ## Design: performance and battery first
 
 Every choice below trades something away to keep the phone's CPU, radio and
@@ -56,9 +66,9 @@ memory idle when the reader is not asking for anything.
   preference-saver thread, the logging interceptor, the OkHttp disk cache,
   GraalJS and desktop Chromium are not in the host. `apply()`d preferences are
   written once after the call that changed them.
-- **Interpreter-only VM tuned for footprint.** On iOS the VM is Eclipse OpenJ9
-  without JIT (iOS forbids executable memory), with a pre-sized generational
-  heap and two GC threads; see `SuwayomiHost/jvm-options/openj9.options`.
+- **Interpreter-only VM tuned for footprint.** On iOS the VM is OpenJDK
+  Mobile's HotSpot Zero (iOS forbids executable memory), with Serial GC, a
+  384 MB cap and 4 MB stacks; see `SuwayomiHost/jvm-options/openjdk.options`.
 
 The JVM cannot be destroyed and recreated inside one process, so once started
 it stays resident (idle, its heap trimmed) until the app exits.
@@ -93,9 +103,11 @@ it stays resident (idle, its heap trimmed) until the app exits.
 ```text
 SuwayomiRuntime/
   host/suwayomi-host.jar   SuwayomiHost/host
-  jvm.options              the VM's options (OpenJ9's on iOS)
-  jre/                     java.home of the statically linked VM
-  licenses/                OpenJ9, OMR, OpenJDK, libffi, zlib notices
+  jvm.options              HotSpot Zero options (SuwayomiHost/jvm-options)
+  licenses/                OpenJDK (GPLv2), libffi (MIT), SOURCE.md
+lib/                       java.home of the static VM (HotSpot derives <bundle>/lib)
+  lib/modules              jlinked modules
+  conf/, lib/security/     java.security, cacerts, tzdb
 ```
 
 `SuwayomiHost/jvm-ios/package.sh` writes it under
@@ -126,8 +138,11 @@ HotSpot `libjvm`.
   as separate headers, gzip decoding even when the extension advertises zstd,
   and early cancellation at the transport and direct-image streaming limits.
 - Not verified here: the iOS build itself (no Xcode on the development host),
-  the OpenJ9 VM on a device, WebKit challenge solving and JavaScriptCore
+  the HotSpot Zero VM on a device, WebKit challenge solving and JavaScriptCore
   through this backend.
+- **Licence:** libjvm is GPL-2.0 only, so an app bundling this runtime is a
+  GPLv2 combined work and is sideload-only (see `SuwayomiHost/jvm-ios/NOTICE`
+  and `SOURCE.md` in the bundle). Builds without it are unaffected.
 - No device battery or energy measurements have been taken. These are
   architecture constraints, not a measured energy improvement over Swift.
 

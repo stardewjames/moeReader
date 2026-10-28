@@ -1,16 +1,32 @@
 /*
- * dex2jar (https://github.com/ThexXTURBOXx/dex2jar, tag 2.4.38), Apache License 2.0.
+ * dex2jar - Tools to work with android .dex and java .class files
+ * Copyright (c) 2009-2012 Panxiaobo
+ * Copyright (c) dex2jar contributors
  *
- * Modified for MoeReader: overlay of dex-ir's NewTransformer. R8 inlines
- * trivial constructors, so Android bytecode may create an object with
- * `new-instance Lz;` and initialise it with a superclass constructor
- * (`invoke-direct Ljava/lang/Object;-><init>`). Upstream folds the pair into
- * `new <constructor owner>()`, which allocates the superclass instead
- * (a Kotlin companion becomes a plain Object and the first call on it fails
- * with AbstractMethodError). Here the allocated type is kept and the missing
- * `z.<init>` is recorded, so the host adds a constructor that delegates to the
- * superclass one (moe.reader.suwayomi.ConstructorFixups). Only the two
- * nInvokeNew call sites differ from upstream.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Modified for Oneechan (https://github.com/leros1337/oneechan-runtime, an
+ * MPL-2.0 project; this file stays Apache-2.0 like dex2jar): do not fold
+ * `new-instance A` + `invoke-direct B.<init>` into `new B(...)` when A != B.
+ * R8 inlines trivial constructors, leaving e.g. `new-instance Lz;` followed by
+ * `invoke-direct Ljava/lang/Object;-><init>()V`; upstream folding used the
+ * constructor owner as the instantiated type and lost the real class.
+ *
+ * Modified for MoeReader: instead of keeping the unverified NEW/INVOKESPECIAL
+ * pair, the allocated type is kept and the missing `z.<init>` is recorded, so
+ * the host adds a constructor that delegates to the superclass one
+ * (moe.reader.suwayomi.ConstructorFixups). Only the two nInvokeNew call sites
+ * differ from upstream dex2jar.
  */
 package com.googlecode.dex2jar.ir.ts;
 

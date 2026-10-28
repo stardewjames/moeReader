@@ -14,53 +14,73 @@ import SuwayomiJNI
 
 /// Files of the bundled runtime:
 ///
-///     SuwayomiRuntime/
-///       host/suwayomi-host.jar   the host (SuwayomiHost/host)
-///       jvm.options              options of the VM this build links
-///       jre/                     java.home of a statically linked VM (iOS)
+///     SuwayomiRuntime/host/suwayomi-host.jar   the host (SuwayomiHost/host)
+///     SuwayomiRuntime/jvm.options              HotSpot options
+///     lib/lib/modules                          jlinked image; HotSpot derives
+///                                              java.home as <bundle>/lib
 ///
-/// `SUWAYOMI_RUNTIME_DIR` points at another directory with the same layout and
-/// `SUWAYOMI_LIBJVM` at a dynamic libjvm, for desktop and Linux test hosts.
+/// `SUWAYOMI_RUNTIME_DIR` points at another directory with the host and
+/// options (and optionally a `jre/`), and `SUWAYOMI_LIBJVM` at a dynamic
+/// libjvm, for desktop and Linux test hosts.
 struct SuwayomiRuntimeLayout: Sendable {
     let root: URL
     let hostJar: URL
     let optionsFile: URL
+    /// `<bundle>/lib` for the static VM, or a `jre/` for a desktop override.
     let javaHome: URL?
+    /// The jlinked module image the statically linked VM boots from.
+    let modules: URL?
     let libjvm: String?
 
     static func locate(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         bundle: Bundle = .main
     ) -> SuwayomiRuntimeLayout? {
+        let files = FileManager.default
         let root: URL
+        let javaHome: URL?
+        let modules: URL?
         if let override = environment["SUWAYOMI_RUNTIME_DIR"], !override.isEmpty {
             root = URL(fileURLWithPath: override, isDirectory: true)
+            let jre = root.appendingPathComponent("jre", isDirectory: true)
+            javaHome = files.fileExists(atPath: jre.path) ? jre : nil
+            modules = nil
         } else if let bundled = bundle.resourceURL?.appendingPathComponent("SuwayomiRuntime", isDirectory: true) {
             root = bundled
+            // os_bsd.cpp sets java.home to <executable dir>/lib for a
+            // statically linked HotSpot; the bundled image mirrors that.
+            let home = bundle.resourceURL?.appendingPathComponent("lib", isDirectory: true)
+            javaHome = home
+            modules = home?
+                .appendingPathComponent("lib", isDirectory: true)
+                .appendingPathComponent("modules")
         } else {
             return nil
         }
-        let files = FileManager.default
         let hostJar = root.appendingPathComponent("host/suwayomi-host.jar")
         let optionsFile = root.appendingPathComponent("jvm.options")
         guard files.fileExists(atPath: hostJar.path), files.fileExists(atPath: optionsFile.path) else { return nil }
-        let javaHome = root.appendingPathComponent("jre", isDirectory: true)
         let libjvm = environment["SUWAYOMI_LIBJVM"].flatMap { $0.isEmpty ? nil : $0 }
         return SuwayomiRuntimeLayout(
             root: root,
             hostJar: hostJar,
             optionsFile: optionsFile,
-            javaHome: files.fileExists(atPath: javaHome.path) ? javaHome : nil,
+            javaHome: javaHome,
+            modules: modules,
             libjvm: libjvm
         )
     }
 
     /// Nil when this build can start the runtime; otherwise why not.
     var unavailableReason: String? {
+        let files = FileManager.default
         if let libjvm {
-            return FileManager.default.fileExists(atPath: libjvm) ? nil : "libjvm not found at \(libjvm)"
+            return files.fileExists(atPath: libjvm) ? nil : "libjvm not found at \(libjvm)"
         }
-        return sw_jvm_linked() != 0 ? nil : "This build does not link a JVM."
+        if let modules, files.fileExists(atPath: modules.path) {
+            return sw_jvm_linked() != 0 ? nil : "This build does not link a JVM."
+        }
+        return "This build does not include the JVM modules."
     }
 }
 
@@ -343,9 +363,6 @@ final class SuwayomiJVM: @unchecked Sendable {
             "-Dkotlinx.coroutines.scheduler.core.pool.size=2",
             "-Dkotlinx.coroutines.io.parallelism=8",
         ]
-        if let javaHome = layout.javaHome {
-            options.append("-Djava.home=\(javaHome.path)")
-        }
         let substitutions = [
             "${dataDir}": directories.data.path,
             "${cacheDir}": directories.cache.path,

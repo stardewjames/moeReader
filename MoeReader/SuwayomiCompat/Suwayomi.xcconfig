@@ -1,8 +1,9 @@
 // Build settings of the Suwayomi runtime backend (MoeReader/SuwayomiCompat).
 //
 // SuwayomiHost/jvm-ios/package.sh writes jvm.xcconfig with the link flags of
-// the static OpenJ9 VM. Without it the app still builds; the backend then
-// reports in Settings that this build does not include the runtime.
+// the static HotSpot Zero VM (OpenJDK Mobile). Without it the app still
+// builds; the backend then reports in Settings that this build does not
+// include the runtime.
 // Default for builds without a VM for the selected SDK. The generated file
 // overrides this only for SDKs whose archives were packaged.
 SUWAYOMI_JVM_DEAD_CODE_STRIPPING = YES

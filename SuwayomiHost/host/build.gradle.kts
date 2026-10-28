@@ -5,7 +5,9 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 // (AndroidCompat plus the Tachiyomi source API) next to MoeReader's bridge.
 // Vendor files that must behave differently on a phone are excluded here and
 // re-implemented under the same fully-qualified name in src/overlay; the
-// vendor tree itself is never edited.
+// vendor tree itself is never edited. The include/exclude lists started from
+// the Oneechan runtime's source-api build (MPL-2.0); MoeReader's own overlays
+// and exclusions are listed here.
 plugins {
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.serialization)

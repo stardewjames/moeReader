@@ -1,13 +1,27 @@
-The scripts, tools and patches in this directory come from the Oneechan runtime
-(https://github.com/leros1337/oneechan, jvm-ios/), licensed under the Mozilla
-Public License 2.0 (LICENSE-MPL-2.0). The patches under patches/openj9 modify
-Eclipse OpenJ9 and OMR (Apache-2.0) and the OpenJDK 21 class library (GPL-2.0
-with the Classpath Exception) and are licensed like the files they modify.
+OpenJDK Mobile / HotSpot Zero runtime
 
-Changes for MoeReader:
-- build-openj9-ios.sh, build-openj9-macos.sh: vendor name and build user.
-- package.sh: rewritten for MoeReader's runtime layout (SuwayomiRuntime/,
-  per-SDK copies of the prelinked archive, jvm.xcconfig variables) and a
-  HOST_ONLY refresh mode.
-- The simulator smoke tests and the Oneechan option file are not included;
-  ../jvm-options/openj9.options replaces the latter.
+The iOS runtime is built from OpenJDK Mobile:
+  https://github.com/openjdk/mobile
+  commit pinned by fetch-openjdk.sh (JDK 27)
+
+- libjvm.a is HotSpot Zero (interpreter only), distributed under the GNU
+  General Public License version 2 only, without the Classpath Exception.
+- The class library (libjava, libzip, libnet, libnio, libjimage, libmanagement,
+  libmanagement_ext and the jlinked modules) is GPL-2.0 with the Classpath
+  Exception.
+- An application that links libjvm.a is a GPLv2 combined work. Complete
+  corresponding source is this repository (fetch-openjdk.sh,
+  build-openjdk-ios.sh, package.sh and the application source) together with
+  openjdk/mobile at the commit above. package.sh bundles OpenJDK's LICENSE,
+  ASSEMBLY_EXCEPTION, ADDITIONAL_LICENSE_INFO and a SOURCE.md saying this.
+
+Build prerequisites that are not part of the shipped runtime:
+- libffi for iOS, from the ios-tools "libffi-build" release
+  (https://github.com/openjdk-mobile/ios-tools/releases/tag/libffi-build),
+  SHA-256 pinned in fetch-openjdk.sh; MIT licensed, licence bundled.
+- A macOS JDK built from the same openjdk/mobile commit by
+  build-openjdk-macos.sh, used only for its jmod and jlink tools (jlink
+  requires modules and tools from the same JDK build). Not linked into the app.
+
+No prebuilt VM archive is downloaded; the runtime is compiled from the pinned
+openjdk/mobile source by this repository's scripts.

@@ -85,9 +85,11 @@ object ExtensionConverter {
     }
 
     /**
-     * dex2jar with Suwayomi's settings (PackageTools.dex2jar). Like upstream,
-     * a method dex2jar cannot translate becomes a throwing stub instead of
-     * failing the whole extension; the count is logged.
+     * dex2jar with Suwayomi's settings (PackageTools.dex2jar, MPL-2.0): the
+     * builder configuration below is copied from upstream Suwayomi-Server; the
+     * exception handler and logging are MoeReader's. Like upstream, a method
+     * dex2jar cannot translate becomes a throwing stub instead of failing the
+     * whole extension; the count is logged.
      */
     private fun dex2jar(
         apk: File,
