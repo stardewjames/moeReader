@@ -120,8 +120,20 @@ For desktop and Linux hosts, `SUWAYOMI_RUNTIME_DIR` points at a directory with
 the same layout (`./gradlew :host:desktopRuntime`) and `SUWAYOMI_LIBJVM` at a
 HotSpot `libjvm`.
 
+HotSpot reports `JNI_CreateJavaVM failed (-6)` (`JNI_EINVAL`) when it rejects
+startup arguments. The bundled options unlock diagnostic flags with
+`-XX:+UnlockDiagnosticVMOptions` **before** `-XX:-BytecodeVerificationRemote`,
+which converted extension bytecode requires. Without the unlock, HotSpot
+rejects that flag. After changing `openjdk.options`, refresh an existing
+package with `HOST_ONLY=1 SuwayomiHost/jvm-ios/package.sh` and rebuild the app;
+editing the source options alone does not change an already packaged runtime.
+
 ## Verified
 
+- `bash SuwayomiHost/harness/test-jvm-options.sh` starts a desktop HotSpot
+  with the actual bundled options, catching rejected flags and incorrect
+  diagnostic-option ordering. CI runs it on JDK 21 before building the host.
+  It does not verify the iOS VM itself.
 - `SuwayomiHost/harness/run-linux.sh` builds this folder's Swift and C sources
   in Swift 6 mode with the shared layer and runs one extension end to end on a
   desktop HotSpot: load, popular (two pages), latest, filters, search,

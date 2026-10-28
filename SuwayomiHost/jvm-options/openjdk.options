@@ -15,6 +15,8 @@
 # Interpreted frames recurse deeply (HTML parsing, regex); reserve room.
 -Xss4m
 # dex2jar output is not verifiable bytecode (extensions are R8-optimised for ART).
+# HotSpot requires diagnostic options to be unlocked before using this flag.
+-XX:+UnlockDiagnosticVMOptions
 -XX:-BytecodeVerificationRemote
 # No attach API and no perf-data file: both assume a writable /tmp.
 -XX:+DisableAttachMechanism

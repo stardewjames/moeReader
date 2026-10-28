@@ -22,6 +22,8 @@ jobs:
       # Commits from Windows checkouts may not carry the executable bit.
       - run: chmod +x SuwayomiHost/gradlew SuwayomiHost/jvm-ios/*.sh
       - run: xcodebuild -version
+      - name: Verify bundled JVM options
+        run: bash SuwayomiHost/harness/test-jvm-options.sh
       - name: Suwayomi host tests
         working-directory: SuwayomiHost
         run: ./gradlew --console=plain :host:test
