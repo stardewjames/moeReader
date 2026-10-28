@@ -25,6 +25,18 @@ final class VMJsonTree {
     let kind: Kind
     init(_ kind: Kind) { self.kind = kind }
 
+    /// Read-only `Map`/`List` views of this element, built on first use by
+    /// `mapPayload`/`listPayload`. A `JsonObject`/`JsonArray` is a Kotlin
+    /// collection, so every collection helper materialises entries; caching
+    /// them keeps repeated lookups on a large object linear instead of
+    /// rebuilding (and re-allocating) them per call. The slots index the
+    /// runtime's payload table and prove the cached values are not from a
+    /// released arena: memos keep trees alive across `resetArena`.
+    var mapView: VMMapPayload?
+    var mapViewSlot = -1
+    var listView: VMListPayload?
+    var listViewSlot = -1
+
     var stringValue: String? {
         switch kind {
         case .string(let value): return value
@@ -32,6 +44,13 @@ final class VMJsonTree {
         case .bool(let value): return value ? "true" : "false"
         default: return nil
         }
+    }
+
+    /// `JsonPrimitive.isString`: only quoted JSON text is a string; numbers,
+    /// booleans and null are not (`JsonPrimitive.equals` distinguishes them).
+    var isStringElement: Bool {
+        if case .string = kind { return true }
+        return false
     }
 }
 
@@ -958,28 +977,27 @@ struct SerializationRuntime {
                     return runtime.jsonElementValue(value)
                 }
                 cls.method("get", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
-                    let key = runtime.stringValue(args[1]) ?? ""
-                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                    guard let key = runtime.stringValue(args[1]),
+                          let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
                           case .object(let fields) = payload.kind, let value = fields[key] else { return .null }
                     return runtime.jsonElementValue(value)
                 }
                 cls.method("entrySet", "()Ljava/util/Set;") { runtime, args, _ in
-                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
-                          case .object(let fields) = payload.kind else { return .null }
-                    let entries = fields.map { (key, value) -> (key: VMValue, value: VMValue) in
-                        (runtime.newString(key), runtime.jsonElementValue(value))
-                    }
-                    return runtime.makeNative("Ljava/util/EntrySet;", payload: VMEntrySetPayload(entries: entries))
+                    guard let map = runtime.mapPayload(args[0]) else { return .null }
+                    return runtime.makeNative(
+                        "Ljava/util/EntrySet;",
+                        payload: VMEntrySetPayload(entries: map.entries, owner: map)
+                    )
                 }
                 cls.method("values", "()Ljava/util/Collection;") { runtime, args, _ in
-                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
-                          case .object(let fields) = payload.kind else { return .null }
-                    return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(fields.values.map { runtime.jsonElementValue($0) }))
+                    guard let map = runtime.mapPayload(args[0]) else { return .null }
+                    return runtime.makeNative("Ljava/util/HashMap$Values;", payload: VMValuesViewPayload(map: map))
                 }
                 cls.method("containsKey", "(Ljava/lang/Object;)Z") { runtime, args, _ in
-                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                    guard let key = runtime.stringValue(args[1]),
+                          let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
                           case .object(let fields) = payload.kind else { return .boolean(false) }
-                    return .boolean(fields[runtime.stringValue(args[1]) ?? ""] != nil)
+                    return .boolean(fields[key] != nil)
                 }
                 cls.method("isEmpty", "()Z") { runtime, args, _ in
                     guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
@@ -987,14 +1005,35 @@ struct SerializationRuntime {
                     return .boolean(fields.isEmpty)
                 }
                 cls.method("keySet", "()Ljava/util/Set;") { runtime, args, _ in
-                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
-                          case .object(let fields) = payload.kind else { return .null }
-                    return runtime.makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(fields.keys.map { runtime.newString($0) }))
+                    guard let map = runtime.mapPayload(args[0]) else { return .null }
+                    return runtime.makeNative("Ljava/util/HashMap$KeySet;", payload: VMKeySetViewPayload(map: map))
                 }
                 cls.method("size", "()I") { runtime, args, _ in
                     guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
                           case .object(let fields) = payload.kind else { return .int32(0) }
                     return .int32(Int32(fields.count))
+                }
+                cls.method("getOrDefault", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+                    guard let key = runtime.stringValue(args[1]),
+                          let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                          case .object(let fields) = payload.kind,
+                          let value = fields[key] else { return args[2] }
+                    return runtime.jsonElementValue(value)
+                }
+                // A JSON object is immutable, so the mutating half of `Map`
+                // rejects changes instead of falling through to the interface
+                // default, which would silently answer null.
+                for (name, signature) in [
+                    ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+                    ("putIfAbsent", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+                    ("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    ("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+                    ("putAll", "(Ljava/util/Map;)V"),
+                    ("clear", "()V"),
+                ] {
+                    cls.method(name, signature) { _, _, _ in
+                        throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "JsonObject is immutable")
+                    }
                 }
             }
             if name == "JsonElement" {
@@ -1012,6 +1051,15 @@ struct SerializationRuntime {
                     guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self) else { return .null }
                     return runtime.newString(SerializationRuntime.jsonText(tree))
                 }
+                cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+                    guard let left: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                          let right: VMJsonTree = runtime.payload(args[1], as: VMJsonTree.self) else { return .boolean(false) }
+                    return .boolean(runtime.jsonTreesEqual(left, right))
+                }
+                cls.method("hashCode", "()I") { runtime, args, _ in
+                    guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self) else { return .int32(0) }
+                    return .int32(runtime.jsonTreeHash(tree))
+                }
             }
             if name == "JsonArray" {
                 cls.method("<init>", "(Ljava/util/List;)V") { runtime, args, _ in
@@ -1023,21 +1071,32 @@ struct SerializationRuntime {
                     return .zero
                 }
                 cls.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
-                    guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
-                          case .array(let items) = tree.kind else { return .null }
-                    return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(items.map { runtime.jsonElementValue($0) }))
+                    let items = runtime.listPayload(args[0])?.items ?? []
+                    return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(items))
                 }
                 cls.method("contains", "(Ljava/lang/Object;)Z") { runtime, args, _ in
                     guard let tree: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
                           case .array(let items) = tree.kind else { return .boolean(false) }
-                    let target = runtime.stringValue(runtime.javaToString(args[1])) ?? ""
-                    return .boolean(items.contains { ($0.stringValue ?? "") == target })
+                    return .boolean(items.contains { runtime.javaEquals(runtime.jsonElementValue($0), args[1]) })
                 }
                 cls.method("get", "(I)Lkotlinx/serialization/json/JsonElement;") { runtime, args, _ in
                     guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
                           case .array(let items) = payload.kind else { return .null }
                     let index = Int(args[1].asInt32)
-                    guard index >= 0, index < items.count else { return .null }
+                    guard index >= 0, index < items.count else {
+                        throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "Index \(index) out of bounds for length \(items.count)")
+                    }
+                    return runtime.jsonElementValue(items[index])
+                }
+                // `JsonArray` reaches Kotlin as `List<JsonElement>`, so the
+                // interface signature must resolve on the class too.
+                cls.method("get", "(I)Ljava/lang/Object;") { runtime, args, _ in
+                    guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
+                          case .array(let items) = payload.kind else { return .null }
+                    let index = Int(args[1].asInt32)
+                    guard index >= 0, index < items.count else {
+                        throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;", "Index \(index) out of bounds for length \(items.count)")
+                    }
                     return runtime.jsonElementValue(items[index])
                 }
                 cls.method("size", "()I") { runtime, args, _ in
@@ -1049,6 +1108,21 @@ struct SerializationRuntime {
                     guard let payload: VMJsonTree = runtime.payload(args[0], as: VMJsonTree.self),
                           case .array(let items) = payload.kind else { return .boolean(true) }
                     return .boolean(items.isEmpty)
+                }
+                // A JSON array is immutable: the mutating half of `List`
+                // rejects changes rather than answering null through the
+                // interface default.
+                for (name, signature) in [
+                    ("add", "(Ljava/lang/Object;)Z"),
+                    ("add", "(ILjava/lang/Object;)V"),
+                    ("set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+                    ("remove", "(Ljava/lang/Object;)Z"),
+                    ("remove", "(I)Ljava/lang/Object;"),
+                    ("clear", "()V"),
+                ] {
+                    cls.method(name, signature) { _, _, _ in
+                        throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "JsonArray is immutable")
+                    }
                 }
             }
             if name == "JsonPrimitive" {
@@ -2011,6 +2085,48 @@ extension VMRuntime {
         default: descriptor = "Lkotlinx/serialization/json/JsonPrimitive;"
         }
         return makeNative(descriptor, payload: tree)
+    }
+
+    /// Content equality for JSON elements, as kotlinx defines it: primitives
+    /// compare content and string-ness, objects compare fields, arrays compare
+    /// items. Collection helpers (`contains`, `distinct`, map keys) rely on it.
+    func jsonTreesEqual(_ left: VMJsonTree, _ right: VMJsonTree) -> Bool {
+        switch (left.kind, right.kind) {
+        case (.object(let a), .object(let b)):
+            guard a.count == b.count else { return false }
+            for (key, value) in a {
+                guard let other = b[key], jsonTreesEqual(value, other) else { return false }
+            }
+            return true
+        case (.array(let a), .array(let b)):
+            guard a.count == b.count else { return false }
+            for (index, value) in a.enumerated() where !jsonTreesEqual(value, b[index]) { return false }
+            return true
+        case (.object, _), (.array, _), (_, .object), (_, .array):
+            return false
+        default:
+            return left.stringValue == right.stringValue && left.isStringElement == right.isStringElement
+        }
+    }
+
+    /// Matches kotlinx's content-based hash for JSON elements so equal trees
+    /// hash alike.
+    func jsonTreeHash(_ tree: VMJsonTree) -> Int32 {
+        switch tree.kind {
+        case .object(let fields):
+            var hash: Int32 = 0
+            for (key, value) in fields {
+                hash = hash &+ (stringHash(newString(key)) ^ jsonTreeHash(value))
+            }
+            return hash
+        case .array(let items):
+            var hash: Int32 = 1
+            for item in items { hash = 31 &* hash &+ jsonTreeHash(item) }
+            return hash
+        default:
+            let content = stringHash(newString(tree.stringValue ?? "null"))
+            return content &* 31 &+ (tree.isStringElement ? 1231 : 1237)
+        }
     }
 
     func jsonPrimitiveValue(_ tree: VMJsonTree, kind: String) -> VMValue {

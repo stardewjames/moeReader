@@ -565,16 +565,56 @@ extension VMRuntime {
         VMObjectLayout.setAux(pointer, UInt64(nativeObjects.count))
     }
 
+    /// Reads a Kotlin `List`. `kotlinx.serialization.json.JsonArray` *is* a
+    /// `List<JsonElement>` on the JVM, so a JSON array resolves to a read-only
+    /// view of its tree; every collection helper goes through here.
     func listPayload(_ value: VMValue) -> VMListPayload? {
-        payload(value, as: VMListPayload.self)
+        if let list: VMListPayload = payload(value, as: VMListPayload.self) { return list }
+        guard let tree: VMJsonTree = payload(value, as: VMJsonTree.self),
+              case .array(let elements) = tree.kind else { return nil }
+        if let cached = tree.listView, arenaCacheHolds(tree.listViewSlot, cached) { return cached }
+        let created = VMListPayload(elements.map { jsonElementValue($0) }, immutable: true)
+        tree.listView = created
+        tree.listViewSlot = arenaCacheSlot(created)
+        return created
     }
 
     func setPayload(_ value: VMValue) -> VMSetPayload? {
         payload(value, as: VMSetPayload.self)
     }
 
+    /// Reads a Kotlin `Map`. `kotlinx.serialization.json.JsonObject` *is* a
+    /// `Map<String, JsonElement>` on the JVM, so a JSON object resolves to a
+    /// read-only view of its tree; without this every Kotlin map helper saw an
+    /// empty map and reported present keys as missing.
     func mapPayload(_ value: VMValue) -> VMMapPayload? {
-        payload(value, as: VMMapPayload.self)
+        if let map: VMMapPayload = payload(value, as: VMMapPayload.self) { return map }
+        guard let tree: VMJsonTree = payload(value, as: VMJsonTree.self),
+              case .object(let fields) = tree.kind else { return nil }
+        if let cached = tree.mapView, arenaCacheHolds(tree.mapViewSlot, cached) { return cached }
+        var entries: [(key: VMValue, value: VMValue)] = []
+        entries.reserveCapacity(fields.count)
+        for (name, child) in fields {
+            entries.append((newString(name), jsonElementValue(child)))
+        }
+        let created = VMMapPayload(entries, immutable: true)
+        tree.mapView = created
+        tree.mapViewSlot = arenaCacheSlot(created)
+        return created
+    }
+
+    /// Reserves a payload-table slot for a view cached outside the arena (a
+    /// `VMJsonTree` outlives an operation through the engine's memos) and
+    /// returns its index. `resetArena` clears the table, so the slot doubles as
+    /// proof that the cached `VMValue`s still address live objects.
+    private func arenaCacheSlot(_ payload: Any) -> Int {
+        nativeObjects.append(payload)
+        return nativeObjects.count - 1
+    }
+
+    private func arenaCacheHolds(_ slot: Int, _ payload: Any) -> Bool {
+        guard slot >= 0, slot < nativeObjects.count else { return false }
+        return (nativeObjects[slot] as AnyObject) === (payload as AnyObject)
     }
 
     func mutableList(_ value: VMValue) throws -> VMListPayload {
@@ -620,9 +660,6 @@ extension VMRuntime {
             return elements.nodes.map { node in
                 makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: elements.document))
             }
-        }
-        if let tree: VMJsonTree = payload(value, as: VMJsonTree.self), case .array(let items) = tree.kind {
-            return items.map { jsonElementValue($0) }
         }
         return nil
     }

@@ -1482,6 +1482,30 @@ enum KotlinRuntime {
             }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
         }
+        maps.staticMethod("filterKeys", "(Ljava/util/Map;Lkotlin/jvm/functions/Function1;)Ljava/util/Map;") { runtime, args, _ in
+            var output: [(key: VMValue, value: VMValue)] = []
+            for entry in runtime.mapPayload(args[0])?.entries ?? []
+            where predicateTruth(try runtime.callFunction(args[1], [entry.key])) {
+                output.append(entry)
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
+        }
+        maps.staticMethod("filterValues", "(Ljava/util/Map;Lkotlin/jvm/functions/Function1;)Ljava/util/Map;") { runtime, args, _ in
+            var output: [(key: VMValue, value: VMValue)] = []
+            for entry in runtime.mapPayload(args[0])?.entries ?? []
+            where predicateTruth(try runtime.callFunction(args[1], [entry.value])) {
+                output.append(entry)
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
+        }
+        maps.staticMethod("filter", "(Ljava/util/Map;Lkotlin/jvm/functions/Function1;)Ljava/util/Map;") { runtime, args, _ in
+            var output: [(key: VMValue, value: VMValue)] = []
+            for entry in runtime.mapPayload(args[0])?.entries ?? [] {
+                let mapEntry = runtime.makeNative("Ljava/util/MapEntry;", payload: VMEntryPayload(key: entry.key, value: entry.value))
+                if predicateTruth(try runtime.callFunction(args[1], [mapEntry])) { output.append(entry) }
+            }
+            return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
+        }
         maps.staticMethod("mapOf", "()Ljava/util/Map;") { runtime, _, _ in
             runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload([], immutable: true))
         }
