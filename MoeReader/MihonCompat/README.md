@@ -259,6 +259,13 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - The two nested `:has` selectors on a 2 MB details page went from about 12 s
   and more than 300 s (that run was killed at the harness 600 s cap) to 69–80 ms
   each after the per-select memoisation.
+- `MihonJsonCollectionTests` covers parsed JSON read through the Kotlin
+  collection surface: `JsonObject`/`JsonArray` resolve to immutable map/list
+  payloads, so `getValue`/`getOrElse`/`keys`/`values`/`entrySet`/`filter*`,
+  `List.get`/`iterator`/`size` and content equality behave as they do on the
+  JVM, a missing key raises `NoSuchElementException`, and mutation raises
+  `UnsupportedOperationException`. The synthesized view is cached per node and
+  rebuilt after an arena reset.
 - `MihonQuickJsTests` pins both branches of `app.cash.quickjs`: the
   JavaScriptCore round trip and the typed `UnsupportedOperationException` on a
   host without it.
