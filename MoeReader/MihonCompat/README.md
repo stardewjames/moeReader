@@ -250,7 +250,9 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   `OkHttpClient`, so its interceptors see the request and the returned bytes
   are decoded and cached by the host. A live run tripped the extension's own
   cache-control interceptor, which proves the plain image loader is not used
-  for pages.
+  for pages. With the image step enabled, 24 of the 25 sources that pass the
+  metadata steps also return image bytes through that path; the exception is a
+  page CDN behind the same browser check as its HTML host.
 - A live call under `MIHON_OP_TIMEOUT=0.3` fails with a typed timeout in about
   two seconds instead of hanging, and the engine reloads the extension state
   before the next call.
