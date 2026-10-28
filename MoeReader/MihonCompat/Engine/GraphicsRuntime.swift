@@ -342,9 +342,12 @@ enum VMCanvasDrawing {
             throw VMJavaException("Ljava/lang/IllegalStateException;", "Canvas: bitmap has no pixels")
         }
         context.saveGState()
-        context.setCTM(canvas.bitmap.baseTransform)
+        // Fill the whole bitmap regardless of any transform the canvas has
+        // picked up, like Canvas.drawColor: transform the device area back
+        // into user space and fill that.
+        let area = CGRect(x: 0, y: 0, width: CGFloat(canvas.bitmap.width), height: CGFloat(canvas.bitmap.height))
         context.setFillColor(VMBitmapStore.color(argb))
-        context.fill(CGRect(x: 0, y: 0, width: CGFloat(canvas.bitmap.width), height: CGFloat(canvas.bitmap.height)))
+        context.fill(area.applying(context.ctm.inverted()))
         context.restoreGState()
     }
 
