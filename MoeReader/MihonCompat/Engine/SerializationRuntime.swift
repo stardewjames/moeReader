@@ -348,7 +348,7 @@ struct SerializationRuntime {
     static func jsonText(_ tree: VMJsonTree) -> String {
         switch tree.kind {
         case .object(let fields):
-            let body = fields.map { key, value in "\"\(key)\":" + jsonText(value) }.joined(separator: ",")
+            let body = fields.map { key, value in quote(key) + ":" + jsonText(value) }.joined(separator: ",")
             return "{" + body + "}"
         case .array(let items):
             return "[" + items.map(jsonText).joined(separator: ",") + "]"

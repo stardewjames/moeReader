@@ -32,4 +32,24 @@ final class MihonEngineSerializationTests: XCTestCase {
         XCTAssertEqual(result.first?["name"] as? String, "Alpha")
         XCTAssertEqual(result.first?["number"] as? Int, 7)
     }
+
+    /// Map keys are data: a Kotlin `Map<String, …>` may hold tag names that
+    /// end in a backslash or contain quotes/control characters. `jsonText`
+    /// must escape keys exactly like values or the cached JSON is invalid.
+    func testJsonEncoderEscapesObjectKeys() throws {
+        let nastyKey = "fantasy\\"
+        let quoteKey = "say \"hi\"\n"
+        let tree = VMJsonTree(.object([
+            nastyKey: VMJsonTree(.string("trailing\\")),
+            quoteKey: VMJsonTree(.string("line\nbreak")),
+            "plain": VMJsonTree(.number("1")),
+        ]))
+        let text = SerializationRuntime.jsonText(tree)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object[nastyKey] as? String, "trailing\\")
+        XCTAssertEqual(object[quoteKey] as? String, "line\nbreak")
+        XCTAssertEqual(object["plain"] as? Int, 1)
+    }
 }

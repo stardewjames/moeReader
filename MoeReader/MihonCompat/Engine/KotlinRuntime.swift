@@ -4801,7 +4801,10 @@ enum KotlinRuntime {
             runtime.makeNative("Lkotlin/time/Instant;", payload: NSNumber(value: Int64(Date().timeIntervalSince1970 * 1000)))
         }
         instantCompanion.method("getEpochMilliseconds", "(J)J") { _, args, _ in args[1] }
-        instantCompanion.method("fromEpochSeconds$default", "(Lkotlin/time/Instant$Companion;JJILjava/lang/Object;)Lkotlin/time/Instant;") { runtime, args, _ in
+        // `$default` bridges are static on the descriptor class and carry the
+        // companion receiver as their first parameter; invoking them virtually
+        // reports NoSuchMethodError.
+        instantCompanion.staticMethod("fromEpochSeconds$default", "(Lkotlin/time/Instant$Companion;JJILjava/lang/Object;)Lkotlin/time/Instant;") { runtime, args, _ in
             let mask = args[3].asInt32
             let seconds = args[1].asInt64
             let adjustment = mask & 2 != 0 ? Int64(0) : args[2].asInt64
