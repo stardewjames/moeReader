@@ -53,6 +53,10 @@ int32_t sw_jvm_start(const char *libjvm_path,
 /// True when this process can start a JVM without loading a library.
 int32_t sw_jvm_linked(void);
 
+/// True once `sw_jvm_start` created the VM. A start that failed before
+/// creation leaves nothing behind and can be retried.
+int32_t sw_jvm_running(void);
+
 /// Calls `moe.reader.suwayomi.Bridge.call(op, request)` on the current
 /// thread, attaching it to the JVM as a daemon the first time. On success the
 /// reply is in `reply` and must be freed with `sw_reply_free`.

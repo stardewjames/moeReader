@@ -170,6 +170,10 @@ int32_t sw_jvm_linked(void) {
     return linked_create_vm() != NULL ? 1 : 0;
 }
 
+int32_t sw_jvm_running(void) {
+    return g_vm != NULL ? 1 : 0;
+}
+
 int32_t sw_jvm_start(const char *libjvm_path,
                      const char *const *options, int32_t option_count,
                      sw_fetch_callback fetch, sw_call_callback call, sw_release_callback release,
@@ -211,8 +215,17 @@ int32_t sw_jvm_start(const char *libjvm_path,
     free(vm_options);
     if (created != JNI_OK || !env) {
         g_vm = NULL;
-        char message[96];
-        snprintf(message, sizeof(message), "JNI_CreateJavaVM failed (%d)", (int)created);
+        // The code alone is opaque to a user, and HotSpot's own explanation of
+        // a rejected option goes to stderr, which no app UI reads.
+        const char *reason = "unknown";
+        switch (created) {
+        case JNI_EINVAL: reason = "a VM option was rejected"; break;
+        case JNI_ENOMEM: reason = "out of memory"; break;
+        case JNI_EVERSION: reason = "unsupported JNI version"; break;
+        case JNI_EEXIST: reason = "a VM already exists"; break;
+        }
+        char message[128];
+        snprintf(message, sizeof(message), "JNI_CreateJavaVM failed (%d: %s)", (int)created, reason);
         set_error(error, error_capacity, message);
         return -1;
     }

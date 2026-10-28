@@ -168,11 +168,31 @@ final class SuwayomiJVM: @unchecked Sendable {
     private var state = State.stopped
     private var jobs: [() -> Void] = []
     private var workers: [Thread] = []
+    /// Bumped when another backend becomes active. Runtimes capture it, and a
+    /// call from an earlier activation is refused instead of reloading an
+    /// extension the host has just trimmed.
+    private var epoch = 0
 
     init(layout: SuwayomiRuntimeLayout?, directories: SuwayomiDirectories) {
         self.layout = layout
         self.directories = directories
         unavailableReason = layout.map(\.unavailableReason) ?? "This build does not include the Suwayomi runtime."
+    }
+
+    /// The activation a caller should hold on to: `call(since:)` with an older
+    /// value fails once `invalidate` has run.
+    var currentEpoch: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return epoch
+    }
+
+    /// The active backend changed: queued and later calls from runtimes created
+    /// under the previous activation stop before they reach the host.
+    func invalidate() {
+        lock.lock()
+        epoch += 1
+        lock.unlock()
     }
 
     /// True once the JVM runs. Housekeeping calls (unload, trim) are skipped
@@ -186,13 +206,17 @@ final class SuwayomiJVM: @unchecked Sendable {
 
     // MARK: Calls
 
-    /// Runs one host operation and returns its payload.
-    func call(_ op: SuwayomiOp, _ payload: SuwayomiWireWriter) async throws -> SuwayomiWireReader {
+    /// Runs one host operation and returns its payload. `epoch` is the
+    /// activation the caller belongs to; a call from before the last
+    /// `invalidate` fails without starting or loading anything.
+    func call(_ op: SuwayomiOp, _ payload: SuwayomiWireWriter, since epoch: Int = 0) async throws -> SuwayomiWireReader {
         let request = payload.bytes
         let reply: Data = try await withCheckedThrowingContinuation { continuation in
             submit {
                 do {
+                    try self.ensureActive(epoch)
                     try self.ensureStarted()
+                    try self.ensureActive(epoch)
                     continuation.resume(returning: try self.bridgeCall(op.rawValue, request))
                 } catch {
                     continuation.resume(throwing: error)
@@ -202,11 +226,15 @@ final class SuwayomiJVM: @unchecked Sendable {
         return try Self.unwrap(reply)
     }
 
-    /// Runs `op` only if the JVM is already up.
+    /// Runs `op` only if the JVM is already up. The check runs on the worker,
+    /// so housekeeping submitted while the JVM starts is not dropped: it waits
+    /// for the start and then sees the state the start left behind.
     func callIfRunning(_ op: SuwayomiOp, _ payload: SuwayomiWireWriter) {
-        guard isRunning else { return }
         let request = payload.bytes
         submit {
+            self.startLock.lock()
+            defer { self.startLock.unlock() }
+            guard self.isRunning else { return }
             _ = try? self.bridgeCall(op.rawValue, request)
         }
     }
@@ -287,30 +315,40 @@ final class SuwayomiJVM: @unchecked Sendable {
 
     private let startLock = NSLock()
 
+    /// Fails when `epoch` belongs to an activation that has been released.
+    func ensureActive(_ epoch: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard epoch == self.epoch else {
+            throw SuwayomiFailure("the Suwayomi runtime was released when the extension runtime changed")
+        }
+    }
+
     private func ensureStarted() throws {
         startLock.lock()
         defer { startLock.unlock() }
         lock.lock()
         let current = state
         lock.unlock()
-        switch current {
-        case .running:
-            return
-        case .failed(let message):
+        if case .running = current { return }
+        if case .failed(let message) = current {
+            // `sw_jvm_start` leaves no VM behind when it fails before creating
+            // one, so that failure can be retried: its cause may be
+            // environmental (storage, memory, a fixed options file) and is not
+            // worth an app relaunch. Once a VM exists the runtime is final.
+            guard sw_jvm_running() == 0 else { throw SuwayomiFailure(message) }
+        }
+        do {
+            try start()
+            lock.lock()
+            state = .running
+            lock.unlock()
+        } catch {
+            let message = "Suwayomi runtime failed to start: \(error.localizedDescription)"
+            lock.lock()
+            state = .failed(message)
+            lock.unlock()
             throw SuwayomiFailure(message)
-        case .stopped:
-            do {
-                try start()
-                lock.lock()
-                state = .running
-                lock.unlock()
-            } catch {
-                let message = "Suwayomi runtime failed to start: \(error.localizedDescription)"
-                lock.lock()
-                state = .failed(message)
-                lock.unlock()
-                throw SuwayomiFailure(message)
-            }
         }
     }
 

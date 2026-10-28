@@ -31,6 +31,10 @@ final class SuwayomiRuntime: MihonSourceRuntime, MihonSourceFilterProviding, Mih
     let apkURL: URL
 
     private let jvm: SuwayomiJVM
+    /// The backend activation this runtime was created for. `SuwayomiBackend`
+    /// creates a fresh runtime after switching back, so a stale one holds an
+    /// old value and its calls are refused.
+    private let epoch: Int
     private let lock = NSLock()
     private var classNames: [String]?
     private var sources: [SuwayomiSourceInfo]?
@@ -39,6 +43,7 @@ final class SuwayomiRuntime: MihonSourceRuntime, MihonSourceFilterProviding, Mih
         self.packageName = packageName
         self.apkURL = apkURL
         self.jvm = jvm
+        self.epoch = jvm.currentEpoch
         self.descriptor = MihonRuntimeDescriptor(
             id: "suwayomi",
             name: "Suwayomi runtime",
@@ -91,8 +96,9 @@ final class SuwayomiRuntime: MihonSourceRuntime, MihonSourceFilterProviding, Mih
 
     /// The extension's sources as the host loaded them (loads it on first use).
     func sourceInfos() async throws -> [SuwayomiSourceInfo] {
+        try jvm.ensureActive(epoch)
         if let cached = lock.withLock({ sources }) { return cached }
-        var reply = try await jvm.call(.load, try header())
+        var reply = try await jvm.call(.load, try header(), since: epoch)
         let loaded = try reply.list { reader in
             SuwayomiSourceInfo(
                 id: try reader.i64(),
@@ -123,11 +129,12 @@ final class SuwayomiRuntime: MihonSourceRuntime, MihonSourceFilterProviding, Mih
         source: MihonSource,
         _ fill: (inout SuwayomiWireWriter) -> Void = { _ in }
     ) async throws -> (SuwayomiWireReader, SuwayomiSourceInfo) {
+        try jvm.ensureActive(epoch)
         let info = try await info(for: source)
         var writer = try header()
         writer.i64(info.id)
         fill(&writer)
-        return (try await jvm.call(op, writer), info)
+        return (try await jvm.call(op, writer, since: epoch), info)
     }
 
     // MARK: Listings

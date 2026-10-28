@@ -79,6 +79,12 @@ protocol MihonRuntimeBackend: AnyObject, Sendable {
   reads the observed `activeID`.
 - `evict(packageName:)` reaches every backend on uninstall, not only the
   active one.
+- `deactivate()` is an execution boundary, not just a cache flush: a backend
+  should make work holding a runtime from before the call fail instead of
+  reaching the extension again. `SuwayomiBackend` does this with an activation
+  counter on the shared JVM (`SuwayomiJVM.invalidate()`), so a reader prefetch
+  or a page request left over from the previous backend stops before it
+  re-loads the extension the host was just told to drop.
 - Runtimes implement `MihonSourceRuntime` and may also implement
   `MihonSourceFilterProviding` (filter tree and filtered search) and
   `MihonSourcePreferencesProviding` (`MihonSourcePreference` controls). The
@@ -112,7 +118,7 @@ needs). Nothing in this layer names a backend.
 | `MihonCompatStore.swift` | Actor-owned persistence and install lifecycle |
 | `MihonSourceRuntime.swift` | Runtime protocols and the shared source, filter and preference models |
 | `MihonRuntimeBackend.swift` | Backend protocol and the user's backend selection |
-| `MihonRemoteImageView.swift` | Page bytes from the runtime, cover fetch over URLSession, decode cache, prefetch |
+| `MihonRemoteImageView.swift` | Page bytes from the runtime, cover fetch over URLSession, decode cache, prefetch. Page keys include the backend's descriptor id, so a page decoded by one runtime is not served to, or waited on by, another after a backend switch |
 | `MihonCompatView.swift` | Repository/extension manager |
 | `MihonBrowseView.swift`, `MihonMangaView.swift`, `MihonReaderView.swift` | Source browser and reader |
 | `MihonFilterView.swift` | FilterList sheet for source searches |

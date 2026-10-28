@@ -72,6 +72,9 @@ final class SuwayomiBackend: MihonRuntimeBackend, @unchecked Sendable {
     func deactivate() {
         lock.lock()
         runtimes.removeAll()
+        // Under the same lock as `runtime(for:)`: a runtime resolved here either
+        // sees the new activation or is dropped with the dictionary.
+        jvm.invalidate()
         lock.unlock()
         jvm.callIfRunning(.trim, SuwayomiWireWriter())
     }
@@ -82,7 +85,9 @@ enum SuwayomiJars {
     static func purge(packageName: String, directories: SuwayomiDirectories) {
         let folder = directories.data.appendingPathComponent("jars", isDirectory: true)
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
-        for name in names where name.hasPrefix("\(packageName)-") {
+        // The converter writes `.d2j` and `.tmp` siblings before renaming the
+        // finished jar into place; those belong to a conversion in flight.
+        for name in names where name.hasPrefix("\(packageName)-") && name.hasSuffix(".jar") {
             try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
         }
     }

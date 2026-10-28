@@ -152,6 +152,57 @@ final class SuwayomiCompatTests: XCTestCase {
         XCTAssertFalse(jvm.isRunning)
     }
 
+    // MARK: Activation
+
+    func testReleasedRuntimeRefusesCallsBeforeReachingTheHost() async throws {
+        let jvm = SuwayomiJVM(layout: nil, directories: .standard)
+        let apk = try TestFixtures.temporaryDirectory().appendingPathComponent("package.apk")
+        let runtime = SuwayomiRuntime(packageName: "com.example.extension", apkURL: apk, jvm: jvm)
+        let before = jvm.currentEpoch
+        jvm.invalidate()
+        XCTAssertEqual(jvm.currentEpoch, before + 1)
+
+        do {
+            _ = try await runtime.capabilities(source: MihonSource(
+                id: 1, name: "Example", language: "en", homeURL: URL(string: "https://example.test")!
+            ))
+            XCTFail("a released runtime must not run")
+        } catch {
+            // Not the missing-APK or missing-runtime message: the activation is
+            // checked before any package or JVM work.
+            XCTAssertTrue(error.localizedDescription.contains("released"), error.localizedDescription)
+        }
+        XCTAssertFalse(jvm.isRunning)
+    }
+
+    func testPurgeKeepsConversionScratchFilesAndOtherPackages() throws {
+        let root = try TestFixtures.temporaryDirectory()
+        let directories = SuwayomiDirectories(
+            data: root,
+            cache: root.appendingPathComponent("cache"),
+            temporary: root.appendingPathComponent("tmp")
+        )
+        let jars = directories.data.appendingPathComponent("jars", isDirectory: true)
+        try FileManager.default.createDirectory(at: jars, withIntermediateDirectories: true)
+        let names = [
+            "com.example.one-abc-c1.jar",
+            "com.example.one-def-c1.jar",
+            "com.example.one-def-c1.jar.d2j",
+            "com.example.one-def-c1.jar.tmp",
+            "com.example.two-abc-c1.jar",
+        ]
+        for name in names { try Data().write(to: jars.appendingPathComponent(name)) }
+
+        SuwayomiJars.purge(packageName: "com.example.one", directories: directories)
+
+        let remaining = Set(try FileManager.default.contentsOfDirectory(atPath: jars.path))
+        XCTAssertEqual(remaining, [
+            "com.example.one-def-c1.jar.d2j",
+            "com.example.one-def-c1.jar.tmp",
+            "com.example.two-abc-c1.jar",
+        ])
+    }
+
     // MARK: Models
 
     func testChapterNumbersReadLikeTheSwiftEngine() {

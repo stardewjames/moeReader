@@ -34,11 +34,17 @@ memory idle when the reader is not asking for anything.
   the JVM and extensions may still run their own background work.
 - **Started on first use, never at launch.** `SuwayomiJVM` creates the JVM the
   first time a source call needs it. Choosing the backend, rendering the source
-  list and uninstalling extensions never start it.
+  list and uninstalling extensions never start it. A start that failed before
+  HotSpot created the VM left nothing behind, so it is retried on the next
+  call instead of failing until the app relaunches; once a VM exists the
+  runtime is final for the process.
 - **Two parked worker threads.** Calls run on at most two dedicated threads,
   attached to the JVM once and parked on a condition variable between jobs (no
   GCD thread churn, no re-attach per call). Two lets a page fetch overlap a
-  listing without letting extension code compete for more cores.
+  listing without letting extension code compete for more cores. Housekeeping
+  (`unload`, `trim`) is a job like any other and takes the same start lock, so
+  a memory warning during the first start trims after it rather than being
+  dropped while the state was still `stopped`.
 - **The app owns the network.** OkHttp's chain is kept (extension interceptors,
   redirects with per-hop cookies, cookie jar, gzip), but the final hop is the
   app's `URLSession`: the system TLS stack, HTTP/2 and connection reuse instead
@@ -60,7 +66,11 @@ memory idle when the reader is not asking for anything.
   three-extension limit (busy calls may exceed it). Per-source caches hold
   512 listed manga, 2048 chapters and 4 page lists. Switching backends or a
   memory warning drops idle loaders immediately and busy ones after their
-  calls finish; converted jars are retained to avoid reconversion.
+  calls finish; converted jars are retained to avoid reconversion. Switching
+  away is also an execution boundary: `SuwayomiBackend.deactivate()` bumps the
+  JVM's activation counter, and a call from a runtime created before it fails
+  with "the Suwayomi runtime was released when the extension runtime changed"
+  instead of loading the extension again after the trim.
 - **Small interpreter-friendly boot.** The HOCON/config4k configuration layer
   (kotlin-reflect at every start), XML preference files, a background
   preference-saver thread, the logging interceptor, the OkHttp disk cache,
@@ -121,13 +131,17 @@ For desktop and Linux hosts, `SUWAYOMI_RUNTIME_DIR` points at a directory with
 the same layout (`./gradlew :host:desktopRuntime`) and `SUWAYOMI_LIBJVM` at a
 HotSpot `libjvm`.
 
-HotSpot reports `JNI_CreateJavaVM failed (-6)` (`JNI_EINVAL`) when it rejects
-startup arguments. The bundled options unlock diagnostic flags with
-`-XX:+UnlockDiagnosticVMOptions` **before** `-XX:-BytecodeVerificationRemote`,
-which converted extension bytecode requires. Without the unlock, HotSpot
-rejects that flag. After changing `openjdk.options`, refresh an existing
-package with `HOST_ONLY=1 SuwayomiHost/jvm-ios/package.sh` and rebuild the app;
-editing the source options alone does not change an already packaged runtime.
+HotSpot reports `JNI_CreateJavaVM failed (-6: a VM option was rejected)`
+(`-6` is `JNI_EINVAL`) when it rejects startup arguments. The bundled options
+unlock diagnostic flags with `-XX:+UnlockDiagnosticVMOptions` **before**
+`-XX:-BytecodeVerificationRemote`, which converted extension bytecode
+requires. Without the unlock, HotSpot rejects that flag and prints the exact
+option on stderr, which no app UI reads; the shim names the reason in the error
+instead. After changing `openjdk.options`, refresh an existing package with
+`HOST_ONLY=1 SuwayomiHost/jvm-ios/package.sh` and rebuild the app; editing the
+source options alone does not change an already packaged runtime. A failure
+before the VM exists is retried on the next source call, so a fixed runtime is
+picked up without relaunching the app.
 
 ## Verified
 

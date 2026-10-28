@@ -11,9 +11,11 @@ struct MihonPageImageSource: Sendable {
     let provider: any MihonSourceRuntime
 
     /// Cache identity: one extension source can serve many chapters, and page
-    /// indexes repeat across chapters.
+    /// indexes repeat across chapters. The backend is part of it, so a page
+    /// rendered by one runtime is never served from another's cache or joined
+    /// to its in-flight request after the user switches backends.
     var identity: String {
-        "\(source.identity)#\(chapter.id)#\(page.index)"
+        "\(provider.descriptor.id)#\(source.identity)#\(chapter.id)#\(page.index)"
     }
 }
 
