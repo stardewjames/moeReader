@@ -14,6 +14,9 @@ struct MihonMangaView: View {
     @State private var didLoad = false
     @State private var scanlatorFilter: String?
     @State private var chapterOrder: ChapterOrder = .newest
+    @State private var extensionName: String?
+    @State private var releaseSchedule = "Unknown"
+    @State private var isShowingDescription = false
 
     init(
         initialManga: MihonManga,
@@ -158,24 +161,44 @@ struct MihonMangaView: View {
                 library: library
             )
         }
+        .sheet(isPresented: $isShowingDescription) {
+            if let description = manga.description, !description.isEmpty {
+                NavigationStack {
+                    ScrollView {
+                        Text(description)
+                            .font(.body)
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(20)
+                    }
+                    .background(Palette.background.ignoresSafeArea())
+                    .navigationTitle("Description")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { isShowingDescription = false }
+                        }
+                    }
+                }
+                .presentationDetents([.medium, .large])
+                .tint(Palette.amber)
+            }
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 14) {
-                VStack(spacing: 8) {
-                    MihonRemoteImageView(
-                        url: manga.coverURL,
-                        headers: manga.coverHeaders,
-                        maxPixelSize: 360,
-                        contentMode: .fill
-                    )
-                    .frame(width: 116, height: 172)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    libraryControl
-                }
-                .frame(width: 116)
-                VStack(alignment: .leading, spacing: 5) {
+                MihonRemoteImageView(
+                    url: manga.coverURL,
+                    headers: manga.coverHeaders,
+                    maxPixelSize: 360,
+                    contentMode: .fill
+                )
+                .frame(width: 116, height: 172)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 6) {
                     Text(manga.title)
                         .font(.headline)
                         .foregroundStyle(.white)
@@ -185,31 +208,75 @@ struct MihonMangaView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
-                    if let status = manga.status {
-                        Text(status)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(Palette.amber)
-                    }
                     if !manga.genres.isEmpty {
-                        Text(manga.genres.prefix(5).joined(separator: " · "))
+                        Text(manga.genres.prefix(4).joined(separator: " · "))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .lineLimit(3)
+                            .lineLimit(1)
                     }
+                    metadata
                     Spacer(minLength: 0)
-                    Text(source.name + " · " + source.language.uppercased())
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    libraryControl
                 }
+                .frame(minHeight: 172, alignment: .top)
             }
             if let description = manga.description, !description.isEmpty {
-                Text(description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(8)
+                Button {
+                    isShowingDescription = true
+                } label: {
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Opens the full description")
             }
         }
         .padding(.vertical, 6)
+    }
+
+    private var metadata: some View {
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 3) {
+            metadataRow("Status", statusText)
+            metadataRow("Tracking", trackingText)
+            metadataRow("Extension", extensionText)
+            metadataRow("Schedule", scheduleText)
+        }
+        .font(.caption2)
+    }
+
+    private func metadataRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+        }
+    }
+
+    private var statusText: String {
+        guard let status = manga.status?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !status.isEmpty else {
+            return "Unknown"
+        }
+        return status
+    }
+
+    private var trackingText: String {
+        libraryEntry == nil ? "Not tracked" : "In library"
+    }
+
+    private var extensionText: String {
+        extensionName ?? source.name
+    }
+
+    private var scheduleText: String {
+        releaseSchedule == "Unknown" ? releaseSchedule : "\(releaseSchedule) (est.)"
     }
 
     @ViewBuilder
@@ -309,12 +376,17 @@ struct MihonMangaView: View {
         isLoading = true
         defer { isLoading = false }
         errorMessage = nil
+        if extensionName == nil {
+            let installed = await MihonCompatStore.shared.installedSnapshot()
+            extensionName = installed.first { $0.packageName == packageName }?.name
+        }
         do {
             async let details = runtime.manga(id: manga.id, source: source, title: manga.title)
             async let chapterList = runtime.chapters(manga: manga, source: source)
             let (loadedManga, loadedChapters) = try await (details, chapterList)
             manga = loadedManga
             chapters = loadedChapters
+            releaseSchedule = MihonReleaseSchedule.describe(loadedChapters)
             if let scanlatorFilter, !scanlators.contains(scanlatorFilter) {
                 self.scanlatorFilter = nil
             }

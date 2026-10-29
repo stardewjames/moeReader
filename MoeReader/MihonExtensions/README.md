@@ -46,9 +46,11 @@ destination (from Settings and the home Library), the runtime picker in
   that run against one source or every enabled source at once. Search filters
   are rendered from the extension's `FilterList` and replayed onto a fresh list
   for each search, persisted per source, and re-applied after view recreation.
-  Source preferences are edited in a sheet, including text, single-choice,
-  toggle, and multi-select controls; only changed keys are written. Covers use
-  the source's request headers over the shared cookie jar.
+  The manga detail shows status, library tracking, the extension, and an
+  estimated release cadence beside the cover; its truncated description opens
+  in a full-text sheet. Source preferences are edited in a sheet, including
+  text, single-choice, toggle, and multi-select controls; only changed keys are
+  written. Covers use the source's request headers over the shared cookie jar.
 - **One reader.** Extension chapters open in the same `ReaderView` as local
   books. `MihonReaderPageSource` feeds `runtime.pageImage` into the reader's
   image-provider seam, so the extension's interceptors apply while paging,
