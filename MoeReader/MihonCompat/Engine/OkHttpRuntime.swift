@@ -189,8 +189,7 @@ enum VMCookieJar {
         return true
     }
 
-    static func store(headers: [(String, String)], for urlString: String, storage: HTTPCookieStorage) {
-        guard let url = URL(string: urlString) else { return }
+    static func store(headers: [(String, String)], for url: URL, storage: HTTPCookieStorage) {
         for (name, value) in headers where name.caseInsensitiveCompare("Set-Cookie") == .orderedSame {
             for chunk in splitSetCookie(value) {
                 WebKitRuntime.storeCookie(storage, header: chunk, for: url)
@@ -198,9 +197,27 @@ enum VMCookieJar {
         }
     }
 
+    /// Expands `Set-Cookie` values a transport merged into one comma-joined
+    /// string. Applied once where transport headers enter the engine, so every
+    /// later consumer sees one cookie per header.
+    static func splitSetCookieHeaders(_ headers: [(String, String)]) -> [(String, String)] {
+        var result: [(String, String)] = []
+        result.reserveCapacity(headers.count)
+        for (name, value) in headers {
+            if name.caseInsensitiveCompare("Set-Cookie") == .orderedSame {
+                for chunk in splitSetCookie(value) { result.append((name, chunk)) }
+            } else {
+                result.append((name, value))
+            }
+        }
+        return result
+    }
+
     /// Foundation merges several `Set-Cookie` values into one comma-joined
     /// string; a comma only separates cookies when a new `name=` follows it
-    /// (`Expires` dates also contain commas).
+    /// (`Expires` dates also contain commas). The separating comma is dropped
+    /// rather than left on the preceding cookie, where it would corrupt the
+    /// attribute that happens to come last (`Path=/,`).
     static func splitSetCookie(_ value: String) -> [String] {
         var parts: [String] = []
         var current = ""
@@ -208,30 +225,51 @@ enum VMCookieJar {
         var index = 0
         while index < characters.count {
             let character = characters[index]
-            current.append(character)
-            if character == "," {
-                var cursor = index + 1
-                while cursor < characters.count, characters[cursor] == " " { cursor += 1 }
-                var nameEnd = cursor
-                while nameEnd < characters.count, characters[nameEnd] != "=", !characters[nameEnd].isWhitespace,
-                      characters[nameEnd] != ";" {
-                    nameEnd += 1
-                }
-                if nameEnd < characters.count, characters[nameEnd] == "=", nameEnd > cursor {
-                    parts.append(current)
-                    current = ""
-                }
+            if character == ",", startsNewCookie(characters, at: index + 1) {
+                let part = current.trimmingCharacters(in: .whitespaces)
+                if !part.isEmpty { parts.append(part) }
+                current = ""
+            } else {
+                current.append(character)
             }
             index += 1
         }
-        if !current.isEmpty { parts.append(current) }
+        let part = current.trimmingCharacters(in: .whitespaces)
+        if !part.isEmpty { parts.append(part) }
         return parts
+    }
+
+    /// True when the text after a comma opens a fresh `name=` pair rather than
+    /// continuing an `Expires` date.
+    private static func startsNewCookie(_ characters: [Character], at index: Int) -> Bool {
+        var cursor = index
+        while cursor < characters.count, characters[cursor] == " " { cursor += 1 }
+        var nameEnd = cursor
+        while nameEnd < characters.count, characters[nameEnd] != "=", !characters[nameEnd].isWhitespace,
+              characters[nameEnd] != ";" {
+            nameEnd += 1
+        }
+        return nameEnd < characters.count && characters[nameEnd] == "=" && nameEnd > cursor
     }
 
     static func header(_ cookies: [HTTPCookie]) -> String {
         cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
     }
+
+    /// `Cookie` request header for the jar's current contents, or nil when
+    /// nothing in the jar matches the URL.
+    static func header(for url: URL, storage: HTTPCookieStorage) -> String? {
+        let matches = cookies(storage: storage, for: url)
+        return matches.isEmpty ? nil : header(matches)
+    }
 }
+
+/// The jar behind `NetworkHelper.getCookieJar()` and
+/// `OkHttpClient.cookieJar()`: both read and write `VMHost.cookieStorage()`.
+final class VMSharedCookieJar {}
+
+/// `CookieJar.NO_COOKIES`: stores nothing and loads nothing.
+final class VMNoCookiesJar {}
 
 /// `okhttp3.Cookie` as extensions touch it: parse a header value for a URL and
 /// read the fields back.
@@ -455,7 +493,7 @@ enum OkHttpRuntime {
     // MARK: - Headers
 
     private static func headersClasses() -> [NativeClass] {
-        let headers = NativeClass("Lokhttp3/Headers;", superclass: "Ljava/lang/Object;")
+        let headers = NativeClass("Lokhttp3/Headers;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Iterable;"])
         headers.staticField("Companion", "Lokhttp3/Headers$Companion;")
         headers.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lokhttp3/Headers$Companion;", payload: NSNull())
@@ -1320,7 +1358,7 @@ enum OkHttpRuntime {
             return runtime.makeNative("Lokhttp3/OkHttpClient$Builder;", payload: builder)
         }
         client.method("cookieJar", "()Lokhttp3/CookieJar;") { runtime, _, _ in
-            runtime.makeNative("Lokhttp3/CookieJar;", payload: NSNull())
+            runtime.makeNative("Lokhttp3/CookieJar;", payload: VMSharedCookieJar())
         }
         client.method("dispatcher", "()Lokhttp3/Dispatcher;") { runtime, _, _ in
             runtime.makeNative("Lokhttp3/Dispatcher;", payload: VMDispatchPayload())
@@ -1968,16 +2006,22 @@ enum OkHttpRuntime {
         let formBody = NativeClass("Lokhttp3/FormBody;", superclass: "Lokhttp3/RequestBody;")
         formBody.method("<init>", "([Ljava/lang/String;[Ljava/lang/String;)V") { runtime, args, _ in
             let count = runtime.arrayLength(args[1])
-            var pairs: [(String, String)] = []
+            var pairs: [VMFormBodyPayload.Parameter] = []
             for index in 0..<min(count, runtime.arrayLength(args[2])) {
-                pairs.append((
-                    runtime.stringValue(runtime.arrayElement(args[1], index)) ?? "",
-                    runtime.stringValue(runtime.arrayElement(args[2], index)) ?? ""
+                pairs.append(VMFormBodyPayload.Parameter(
+                    name: runtime.stringValue(runtime.arrayElement(args[1], index)) ?? "",
+                    value: runtime.stringValue(runtime.arrayElement(args[2], index)) ?? "",
+                    // OkHttp stores these arrays as encoded names and values.
+                    encoded: true
                 ))
             }
             runtime.setPayload(
                 args[0],
-                VMFormBodyPayload(pairs: pairs, data: Data(), contentType: "application/x-www-form-urlencoded")
+                VMFormBodyPayload(
+                    pairs: pairs,
+                    data: VMFormBodyPayload.render(pairs),
+                    contentType: "application/x-www-form-urlencoded"
+                )
             )
             return .zero
         }
@@ -1988,50 +2032,59 @@ enum OkHttpRuntime {
             let payload = runtime.payload(args[0], as: VMFormBodyPayload.self)
             let index = Int(args[1].asInt32)
             guard let pairs = payload?.pairs, index >= 0, index < pairs.count else { return .null }
-            return runtime.newString(pairs[index].0)
+            let pair = pairs[index]
+            return runtime.newString(pair.encoded ? VMFormBodyPayload.decode(pair.name) : pair.name)
         }
         formBody.method("value", "(I)Ljava/lang/String;") { runtime, args, _ in
             let payload = runtime.payload(args[0], as: VMFormBodyPayload.self)
             let index = Int(args[1].asInt32)
             guard let pairs = payload?.pairs, index >= 0, index < pairs.count else { return .null }
-            return runtime.newString(pairs[index].1)
+            let pair = pairs[index]
+            return runtime.newString(pair.encoded ? VMFormBodyPayload.decode(pair.value) : pair.value)
         }
 
         let formBuilder = NativeClass("Lokhttp3/FormBody$Builder;", superclass: "Ljava/lang/Object;")
         formBuilder.method("<init>", "()V") { runtime, args, _ in
             runtime.setPayload(
                 args[0],
-                VMFormBodyPayload(pairs: [], data: Data(), contentType: "application/x-www-form-urlencoded")
+                VMFormBodyPayload(pairs: [], contentType: "application/x-www-form-urlencoded")
             )
             return .zero
         }
         formBuilder.method("<init>", "(Ljava/nio/charset/Charset;ILkotlin/jvm/internal/DefaultConstructorMarker;)V") { runtime, args, _ in
-            // `FormBody.Builder(charset = ...)`: the charset only affects encoding,
-            // which the request layer applies from the content type.
-            runtime.setPayload(
-                args[0],
-                VMFormBodyPayload(pairs: [], data: Data(), contentType: "application/x-www-form-urlencoded")
-            )
+            let charset = runtime.payload(args[1], as: VMCharset.self)?.name
+            let type = charset.map { "application/x-www-form-urlencoded; charset=\($0)" }
+                ?? "application/x-www-form-urlencoded"
+            runtime.setPayload(args[0], VMFormBodyPayload(pairs: [], contentType: type))
             return .zero
         }
         formBuilder.method("add", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;") { runtime, args, _ in
             let payload: VMFormBodyPayload = try runtime.payloadBox(args[0])
-            payload.pairs.append((runtime.stringValue(args[1]) ?? "", runtime.stringValue(args[2]) ?? ""))
+            payload.pairs.append(VMFormBodyPayload.Parameter(
+                name: runtime.stringValue(args[1]) ?? "",
+                value: runtime.stringValue(args[2]) ?? "",
+                encoded: false
+            ))
             return args[0]
         }
         formBuilder.method("addEncoded", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;") { runtime, args, _ in
             let payload: VMFormBodyPayload = try runtime.payloadBox(args[0])
-            payload.pairs.append((runtime.stringValue(args[1]) ?? "", runtime.stringValue(args[2]) ?? ""))
+            payload.pairs.append(VMFormBodyPayload.Parameter(
+                name: runtime.stringValue(args[1]) ?? "",
+                value: runtime.stringValue(args[2]) ?? "",
+                encoded: true
+            ))
             return args[0]
         }
         formBuilder.method("build", "()Lokhttp3/FormBody;") { runtime, args, _ in
-            let payload: VMFormBodyPayload? = runtime.payload(args[0], as: VMFormBodyPayload.self)
+            let payload = runtime.payload(args[0], as: VMFormBodyPayload.self)
+            let pairs = payload?.pairs ?? []
             return runtime.makeNative(
                 "Lokhttp3/FormBody;",
-                payload: payload ?? VMFormBodyPayload(
-                    pairs: [],
-                    data: Data(),
-                    contentType: "application/x-www-form-urlencoded"
+                payload: VMFormBodyPayload(
+                    pairs: pairs,
+                    data: VMFormBodyPayload.render(pairs),
+                    contentType: payload?.contentType ?? "application/x-www-form-urlencoded"
                 )
             )
         }
@@ -2508,13 +2561,53 @@ enum OkHttpRuntime {
 }
 
 final class VMFormBodyPayload {
-    var pairs: [(String, String)]
-    var data: Data
+    /// One form parameter. `encoded` records whether the text is already
+    /// percent-encoded (`addEncoded`, the array constructor), in which case
+    /// rendering must copy it verbatim instead of encoding it again.
+    struct Parameter {
+        var name: String
+        var value: String
+        var encoded: Bool
+    }
+
+    var pairs: [Parameter]
+    /// The rendered `name=value&...` bytes. `contentLength`, `writeTo` and the
+    /// transport all read this one blob, so they cannot disagree.
+    let data: Data
     var contentType: String?
-    init(pairs: [(String, String)], data: Data, contentType: String? = nil) {
+
+    init(pairs: [Parameter] = [], data: Data? = nil, contentType: String? = nil) {
         self.pairs = pairs
-        self.data = data
+        self.data = data ?? Self.render(pairs)
         self.contentType = contentType
+    }
+
+    static func render(_ pairs: [Parameter]) -> Data {
+        var text = ""
+        for (index, pair) in pairs.enumerated() {
+            if index > 0 { text.append("&") }
+            text += pair.encoded ? pair.name : encode(pair.name)
+            text.append("=")
+            text += pair.encoded ? pair.value : encode(pair.value)
+        }
+        return Data(text.utf8)
+    }
+
+    /// `application/x-www-form-urlencoded` encoding: unreserved ASCII is
+    /// copied, space becomes `+`, everything else is UTF-8 percent-encoded.
+    static func encode(_ text: String) -> String {
+        let allowed = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789*-._"
+        )
+        let encoded = text.addingPercentEncoding(withAllowedCharacters: allowed) ?? text
+        return encoded.replacingOccurrences(of: "%20", with: "+")
+    }
+
+    /// `FormBody.name(i)`/`value(i)` return the decoded form text, where `+`
+    /// stands for a space.
+    static func decode(_ text: String) -> String {
+        let spaced = text.replacingOccurrences(of: "+", with: " ")
+        return spaced.removingPercentEncoding ?? spaced
     }
 }
 
@@ -2608,11 +2701,9 @@ extension VMRuntime {
         var headers = payload.headers.entries
         if payload.body.bits != 0 {
             if let form: VMFormBodyPayload = self.payload(payload.body, as: VMFormBodyPayload.self) {
-                if !form.pairs.isEmpty {
-                    body = Data(form.pairs.map { "\(formWire($0.0))=\(formWire($0.1))" }.joined(separator: "&").utf8)
-                } else {
-                    body = form.data
-                }
+                // `FormBody` rendered its pairs once at build time; this is the
+                // same blob `contentLength` and `writeTo` report.
+                body = form.data
                 if let contentType = form.contentType,
                    !headers.contains(where: { $0.0.caseInsensitiveCompare("Content-Type") == .orderedSame }) {
                     headers.append(("Content-Type", contentType))
@@ -2644,9 +2735,15 @@ extension VMRuntime {
             body: body
         )
         var response: VMHTTPResponse
+        // The response's own URL is the final hop; storing against the original
+        // URL would misfile cookies a redirect issued for another host.
+        func storeResponseCookies(_ response: VMHTTPResponse) {
+            guard let url = URL(string: response.url) ?? URL(string: payload.url) else { return }
+            VMCookieJar.store(headers: response.headers, for: url, storage: cookieStorage)
+        }
         do {
             response = try host.performRequest(vmRequest)
-            VMCookieJar.store(headers: response.headers, for: payload.url, storage: cookieStorage)
+            storeResponseCookies(response)
             if Self.isChallenge(response), try host.solveChallenge(vmRequest) {
                 // Solving writes the freshly issued clearance cookie into the
                 // jar, so the retry has to send the cookie set as it stands
@@ -2660,7 +2757,7 @@ extension VMRuntime {
                     body: body
                 )
                 response = try host.performRequest(vmRequest)
-                VMCookieJar.store(headers: response.headers, for: payload.url, storage: cookieStorage)
+                storeResponseCookies(response)
             }
         } catch let exception as VMJavaException {
             throw exception
@@ -2677,12 +2774,5 @@ extension VMRuntime {
             contentType: contentType
         )
         return makeNative("Lokhttp3/Response;", payload: responsePayload)
-    }
-
-    private func formWire(_ value: String) -> String {
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "*-._")
-        let encoded = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-        return encoded.replacingOccurrences(of: "%20", with: "+")
     }
 }

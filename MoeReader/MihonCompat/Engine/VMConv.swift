@@ -31,8 +31,11 @@ final class VMPrintStream {
 extension VMValue {
     var int32Value: VMValue { .int32(asInt32) }
 
+    /// Payload word of a *boxed* primitive. Primitive cells are not pointers,
+    /// so the receiver is validated against the heap before anything is read;
+    /// a primitive (or a stale pointer) answers zero instead of faulting.
     func asBoxedBits(_ runtime: VMRuntime) -> UInt64 {
-        guard let pointer = object else { return 0 }
+        guard let pointer = object, runtime.isObjectValue(self) else { return 0 }
         let cls = VMObjectLayout.cls(pointer)
         if let field = cls.field(named: "value") {
             return VMObjectLayout.slot(pointer, field.offset).pointee.bits
@@ -45,14 +48,39 @@ extension VMValue {
     }
 
     func asBoxedLong(_ runtime: VMRuntime) -> Int64 {
-        let cls = object.map { VMObjectLayout.cls($0) }
-        if cls?.descriptor == "Ljava/lang/Boolean;" || cls?.descriptor == "Ljava/lang/Character;" {
-            return Int64(truncatingIfNeeded: asBoxedBits(runtime))
-        }
-        if cls?.descriptor == "Ljava/lang/Double;" || cls?.descriptor == "Ljava/lang/Float;" {
-            return Int64(truncatingIfNeeded: asBoxedBits(runtime))
+        guard runtime.isObjectValue(self), let pointer = object, let cls = runtime.classOf(self) else { return 0 }
+        // `Boolean` keeps its flag, and `Character` its code unit, in the
+        // payload word even though `Boolean` declares a `value` field.
+        if cls.descriptor == "Ljava/lang/Boolean;" || cls.descriptor == "Ljava/lang/Character;" {
+            return Int64(truncatingIfNeeded: VMObjectLayout.aux(pointer))
         }
         return Int64(bitPattern: asBoxedBits(runtime))
+    }
+
+    // MARK: boxed-object accessors
+
+    /// The accessors below require a reference to a heap object and validate
+    /// it: a primitive argument holds its own bits (a char code unit, `1` for
+    /// true), and dereferencing those bits is a native crash rather than a
+    /// Java exception. Primitive `<descriptor>` parameters must use the
+    /// `asInt32`/`asUInt32`/`asInt64`/`asBoolean`/`asFloat`/`asDouble`
+    /// accessors instead.
+    func asBoxedChar(_ runtime: VMRuntime) -> UInt16 {
+        guard runtime.isObjectValue(self), let pointer = object else { return 0 }
+        return UInt16(truncatingIfNeeded: VMObjectLayout.aux(pointer))
+    }
+
+    func asBoxedBoolean(_ runtime: VMRuntime) -> Bool {
+        guard runtime.isObjectValue(self), let pointer = object else { return false }
+        return VMObjectLayout.aux(pointer) != 0
+    }
+
+    func asBoxedFloat(_ runtime: VMRuntime) -> Float {
+        Float(bitPattern: UInt32(truncatingIfNeeded: asBoxedBits(runtime)))
+    }
+
+    func asBoxedDouble(_ runtime: VMRuntime) -> Double {
+        Double(bitPattern: asBoxedBits(runtime))
     }
 
     func asBoolean2() -> Bool {
@@ -607,8 +635,25 @@ extension VMRuntime {
     /// Reads a Kotlin `List`. `kotlinx.serialization.json.JsonArray` *is* a
     /// `List<JsonElement>` on the JVM, so a JSON array resolves to a read-only
     /// view of its tree; every collection helper goes through here.
+    ///
+    /// jsoup's `Elements` is a `java.util.List` too. Its payload is the node
+    /// list, so without this branch a Kotlin `List`-typed overload (for
+    /// example `CollectionsKt.dropLast(List, int)`, which the compiler picks
+    /// over the `Iterable` one whenever the receiver is an `Elements`) saw an
+    /// empty list and returned no items. The view is read-only: jsoup rebuilds
+    /// the node list through its own methods.
     func listPayload(_ value: VMValue) -> VMListPayload? {
         if let list: VMListPayload = payload(value, as: VMListPayload.self) { return list }
+        if let nodes: JElementsPayload = payload(value, as: JElementsPayload.self) {
+            if let cached = nodes.listView, arenaCacheHolds(nodes.listViewSlot, cached) { return cached }
+            let created = VMListPayload(
+                nodes.nodes.map { makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: $0, document: nodes.document)) },
+                immutable: true
+            )
+            nodes.listView = created
+            nodes.listViewSlot = arenaCacheSlot(created)
+            return created
+        }
         guard let tree: VMJsonTree = payload(value, as: VMJsonTree.self),
               case .array(let elements) = tree.kind else { return nil }
         if let cached = tree.listView, arenaCacheHolds(tree.listViewSlot, cached) { return cached }
@@ -695,11 +740,6 @@ extension VMRuntime {
         if let map = mapPayload(value) {
             return map.entries.map { makeNative("Ljava/util/MapEntry;", payload: VMEntryPayload(key: $0.key, value: $0.value)) }
         }
-        if let elements: JElementsPayload = payload(value, as: JElementsPayload.self) {
-            return elements.nodes.map { node in
-                makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: elements.document))
-            }
-        }
         return nil
     }
 
@@ -708,7 +748,7 @@ extension VMRuntime {
     /// that are already primitive are returned unchanged, so array conversions
     /// can accept both representations.
     func unboxedPrimitive(_ value: VMValue) -> VMValue {
-        guard value.object != nil else { return value }
+        guard isObjectValue(value) else { return value }
         return VMValue(bits: value.asBoxedBits(self))
     }
 

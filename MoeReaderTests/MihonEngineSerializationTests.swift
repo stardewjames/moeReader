@@ -33,6 +33,49 @@ final class MihonEngineSerializationTests: XCTestCase {
         XCTAssertEqual(result.first?["number"] as? Int, 7)
     }
 
+    /// Absent JSON keys must not be reported as decoded elements: the
+    /// generated synthetic-constructor mask would treat the field as seen and
+    /// pass `null` instead of the property's default (`emptyList()` for a
+    /// `List<T>` with a default). Aliases count as the element being present.
+    func testJsonDecoderReportsOnlyPresentElements() throws {
+        let runtime = VMRuntime()
+        let descriptor = VMSerialDescriptorPayload(serialName: "Probe")
+        descriptor.appendElement("first", optional: true)
+        descriptor.appendElement("second", optional: true)
+        descriptor.appendElement("required", optional: false)
+        descriptor.aliases[1] = ["secondAlias"]
+        let descriptorValue = runtime.makeNative(
+            "Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;",
+            payload: descriptor
+        )
+        func indices(_ tree: VMJsonTree) throws -> [Int32] {
+            let composite = runtime.makeNative(
+                "Lkotlinx/serialization/json/JsonCompositeDecoder;",
+                payload: VMJsonDecoderPayload(tree: tree, descriptor: descriptor, isComposite: true)
+            )
+            let method = try XCTUnwrap(
+                runtime.classOf(composite)?.lookupVirtual(
+                    key: "decodeElementIndex(Lkotlinx/serialization/descriptors/SerialDescriptor;)I"
+                )
+            )
+            var result: [Int32] = []
+            while true {
+                let index = try runtime.invoke(method, [composite, descriptorValue]).asInt32
+                if index == -1 { return result }
+                result.append(index)
+                if result.count > 10 { return result }
+            }
+        }
+
+        let partial = VMJsonTree(.object(["first": VMJsonTree(.number("1")), "unknown": VMJsonTree(.bool(true))]))
+        XCTAssertEqual(try indices(partial), [0, 2])
+        let aliased = VMJsonTree(.object(["secondAlias": VMJsonTree(.string("x"))]))
+        XCTAssertEqual(try indices(aliased), [1, 2])
+        // Required elements stay tolerated when absent (zero/null value).
+        let empty = VMJsonTree(.object([:]))
+        XCTAssertEqual(try indices(empty), [2])
+    }
+
     /// Map keys are data: a Kotlin `Map<String, …>` may hold tag names that
     /// end in a backslash or contain quotes/control characters. `jsonText`
     /// must escape keys exactly like values or the cached JSON is invalid.

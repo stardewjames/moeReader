@@ -87,6 +87,13 @@ final class JNode {
         return result
     }
 
+    /// jsoup's `Collector` starts at the receiver, so `Element.getElements*`
+    /// and `getAllElements` include the element itself before its descendants.
+    /// `Document` is included the same way (its `#root` node leads the result).
+    func selfAndDescendants() -> [JNode] {
+        [self] + descendants()
+    }
+
     func textContent(ownOnly: Bool = false) -> String {
         var output = ""
         for child in children {
@@ -215,6 +222,12 @@ final class JElementPayload {
 final class JElementsPayload {
     let nodes: [JNode]
     let document: JDocumentPayload
+    /// Read-only `java.util.List` view handed to Kotlin/java.util collection
+    /// helpers. Cached like the `JsonArray` view: repeated helper calls over
+    /// the same `Elements` stay linear, and the slot proves the cached
+    /// `VMValue`s still address live objects after an arena reset.
+    var listView: VMListPayload?
+    var listViewSlot = -1
     init(nodes: [JNode], document: JDocumentPayload) {
         self.nodes = nodes
         self.document = document
@@ -912,7 +925,15 @@ struct JsoupSelector {
     }
 
     static func select(groups: [Complex], context: Context) throws -> [JNode] {
-        let candidates = context.root.descendants()
+        // jsoup's `Element.select` starts at the element itself: a receiver
+        // that matches the query is part of the result ("Matched elements may
+        // include this element, or any of its children"). Parsers rely on it
+        // when a selector matches the image element directly and then reads
+        // `selectFirst("img")` from each result.
+        var candidates = context.root.descendants()
+        if context.root.isElement {
+            candidates.insert(context.root, at: 0)
+        }
         var selected = Set<ObjectIdentifier>()
         var result: [JNode] = []
         for group in groups {
@@ -972,6 +993,11 @@ struct JsoupSelector {
         var buffer = ""
         var bracketDepth = 0
         var parenDepth = 0
+        /// Attribute values and pseudo arguments may contain `[`, `]` or `)`
+        /// inside quotes; jsoup does not count those as structure. An
+        /// attribute selector such as `input[name="chapter_ids[]"]` otherwise
+        /// closed its bracket on the `]` inside the quoted value.
+        var quote: Character?
         var pendingCombinator: Character?
         let characters = Array(selector)
         var index = 0
@@ -990,6 +1016,18 @@ struct JsoupSelector {
 
         while index < characters.count {
             let character = characters[index]
+            if let opening = quote {
+                buffer.append(character)
+                if character == opening { quote = nil }
+                index += 1
+                continue
+            }
+            if bracketDepth > 0 || parenDepth > 0, character == "\"" || character == "'" {
+                quote = character
+                buffer.append(character)
+                index += 1
+                continue
+            }
             if character == "[" { bracketDepth += 1; buffer.append(character); index += 1; continue }
             if character == "]" { bracketDepth = max(0, bracketDepth - 1); buffer.append(character); index += 1; continue }
             if character == "(" { parenDepth += 1; buffer.append(character); index += 1; continue }
@@ -1042,7 +1080,22 @@ struct JsoupSelector {
             case "#", ".", "[", ":":
                 if mode == "t" { flushTag() }
                 if character == "[" {
-                    guard let end = text[index...].firstIndex(of: "]") else {
+                    var cursor = text.index(after: index)
+                    var opening: Character?
+                    var end: String.Index?
+                    while cursor < text.endIndex {
+                        let inner = text[cursor]
+                        if let quoted = opening {
+                            if inner == quoted { opening = nil }
+                        } else if inner == "\"" || inner == "'" {
+                            opening = inner
+                        } else if inner == "]" {
+                            end = cursor
+                            break
+                        }
+                        cursor = text.index(after: cursor)
+                    }
+                    guard let end else {
                         index = text.index(after: index)
                         continue
                     }
@@ -1800,13 +1853,13 @@ enum JsoupRuntime {
         }
         element.method("getAllElements", "()Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
-            let nodes = [payload.node] + payload.node.descendants()
+            let nodes = payload.node.selfAndDescendants()
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsContainingText", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let needle = (runtime.stringValue(args[1]) ?? "").lowercased()
-            let nodes = payload.node.descendants().filter { $0.textContent().lowercased().contains(needle) }
+            let nodes = payload.node.selfAndDescendants().filter { $0.textContent().lowercased().contains(needle) }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("wholeOwnText", "()Ljava/lang/String;") { runtime, args, _ in
@@ -1847,19 +1900,19 @@ enum JsoupRuntime {
         element.method("getElementById", "(Ljava/lang/String;)Lorg/jsoup/nodes/Element;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let id = runtime.stringValue(args[1]) ?? ""
-            guard let node = payload.node.descendants().first(where: { $0.attribute("id") == id }) else { return .null }
+            guard let node = payload.node.selfAndDescendants().first(where: { $0.attribute("id") == id }) else { return .null }
             return runtime.makeNative("Lorg/jsoup/nodes/Element;", payload: JElementPayload(node: node, document: payload.document))
         }
         element.method("getElementsByTag", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let tag = (runtime.stringValue(args[1]) ?? "").lowercased()
-            let nodes = payload.node.descendants().filter { $0.tag.lowercased() == tag }
+            let nodes = payload.node.selfAndDescendants().filter { $0.tag.lowercased() == tag }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByClass", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let className = runtime.stringValue(args[1]) ?? ""
-            let nodes = payload.node.descendants().filter { node in
+            let nodes = payload.node.selfAndDescendants().filter { node in
                 (node.attribute("class") ?? "").split(whereSeparator: { $0.isWhitespace }).contains(Substring(className))
             }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
@@ -1867,13 +1920,13 @@ enum JsoupRuntime {
         element.method("getElementsByAttribute", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
-            let nodes = payload.node.descendants().filter { $0.attribute(name) != nil }
+            let nodes = payload.node.selfAndDescendants().filter { $0.attribute(name) != nil }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByAttributeStarting", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let prefix = (runtime.stringValue(args[1]) ?? "").lowercased()
-            let nodes = payload.node.descendants().filter { node in
+            let nodes = payload.node.selfAndDescendants().filter { node in
                 node.attributes.contains { $0.0.lowercased().hasPrefix(prefix) }
             }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
@@ -1882,35 +1935,35 @@ enum JsoupRuntime {
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
             let value = runtime.stringValue(args[2]) ?? ""
-            let nodes = payload.node.descendants().filter { $0.attribute(name) == value }
+            let nodes = payload.node.selfAndDescendants().filter { $0.attribute(name) == value }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByAttributeValueNot", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
             let value = runtime.stringValue(args[2]) ?? ""
-            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "") != value }
+            let nodes = payload.node.selfAndDescendants().filter { ($0.attribute(name) ?? "") != value }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByAttributeValueContaining", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
             let value = runtime.stringValue(args[2]) ?? ""
-            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "").contains(value) }
+            let nodes = payload.node.selfAndDescendants().filter { ($0.attribute(name) ?? "").contains(value) }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByAttributeValueStarting", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
             let value = runtime.stringValue(args[2]) ?? ""
-            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "").hasPrefix(value) }
+            let nodes = payload.node.selfAndDescendants().filter { ($0.attribute(name) ?? "").hasPrefix(value) }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByAttributeValueEnding", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             let name = runtime.stringValue(args[1]) ?? ""
             let value = runtime.stringValue(args[2]) ?? ""
-            let nodes = payload.node.descendants().filter { ($0.attribute(name) ?? "").hasSuffix(value) }
+            let nodes = payload.node.selfAndDescendants().filter { ($0.attribute(name) ?? "").hasSuffix(value) }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         element.method("getElementsByAttributeValueMatching", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
@@ -1919,7 +1972,7 @@ enum JsoupRuntime {
             guard let expression = try? NSRegularExpression(pattern: runtime.stringValue(args[2]) ?? "") else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;")
             }
-            let nodes = payload.node.descendants().filter { node in
+            let nodes = payload.node.selfAndDescendants().filter { node in
                 guard let value = node.attribute(name) else { return false }
                 return expression.firstMatch(in: value, range: NSRange(value.startIndex..<value.endIndex, in: value)) != nil
             }
@@ -2128,8 +2181,18 @@ enum JsoupRuntime {
         }
         elements.method("select", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
+            let selector = runtime.stringValue(args[1]) ?? ""
             var nodes: [JNode] = []
-            for root in payload.nodes { nodes.append(contentsOf: try JsoupSelector.select(root, selector: runtime.stringValue(args[1]) ?? "", runtime: runtime)) }
+            // Each root includes itself, so overlapping roots (a parent and its
+            // child in the same collection) would repeat matches; jsoup keeps
+            // the first occurrence, in root order.
+            var seen = Set<ObjectIdentifier>()
+            for root in payload.nodes {
+                for node in try JsoupSelector.select(root, selector: selector, runtime: runtime)
+                where seen.insert(ObjectIdentifier(node)).inserted {
+                    nodes.append(node)
+                }
+            }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         elements.method("text", "()Ljava/lang/String;") { runtime, args, _ in
@@ -2212,7 +2275,13 @@ enum JsoupRuntime {
             guard let payload: JElementsPayload = runtime.payload(args[0], as: JElementsPayload.self) else { return .null }
             let selector = runtime.payload(args[1], as: JEvaluatorPayload.self)?.selector ?? ""
             var nodes: [JNode] = []
-            for root in payload.nodes { nodes.append(contentsOf: try JsoupSelector.select(root, selector: selector, runtime: runtime)) }
+            var seen = Set<ObjectIdentifier>()
+            for root in payload.nodes {
+                for node in try JsoupSelector.select(root, selector: selector, runtime: runtime)
+                where seen.insert(ObjectIdentifier(node)).inserted {
+                    nodes.append(node)
+                }
+            }
             return runtime.makeNative("Lorg/jsoup/select/Elements;", payload: JElementsPayload(nodes: nodes, document: payload.document))
         }
         elements.method("append", "(Ljava/lang/String;)Lorg/jsoup/select/Elements;") { runtime, args, _ in

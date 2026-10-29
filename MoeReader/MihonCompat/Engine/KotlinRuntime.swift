@@ -359,6 +359,34 @@ enum KotlinRuntime {
         return result
     }
 
+    // MARK: - kotlin.collections.addAll
+
+    /// `CollectionsKt.addAll` is declared on `MutableCollection`, so the
+    /// destination is often a `Set`: extensions gather the elements matching a
+    /// detail row into a `LinkedHashSet` and pass that set here. Appending
+    /// through the list helper gave the set a fresh empty list payload, so the
+    /// set stayed empty and every later `get(key)` returned null. Route by
+    /// payload type and keep `Set`'s duplicate suppression.
+    private static func append(_ runtime: VMRuntime, to destination: VMValue, _ contents: [VMValue]) throws -> VMValue {
+        // Map-backed views reject structural adds on the JVM.
+        if runtime.payload(destination, as: VMKeySetViewPayload.self) != nil
+            || runtime.payload(destination, as: VMValuesViewPayload.self) != nil
+            || runtime.payload(destination, as: VMEntrySetPayload.self) != nil {
+            throw VMJavaException("Ljava/lang/UnsupportedOperationException;")
+        }
+        if let set: VMSetPayload = runtime.payload(destination, as: VMSetPayload.self) {
+            if set.immutable { throw VMJavaException("Ljava/lang/UnsupportedOperationException;") }
+            var added = false
+            for item in contents where !set.items.contains(where: { runtime.javaEquals($0, item) }) {
+                set.items.append(item)
+                added = true
+            }
+            return .boolean(added)
+        }
+        try runtime.mutableList(destination).items.append(contentsOf: contents)
+        return .boolean(!contents.isEmpty)
+    }
+
     // MARK: - kotlin.Unit, Intrinsics, Result
 
     private static func coreClasses() -> [NativeClass] {
@@ -515,6 +543,12 @@ enum KotlinRuntime {
             let pointer = runtime.allocateObject(cls)
             VMObjectLayout.setAux(pointer, args[0].asBoolean ? 1 : 0)
             return .reference(pointer)
+        }
+        boxing.staticMethod("boxByte", "(B)Ljava/lang/Byte;") { runtime, args, _ in
+            runtime.boxByte(Int8(truncatingIfNeeded: args[0].asInt32))
+        }
+        boxing.staticMethod("boxShort", "(S)Ljava/lang/Short;") { runtime, args, _ in
+            runtime.boxShort(Int16(truncatingIfNeeded: args[0].asInt32))
         }
         boxing.staticMethod("boxInt", "(I)Ljava/lang/Integer;") { runtime, args, _ in runtime.boxInt(args[0].asInt32) }
         boxing.staticMethod("boxLong", "(J)Ljava/lang/Long;") { runtime, args, _ in runtime.boxLong(args[0].asInt64) }
@@ -1144,14 +1178,10 @@ enum KotlinRuntime {
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items, immutable: true))
         }
         collections.staticMethod("addAll", "(Ljava/util/Collection;Ljava/lang/Iterable;)Z") { runtime, args, _ in
-            let incoming = runtime.listItems(args[1]) ?? []
-            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
-            return .boolean(!incoming.isEmpty)
+            try KotlinRuntime.append(runtime, to: args[0], runtime.listItems(args[1]) ?? [])
         }
         collections.staticMethod("addAll", "(Ljava/util/Collection;Ljava/util/Collection;)Z") { runtime, args, _ in
-            let incoming = runtime.listItems(args[1]) ?? []
-            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
-            return .boolean(!incoming.isEmpty)
+            try KotlinRuntime.append(runtime, to: args[0], runtime.listItems(args[1]) ?? [])
         }
         collections.staticMethod("emptyList", "()Ljava/util/List;") { runtime, _, _ in
             runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload([], immutable: true))
@@ -1335,14 +1365,14 @@ enum KotlinRuntime {
         }
         collections.staticMethod("filter", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Ljava/util/List;") { runtime, args, _ in
             var output: [VMValue] = []
-            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(try runtime.callFunction(args[1], [item])) {
+            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) {
                 output.append(item)
             }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output))
         }
         collections.staticMethod("filterNot", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Ljava/util/List;") { runtime, args, _ in
             var output: [VMValue] = []
-            for item in runtime.listItems(args[0]) ?? [] where !(predicateTruth(try runtime.callFunction(args[1], [item]))) {
+            for item in runtime.listItems(args[0]) ?? [] where !(predicateTruth(runtime, try runtime.callFunction(args[1], [item]))) {
                 output.append(item)
             }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output))
@@ -1352,40 +1382,40 @@ enum KotlinRuntime {
             return .zero
         }
         collections.staticMethod("any", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
-            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(try runtime.callFunction(args[1], [item])) {
+            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) {
                 return .boolean(true)
             }
             return .boolean(false)
         }
         collections.staticMethod("all", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
-            for item in runtime.listItems(args[0]) ?? [] where !(predicateTruth(try runtime.callFunction(args[1], [item]))) {
+            for item in runtime.listItems(args[0]) ?? [] where !(predicateTruth(runtime, try runtime.callFunction(args[1], [item]))) {
                 return .boolean(false)
             }
             return .boolean(true)
         }
         collections.staticMethod("none", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
-            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(try runtime.callFunction(args[1], [item])) {
+            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) {
                 return .boolean(false)
             }
             return .boolean(true)
         }
         collections.staticMethod("count", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)I") { runtime, args, _ in
             var count = 0
-            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(try runtime.callFunction(args[1], [item])) { count += 1 }
+            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) { count += 1 }
             return .int32(Int32(count))
         }
         collections.staticMethod("indexOfFirst", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)I") { runtime, args, _ in
-            for (index, item) in (runtime.listItems(args[0]) ?? []).enumerated() where predicateTruth(try runtime.callFunction(args[1], [item])) {
+            for (index, item) in (runtime.listItems(args[0]) ?? []).enumerated() where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) {
                 return .int32(Int32(index))
             }
             return .int32(-1)
         }
         collections.staticMethod("find", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Ljava/lang/Object;") { runtime, args, _ in
-            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(try runtime.callFunction(args[1], [item])) { return item }
+            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) { return item }
             return .null
         }
         collections.staticMethod("firstOrNull", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Ljava/lang/Object;") { runtime, args, _ in
-            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(try runtime.callFunction(args[1], [item])) { return item }
+            for item in runtime.listItems(args[0]) ?? [] where predicateTruth(runtime, try runtime.callFunction(args[1], [item])) { return item }
             return .null
         }
         collections.staticMethod("sorted", "(Ljava/lang/Iterable;)Ljava/util/List;") { runtime, args, _ in
@@ -1465,7 +1495,7 @@ enum KotlinRuntime {
         collections.staticMethod("filterIndexed", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function2;)Ljava/util/List;") { runtime, args, _ in
             var output: [VMValue] = []
             for (index, item) in (runtime.listItems(args[0]) ?? []).enumerated()
-            where predicateTruth(try runtime.callFunction(args[1], [runtime.boxInt(Int32(index)), item])) {
+            where predicateTruth(runtime, try runtime.callFunction(args[1], [runtime.boxInt(Int32(index)), item])) {
                 output.append(item)
             }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(output))
@@ -1834,7 +1864,7 @@ enum KotlinRuntime {
             var kept: [VMValue] = []
             kept.reserveCapacity(list.items.count)
             for item in list.items {
-                if predicateTruth(try runtime.callFunction(args[1], [item])) {
+                if predicateTruth(runtime, try runtime.callFunction(args[1], [item])) {
                     removed = true
                 } else {
                     kept.append(item)
@@ -1927,16 +1957,14 @@ enum KotlinRuntime {
             return .int32(Int32(-(low + 1)))
         }
         collections.staticMethod("addAll", "(Ljava/util/Collection;Lkotlin/sequences/Sequence;)Z") { runtime, args, _ in
-            let incoming = runtime.sequenceValues(args[1])
-            try runtime.mutableList(args[0]).items.append(contentsOf: incoming)
-            return .boolean(!incoming.isEmpty)
+            try KotlinRuntime.append(runtime, to: args[0], runtime.sequenceValues(args[1]))
         }
         collections.staticMethod("removeAll", "(Ljava/lang/Iterable;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
             let target = try runtime.mutableList(args[0])
             var removed = false
             var kept: [VMValue] = []
             for item in target.items {
-                if predicateTruth(try runtime.callFunction(args[1], [item])) {
+                if predicateTruth(runtime, try runtime.callFunction(args[1], [item])) {
                     removed = true
                 } else {
                     kept.append(item)
@@ -1947,7 +1975,7 @@ enum KotlinRuntime {
         }
         collections.staticMethod("retainAll", "(Ljava/util/List;Lkotlin/jvm/functions/Function1;)Z") { runtime, args, _ in
             let target = try runtime.mutableList(args[0])
-            let kept = try target.items.filter { predicateTruth(try runtime.callFunction(args[1], [$0])) }
+            let kept = try target.items.filter { predicateTruth(runtime, try runtime.callFunction(args[1], [$0])) }
             let changed = kept.count != target.items.count
             target.items = kept
             return .boolean(changed)
@@ -2053,7 +2081,7 @@ enum KotlinRuntime {
         maps.staticMethod("filterKeys", "(Ljava/util/Map;Lkotlin/jvm/functions/Function1;)Ljava/util/Map;") { runtime, args, _ in
             var output: [(key: VMValue, value: VMValue)] = []
             for entry in runtime.mapPayload(args[0])?.entries ?? []
-            where predicateTruth(try runtime.callFunction(args[1], [entry.key])) {
+            where predicateTruth(runtime, try runtime.callFunction(args[1], [entry.key])) {
                 output.append(entry)
             }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
@@ -2061,7 +2089,7 @@ enum KotlinRuntime {
         maps.staticMethod("filterValues", "(Ljava/util/Map;Lkotlin/jvm/functions/Function1;)Ljava/util/Map;") { runtime, args, _ in
             var output: [(key: VMValue, value: VMValue)] = []
             for entry in runtime.mapPayload(args[0])?.entries ?? []
-            where predicateTruth(try runtime.callFunction(args[1], [entry.value])) {
+            where predicateTruth(runtime, try runtime.callFunction(args[1], [entry.value])) {
                 output.append(entry)
             }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
@@ -2070,7 +2098,7 @@ enum KotlinRuntime {
             var output: [(key: VMValue, value: VMValue)] = []
             for entry in runtime.mapPayload(args[0])?.entries ?? [] {
                 let mapEntry = runtime.makeNative("Ljava/util/MapEntry;", payload: VMEntryPayload(key: entry.key, value: entry.value))
-                if predicateTruth(try runtime.callFunction(args[1], [mapEntry])) { output.append(entry) }
+                if predicateTruth(runtime, try runtime.callFunction(args[1], [mapEntry])) { output.append(entry) }
             }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(output))
         }
@@ -2191,10 +2219,13 @@ enum KotlinRuntime {
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
         }
         maps.staticMethod("asSequence", "(Ljava/util/Map;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
-            let pairs = (runtime.mapPayload(args[0])?.entries ?? []).map { entry in
-                runtime.makeNative("Lkotlin/Pair;", payload: VMPairPayload(first: entry.key, second: entry.value))
+            // `Map.asSequence()` is `entries.asSequence()`: a `Sequence<Map.Entry>`,
+            // not a sequence of `Pair`s. Extensions downstream destructure the
+            // entries and cast them back to `Map.Entry`.
+            let entries = (runtime.mapPayload(args[0])?.entries ?? []).map { entry in
+                runtime.makeNative("Ljava/util/MapEntry;", payload: VMEntryPayload(key: entry.key, value: entry.value))
             }
-            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(pairs))
+            return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(entries))
         }
         maps.staticMethod("toMap", "(Ljava/lang/Iterable;Ljava/util/Map;)Ljava/util/Map;") { runtime, args, _ in
             var entries = runtime.mapPayload(args[1])?.entries ?? []
@@ -2747,7 +2778,7 @@ enum KotlinRuntime {
             let effective = limit <= 0 ? all : Array(all.prefix(limit))
             var parts: [String] = []
             for slot in effective {
-                let boxed = runtime.boxInt(slot.asInt32)
+                let boxed = runtime.boxByte(Int8(truncatingIfNeeded: slot.asInt32))
                 let value = transform.bits == 0 ? boxed : try runtime.callFunction(transform, [boxed])
                 parts.append(runtime.stringValue(runtime.javaToString(value)) ?? "null")
             }
@@ -2819,7 +2850,7 @@ enum KotlinRuntime {
             guard count >= 0 else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested element count \(count) is less than zero.")
             }
-            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            let items = arraySlots(runtime, args[0]).map { runtime.boxByte(Int8(truncatingIfNeeded: $0.asInt32)) }
             return runtime.makeNative(
                 "Ljava/util/ArrayList;",
                 payload: VMListPayload(count >= items.count ? items : Array(items.prefix(count)), immutable: true)
@@ -2830,14 +2861,14 @@ enum KotlinRuntime {
             guard count >= 0 else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Requested element count \(count) is less than zero.")
             }
-            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            let items = arraySlots(runtime, args[0]).map { runtime.boxByte(Int8(truncatingIfNeeded: $0.asInt32)) }
             return runtime.makeNative(
                 "Ljava/util/ArrayList;",
                 payload: VMListPayload(count >= items.count ? [] : Array(items.dropFirst(count)), immutable: true)
             )
         }
         arrays.staticMethod("toList", "([B)Ljava/util/List;") { runtime, args, _ in
-            let items = arraySlots(runtime, args[0]).map { runtime.boxInt($0.asInt32) }
+            let items = arraySlots(runtime, args[0]).map { runtime.boxByte(Int8(truncatingIfNeeded: $0.asInt32)) }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items, immutable: true))
         }
         arrays.staticMethod("getIndices", "([B)Lkotlin/ranges/IntRange;") { runtime, args, _ in
@@ -2847,7 +2878,7 @@ enum KotlinRuntime {
             .int32(Int32(runtime.arrayLength(args[0]) - 1))
         }
         arrays.staticMethod("slice", "([BLkotlin/ranges/IntRange;)Ljava/util/List;") { runtime, args, _ in
-            let items = try rangeSlots(runtime, args[0], args[1]).map { runtime.boxInt($0.asInt32) }
+            let items = try rangeSlots(runtime, args[0], args[1]).map { runtime.boxByte(Int8(truncatingIfNeeded: $0.asInt32)) }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(items))
         }
         arrays.staticMethod("slice", "([Ljava/lang/Object;Lkotlin/ranges/IntRange;)Ljava/util/List;") { runtime, args, _ in
@@ -4372,7 +4403,7 @@ enum KotlinRuntime {
         }
         sequences.staticMethod("filter", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
             var output: [VMValue] = []
-            for value in runtime.sequenceValues(args[0]) where predicateTruth(try runtime.callFunction(args[1], [value])) {
+            for value in runtime.sequenceValues(args[0]) where predicateTruth(runtime, try runtime.callFunction(args[1], [value])) {
                 output.append(value)
             }
             return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
@@ -4425,7 +4456,7 @@ enum KotlinRuntime {
         sequences.staticMethod("filterIndexed", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function2;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
             var output: [VMValue] = []
             for (index, value) in runtime.sequenceValues(args[0]).enumerated()
-            where predicateTruth(try runtime.callFunction(args[1], [runtime.boxInt(Int32(index)), value])) {
+            where predicateTruth(runtime, try runtime.callFunction(args[1], [runtime.boxInt(Int32(index)), value])) {
                 output.append(value)
             }
             return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
@@ -4492,7 +4523,7 @@ enum KotlinRuntime {
         }
         sequences.staticMethod("filterNot", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
             var output: [VMValue] = []
-            for value in runtime.sequenceValues(args[0]) where !predicateTruth(try runtime.callFunction(args[1], [value])) {
+            for value in runtime.sequenceValues(args[0]) where !predicateTruth(runtime, try runtime.callFunction(args[1], [value])) {
                 output.append(value)
             }
             return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
@@ -4625,7 +4656,7 @@ enum KotlinRuntime {
         sequences.staticMethod("takeWhile", "(Lkotlin/sequences/Sequence;Lkotlin/jvm/functions/Function1;)Lkotlin/sequences/Sequence;") { runtime, args, _ in
             var output: [VMValue] = []
             for value in runtime.sequenceValues(args[0]) {
-                if !predicateTruth(try runtime.callFunction(args[1], [value])) { break }
+                if !predicateTruth(runtime, try runtime.callFunction(args[1], [value])) { break }
                 output.append(value)
             }
             return runtime.makeNative("Lkotlin/sequences/SequenceImpl;", payload: VMSequencePayload(output))
@@ -4930,6 +4961,20 @@ extension VMRuntime {
         return .reference(pointer)
     }
 
+    func boxByte(_ value: Int8) -> VMValue {
+        guard let cls = findClass("Ljava/lang/Byte;") else { return .null }
+        let pointer = allocateObject(cls)
+        VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(value))
+        return .reference(pointer)
+    }
+
+    func boxShort(_ value: Int16) -> VMValue {
+        guard let cls = findClass("Ljava/lang/Short;") else { return .null }
+        let pointer = allocateObject(cls)
+        VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(value))
+        return .reference(pointer)
+    }
+
     func boxLong(_ value: Int64) -> VMValue {
         guard let cls = findClass("Ljava/lang/Long;") else { return .null }
         let pointer = allocateObject(cls)
@@ -5223,9 +5268,11 @@ private func matchRangeValue(_ runtime: VMRuntime, range: NSRange?) -> VMValue {
 // MARK: - Kotlin predicate results
 
 /// Kotlin lambdas return a boxed `java.lang.Boolean`; primitives appear only
-/// for internal helpers. Read both representations correctly.
-private func predicateTruth(_ value: VMValue) -> Bool {
-    value.object != nil ? value.asBoolean2() : value.asBoolean
+/// for internal helpers. Read both representations correctly: `object` is
+/// non-nil for any non-zero cell, so a primitive `1` must be caught by the
+/// heap check before the payload word is dereferenced.
+private func predicateTruth(_ runtime: VMRuntime, _ value: VMValue) -> Bool {
+    runtime.isObjectValue(value) ? value.asBoolean2() : value.asBoolean
 }
 
 // MARK: - Kotlin string primitives

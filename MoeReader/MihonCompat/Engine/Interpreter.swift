@@ -14,7 +14,12 @@ extension VMRuntime {
     @discardableResult
     func execute(method: VMMethod, code: DexCode, arguments: UnsafePointer<VMValue>, argumentCount: Int) throws -> VMValue {
         let registerCount = code.registersSize
-        guard registerCount > 0, registerCount <= 0xFFFF else {
+        // A zero-sized register file is legal: `static void f() { }` (and the
+        // empty `<clinit>` d8 emits for some R8 output) has no parameters and
+        // no locals, so the dex format writes `registers_size == 0` next to a
+        // single `return-void`. The heap still hands back one 8-byte cell, so
+        // `registers` is a valid pointer even when nothing can address it.
+        guard registerCount >= 0, registerCount <= 0xFFFF else {
             throw VMError.corrupt("bad register count \(registerCount)")
         }
 
@@ -50,7 +55,7 @@ extension VMRuntime {
         var lastOpcode = 0
 
         func failure(_ descriptor: String, _ message: String? = nil) -> VMJavaException {
-            let detail = "\(method.key) at pc \(lastPC) op=0x\(String(lastOpcode, radix: 16)) regs=\(registerCount)" + (message.map { ": \($0)" } ?? "")
+            let detail = "\(callerOwner).\(method.key) at pc \(lastPC) op=0x\(String(lastOpcode, radix: 16)) regs=\(registerCount)" + (message.map { ": \($0)" } ?? "")
             return VMJavaException(descriptor, detail)
         }
 
@@ -323,7 +328,7 @@ extension VMRuntime {
                     guard size >= 0, width <= 8, copyCount * width <= available else {
                         throw VMError.corrupt("fill-array-data payload out of bounds")
                     }
-                    let data = UnsafeRawPointer(code.insns) + (payload + 4) * 2
+                    let data = code.insns + (payload + 4) * 2
                     for index in 0..<copyCount {
                         var value: UInt64 = 0
                         for byte in 0..<width {

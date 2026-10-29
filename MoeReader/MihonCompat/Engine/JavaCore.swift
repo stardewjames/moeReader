@@ -17,6 +17,7 @@ enum JavaCore {
         result += stringBuilderClass()
         result += stringBufferClass()
         result += charSequenceClass()
+        result += annotationClass()
         result += comparableClass()
         result += numberClass()
         result += iterableClass()
@@ -116,6 +117,21 @@ enum JavaCore {
         cls.method("charAt", "(I)C") { _, _, _ in .int32(0) }
         cls.method("toString", "()Ljava/lang/String;") { _, _, _ in .null }
         cls.method("subSequence", "(II)Ljava/lang/CharSequence;") { _, _, _ in .null }
+        return [cls]
+    }
+
+    /// `java.lang.annotation.Annotation`: the engine never implements the
+    /// reflective members, but serialization descriptors hand annotation
+    /// instances around as `Annotation` and cast them before reading a plugin
+    /// annotation (`@ProtoNumber`, `@JsonNames`).
+    private static func annotationClass() -> [NativeClass] {
+        let cls = NativeClass(
+            "Ljava/lang/annotation/Annotation;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        cls.method("annotationType", "()Ljava/lang/Class;") { _, _, _ in .null }
         return [cls]
     }
 
@@ -918,9 +934,9 @@ enum JavaCore {
             if let pointer = args[0].object { VMObjectLayout.setAux(pointer, args[1].asBoolean ? 1 : 0) }
             return .zero
         }
-        cls.method("booleanValue", "()Z") { _, args, _ in .boolean(args[0].asBoolean2()) }
+        cls.method("booleanValue", "()Z") { runtime, args, _ in .boolean(args[0].asBoxedBoolean(runtime)) }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
-            runtime.newString(args[0].asBoolean2() ? "true" : "false")
+            runtime.newString(args[0].asBoxedBoolean(runtime) ? "true" : "false")
         }
         cls.staticMethod("valueOf", "(Z)Ljava/lang/Boolean;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Boolean;") else { return .null }
@@ -934,12 +950,12 @@ enum JavaCore {
             let left = args[0].asBoolean ? 1 : 0, right = args[1].asBoolean ? 1 : 0
             return .int32(Int32(left - right))
         }
-        cls.method("hashCode", "()I") { _, args, _ in .int32(args[0].asBoolean2() ? 1231 : 1237) }
+        cls.method("hashCode", "()I") { runtime, args, _ in .int32(args[0].asBoxedBoolean(runtime) ? 1231 : 1237) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Boolean;" else {
                 return .boolean(false)
             }
-            return .boolean(args[0].asBoolean2() == args[1].asBoolean2())
+            return .boolean(args[0].asBoxedBoolean(runtime) == args[1].asBoxedBoolean(runtime))
         }
         return [cls]
     }
@@ -1210,22 +1226,26 @@ enum JavaCore {
             if let pointer = args[0].object { VMObjectLayout.setAux(pointer, UInt64(args[1].asUInt32)) }
             return .zero
         }
-        cls.method("charValue", "()C") { _, args, _ in .int32(Int32(truncatingIfNeeded: args[0].asChar())) }
+        cls.method("charValue", "()C") { runtime, args, _ in
+            .int32(Int32(args[0].asBoxedChar(runtime)))
+        }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Character;" else {
                 return .boolean(false)
             }
-            return .boolean(args[0].asChar() == args[1].asChar())
+            return .boolean(args[0].asBoxedChar(runtime) == args[1].asBoxedChar(runtime))
         }
-        cls.method("hashCode", "()I") { _, args, _ in .int32(Int32(args[0].asChar())) }
-        cls.method("compareTo", "(Ljava/lang/Character;)I") { _, args, _ in
-            .int32(Int32(args[0].asChar()) - Int32(args[1].asChar()))
+        cls.method("hashCode", "()I") { runtime, args, _ in .int32(Int32(args[0].asBoxedChar(runtime))) }
+        cls.method("compareTo", "(Ljava/lang/Character;)I") { runtime, args, _ in
+            .int32(Int32(args[0].asBoxedChar(runtime)) - Int32(args[1].asBoxedChar(runtime)))
         }
+        // `(C)` parameters are primitive cells: their bits are the code unit,
+        // not a heap address, so they must never be unboxed.
         cls.staticMethod("compare", "(CC)I") { _, args, _ in
-            .int32(Int32(args[0].asChar()) - Int32(args[1].asChar()))
+            .int32(Int32(bitPattern: args[0].asUInt32 &- args[1].asUInt32))
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
-            runtime.newString(String(UnicodeScalar(UInt32(args[0].asChar())) ?? " "))
+            runtime.newString(String(UnicodeScalar(UInt32(args[0].asBoxedChar(runtime))) ?? " "))
         }
         cls.staticMethod("valueOf", "(C)Ljava/lang/Character;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Character;") else { return .null }
@@ -1272,20 +1292,20 @@ enum JavaCore {
             return .int32(Int32(text.utf16.first ?? 0))
         }
         cls.staticMethod("isHighSurrogate", "(C)Z") { _, args, _ in
-            let value = args[0].asChar()
+            let value = args[0].asUInt32
             return .boolean(value >= 0xD800 && value <= 0xDBFF)
         }
         cls.staticMethod("isLowSurrogate", "(C)Z") { _, args, _ in
-            let value = args[0].asChar()
+            let value = args[0].asUInt32
             return .boolean(value >= 0xDC00 && value <= 0xDFFF)
         }
         cls.staticMethod("isSurrogate", "(C)Z") { _, args, _ in
-            let value = args[0].asChar()
+            let value = args[0].asUInt32
             return .boolean(value >= 0xD800 && value <= 0xDFFF)
         }
         cls.staticMethod("isSurrogatePair", "(CC)Z") { _, args, _ in
-            let high = args[0].asChar()
-            let low = args[1].asChar()
+            let high = args[0].asUInt32
+            let low = args[1].asUInt32
             return .boolean(high >= 0xD800 && high <= 0xDBFF && low >= 0xDC00 && low <= 0xDFFF)
         }
         cls.staticMethod("charCount", "(I)I") { _, args, _ in
@@ -1301,7 +1321,7 @@ enum JavaCore {
             }
             return array
         }
-        cls.staticMethod("hashCode", "(C)I") { _, args, _ in .int32(Int32(args[0].asChar())) }
+        cls.staticMethod("hashCode", "(C)I") { _, args, _ in .int32(Int32(bitPattern: args[0].asUInt32)) }
         cls.staticMethod("digit", "(CI)I") { _, args, _ in
             guard let digit = Int(String(UnicodeScalar(args[0].asUInt32) ?? " "), radix: Int(args[1].asInt32)) else {
                 return .int32(-1)
@@ -1332,7 +1352,7 @@ enum JavaCore {
             }
         }
         cls.staticMethod("toTitleCase", "(C)C") { _, args, _ in
-            let value = args[0].asChar()
+            let value = UInt16(truncatingIfNeeded: args[0].asUInt32)
             guard let scalar = UnicodeScalar(UInt32(value)) else { return .int32(Int32(value)) }
             let title = String(scalar).uppercased()
             return .int32(Int32(title.utf16.first ?? value))
@@ -1351,17 +1371,17 @@ enum JavaCore {
             cls.staticValues[0] = .float(.greatestFiniteMagnitude)
             cls.staticValues[1] = .float(.leastNonzeroMagnitude)
         }
-        cls.method("floatValue", "()F") { _, args, _ in .float(args[0].asFloatBox()) }
+        cls.method("floatValue", "()F") { runtime, args, _ in .float(args[0].asBoxedFloat(runtime)) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Float;" else {
                 return .boolean(false)
             }
-            let left = args[0].asFloatBox(), right = args[1].asFloatBox()
+            let left = args[0].asBoxedFloat(runtime), right = args[1].asBoxedFloat(runtime)
             if left.isNaN && right.isNaN { return .boolean(true) }
             return .boolean(left.bitPattern == right.bitPattern)
         }
-        cls.method("hashCode", "()I") { _, args, _ in
-            let value = args[0].asFloatBox()
+        cls.method("hashCode", "()I") { runtime, args, _ in
+            let value = args[0].asBoxedFloat(runtime)
             return .int32(Int32(bitPattern: value.isNaN ? 0x7FC0_0000 : value.bitPattern))
         }
         cls.staticMethod("compare", "(FF)I") { _, args, _ in
@@ -1372,8 +1392,8 @@ enum JavaCore {
             let rightBits = right.isNaN ? 0x7FC0_0000 : right.bitPattern
             return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
         }
-        cls.method("compareTo", "(Ljava/lang/Float;)I") { _, args, _ in
-            let left = args[0].asFloatBox(), right = args[1].asFloatBox()
+        cls.method("compareTo", "(Ljava/lang/Float;)I") { runtime, args, _ in
+            let left = args[0].asBoxedFloat(runtime), right = args[1].asBoxedFloat(runtime)
             if left < right { return .int32(-1) }
             if left > right { return .int32(1) }
             let leftBits = left.isNaN ? 0x7FC0_0000 : left.bitPattern
@@ -1381,7 +1401,7 @@ enum JavaCore {
             return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
         }
         cls.staticMethod("isNaN", "(F)Z") { _, args, _ in .boolean(args[0].asFloat.isNaN) }
-        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asFloatBox())) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asBoxedFloat(runtime))) }
         cls.staticMethod("valueOf", "(F)Ljava/lang/Float;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Float;") else { return .null }
             let pointer = runtime.allocateObject(cls)
@@ -1422,17 +1442,17 @@ enum JavaCore {
             cls.staticValues[0] = .double(.greatestFiniteMagnitude)
             cls.staticValues[1] = .double(.leastNonzeroMagnitude)
         }
-        cls.method("doubleValue", "()D") { _, args, _ in .double(args[0].asDoubleBox()) }
+        cls.method("doubleValue", "()D") { runtime, args, _ in .double(args[0].asBoxedDouble(runtime)) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Double;" else {
                 return .boolean(false)
             }
-            let left = args[0].asDoubleBox(), right = args[1].asDoubleBox()
+            let left = args[0].asBoxedDouble(runtime), right = args[1].asBoxedDouble(runtime)
             if left.isNaN && right.isNaN { return .boolean(true) }
             return .boolean(left.bitPattern == right.bitPattern)
         }
-        cls.method("hashCode", "()I") { _, args, _ in
-            let value = args[0].asDoubleBox()
+        cls.method("hashCode", "()I") { runtime, args, _ in
+            let value = args[0].asBoxedDouble(runtime)
             let bits = value.isNaN ? UInt64(0x7FF8_0000_0000_0000) : value.bitPattern
             return .int32(Int32(truncatingIfNeeded: bits ^ (bits >> 32)))
         }
@@ -1444,8 +1464,8 @@ enum JavaCore {
             let rightBits = right.isNaN ? 0x7FF8_0000_0000_0000 : right.bitPattern
             return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
         }
-        cls.method("compareTo", "(Ljava/lang/Double;)I") { _, args, _ in
-            let left = args[0].asDoubleBox(), right = args[1].asDoubleBox()
+        cls.method("compareTo", "(Ljava/lang/Double;)I") { runtime, args, _ in
+            let left = args[0].asBoxedDouble(runtime), right = args[1].asBoxedDouble(runtime)
             if left < right { return .int32(-1) }
             if left > right { return .int32(1) }
             let leftBits = left.isNaN ? UInt64(0x7FF8_0000_0000_0000) : left.bitPattern
@@ -1453,7 +1473,7 @@ enum JavaCore {
             return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
         }
         cls.staticMethod("isNaN", "(D)Z") { _, args, _ in .boolean(args[0].asDouble.isNaN) }
-        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asDoubleBox())) }
+        cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asBoxedDouble(runtime))) }
         cls.staticMethod("valueOf", "(D)Ljava/lang/Double;") { runtime, args, _ in
             guard let cls = runtime.findClass("Ljava/lang/Double;") else { return .null }
             let pointer = runtime.allocateObject(cls)
@@ -1733,8 +1753,16 @@ enum JavaCore {
         var stack: [VMClass] = [target]
         while let cls = stack.popLast() {
             guard visited.insert(ObjectIdentifier(cls)).inserted else { continue }
-            for method in cls.methods.values where method.name == name {
-                if let parameters, method.parameterTypes != parameters { continue }
+            // Native hosts may declare an instance and a static method under one
+            // key; `getMethod`/`getDeclaredMethod` see both, instance first.
+            let match: (Dictionary<String, VMMethod>.Values) -> VMMethod? = { methods in
+                for method in methods where method.name == name {
+                    if let parameters, method.parameterTypes != parameters { continue }
+                    return method
+                }
+                return nil
+            }
+            if let method = match(cls.methods.values) ?? match(cls.staticMethods.values) {
                 return (cls, method)
             }
             if includeInherited {

@@ -36,6 +36,115 @@ struct MihonEngineError: Error, CustomStringConvertible, LocalizedError {
     var errorDescription: String? { description }
 }
 
+/// The `SManga` objects a browse/search list returned, keyed per source and
+/// manga URL.
+///
+/// Mihon hands the list object straight to `getMangaUpdate`; sources that stash
+/// a canonical path or a content id in `memo` build their details request from
+/// that field. Rebuilding the model from the app-side id and title drops it and
+/// silently changes the request, so details and chapter refreshes reuse the
+/// cached instance while the arena that owns it is alive. The memo snapshot
+/// lets an instance rebuilt after a recycle carry the same data.
+struct MihonListMangaCache {
+    struct Entry {
+        var generation: Int
+        var value: VMValue
+        var url: String
+        var title: String
+        var memo: VMJsonTree?
+    }
+
+    private(set) var entries: [String: Entry] = [:]
+    static let limit = 512
+
+    private static func key(_ sourceIndex: Int, _ url: String) -> String {
+        "\(sourceIndex)\u{1F}\(url)"
+    }
+
+    /// Records everything a list item carries for one source. The caller runs
+    /// while the list's arena is current, so `memo` can be snapshotted.
+    mutating func record(
+        _ value: VMValue,
+        runtime: VMRuntime,
+        sourceIndex: Int,
+        generation: Int
+    ) {
+        let manga = runtime.manga(value)
+        guard let url = runtime.stringValue(manga.url), !url.isEmpty else { return }
+        if entries.count > Self.limit { entries.removeAll(keepingCapacity: true) }
+        entries[Self.key(sourceIndex, url)] = Entry(
+            generation: generation,
+            value: value,
+            url: url,
+            title: runtime.stringValue(manga.title) ?? "",
+            memo: runtime.payload(manga.memo, as: VMJsonTree.self)
+        )
+    }
+
+    /// The entry recorded for `url`, when the arena that owns its `VMValue` is
+    /// still the current one.
+    func liveEntry(sourceIndex: Int, url: String, generation: Int) -> Entry? {
+        guard let entry = entries[Self.key(sourceIndex, url)],
+              entry.generation == generation,
+              entry.value.bits != 0 else { return nil }
+        return entry
+    }
+
+    /// The cached instance for `url`, or a fresh model when none is live.
+    /// Details and the chapter refresh go through here so both see the same
+    /// object Mihon would keep for the open manga.
+    func instance(
+        runtime: VMRuntime,
+        sourceIndex: Int,
+        url: String,
+        title: String?,
+        memo fallbackMemo: VMJsonTree? = nil,
+        generation: Int
+    ) -> VMValue {
+        let entry = entries[Self.key(sourceIndex, url)]
+        if let entry, entry.generation == generation, entry.value.bits != 0 {
+            let manga = entry.value
+            runtime.manga(manga).url = runtime.newString(url)
+            if let title, !title.isEmpty, title != entry.title {
+                runtime.manga(manga).title = runtime.newString(title)
+            }
+            return manga
+        }
+        let manga = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
+        runtime.manga(manga).url = runtime.newString(url)
+        if let title, !title.isEmpty {
+            runtime.manga(manga).title = runtime.newString(title)
+        }
+        if let memo = entry?.memo ?? fallbackMemo {
+            runtime.manga(manga).memo = runtime.makeNative(
+                "Lkotlinx/serialization/json/JsonObject;",
+                payload: memo
+            )
+        }
+        return manga
+    }
+
+    /// Drops the `VMValue`s while keeping the plain-data part of each entry.
+    /// The arena recycle that triggers this invalidates the instances, but a
+    /// source's `memo` must still reach `getMangaUpdate` afterwards, so the
+    /// snapshot is rebuilt into a fresh model on the next lookup.
+    mutating func invalidate() {
+        for (key, entry) in entries {
+            entries[key] = Entry(
+                generation: entry.generation,
+                value: .null,
+                url: entry.url,
+                title: entry.title,
+                memo: entry.memo
+            )
+        }
+    }
+
+    mutating func removeAll() {
+        entries.removeAll(keepingCapacity: true)
+    }
+}
+
 final class MihonEngine: @unchecked Sendable {
     private let apkData: Data
     private let manifest: MihonAPKManifest
@@ -82,6 +191,11 @@ final class MihonEngine: @unchecked Sendable {
     /// `SManga.memo` snapshot; re-attached when the chapter list is refreshed on
     /// a manga object rebuilt after an arena recycle.
     private var mangaMemos: [String: VMJsonTree] = [:]
+    /// The `SManga` instances a browse/search list returned. Mihon passes the
+    /// list object itself to `getMangaUpdate`, and sources that stash state in
+    /// `memo` (a canonical path, a content id) build the wrong details URL
+    /// without it.
+    private var listMangaObjects = MihonListMangaCache()
     private var pageCacheGeneration = 0
 
     init(apkData: Data, host: VMHost) throws {
@@ -245,7 +359,7 @@ final class MihonEngine: @unchecked Sendable {
         }
         let source = try source(at: sourceIndex)
         let result = try callSuspend(source, "getPopularManga(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;", [.int32(Int32(page))])
-        return try mangasPage(result, source: source)
+        return try mangasPage(result, source: source, sourceIndex: sourceIndex)
     }
 
     func latest(sourceIndex: Int, page: Int) throws -> (items: [MihonManga], hasMore: Bool) {
@@ -256,7 +370,7 @@ final class MihonEngine: @unchecked Sendable {
         }
         let source = try source(at: sourceIndex)
         let result = try callSuspend(source, "getLatestUpdates(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;", [.int32(Int32(page))])
-        return try mangasPage(result, source: source)
+        return try mangasPage(result, source: source, sourceIndex: sourceIndex)
     }
 
     func search(sourceIndex: Int, query: String, page: Int) throws -> (items: [MihonManga], hasMore: Bool) {
@@ -282,7 +396,7 @@ final class MihonEngine: @unchecked Sendable {
             "getSearchManga(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
             [.int32(Int32(page)), runtime.newString(query), filters]
         )
-        return try mangasPage(result, source: source)
+        return try mangasPage(result, source: source, sourceIndex: sourceIndex)
     }
 
     /// Snapshot of the source's filter list for the filter UI. Each filter's
@@ -299,6 +413,20 @@ final class MihonEngine: @unchecked Sendable {
         return MihonFilters.tree(runtime: runtime, list: list)
     }
 
+    /// The `SManga` instance to hand to `getMangaUpdate`. See
+    /// `MihonListMangaCache`: a live list instance is reused so its `memo`
+    /// reaches the request, and a rebuilt one re-attaches the memo snapshot.
+    private func mangaInstance(sourceIndex: Int, url: String, title: String?) -> VMValue {
+        listMangaObjects.instance(
+            runtime: runtime,
+            sourceIndex: sourceIndex,
+            url: url,
+            title: title,
+            memo: mangaMemos["\(sourceIndex)\u{1F}\(url)"],
+            generation: pageCacheGeneration
+        )
+    }
+
     /// Details for one manga URL. `title` is the title the caller already knows
     /// (from a browse/search row); sources that build their detail URL from it
     /// need it exactly as Mihon's reader passes the populated model.
@@ -309,11 +437,7 @@ final class MihonEngine: @unchecked Sendable {
             recycleIfNeeded()
         }
         let source = try source(at: sourceIndex)
-        let manga = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
-        runtime.manga(manga).url = runtime.newString(url)
-        if let title, !title.isEmpty {
-            runtime.manga(manga).title = runtime.newString(title)
-        }
+        let manga = mangaInstance(sourceIndex: sourceIndex, url: url, title: title)
         let update = try callSuspend(
             source,
             "getMangaUpdate(Leu/kanade/tachiyomi/source/model/SManga;Ljava/util/List;ZZLkotlin/coroutines/Continuation;)Ljava/lang/Object;",
@@ -351,16 +475,17 @@ final class MihonEngine: @unchecked Sendable {
             if !mangaTitle.isEmpty, mangaTitle != cached.title {
                 runtime.manga(manga).title = runtime.newString(mangaTitle)
             }
-        } else {
-            manga = runtime.makeNative("Leu/kanade/tachiyomi/source/model/MihonSManga;", payload: VMMangaPayload())
-            runtime.manga(manga).url = runtime.newString(mangaURL)
-            runtime.manga(manga).title = runtime.newString(mangaTitle)
-            if let memo = mangaMemos["\(sourceIndex)\u{1F}\(mangaURL)"] {
-                runtime.manga(manga).memo = runtime.makeNative(
-                    "Lkotlinx/serialization/json/JsonObject;",
-                    payload: memo
-                )
+        } else if let listed = listMangaObjects.liveEntry(
+            sourceIndex: sourceIndex, url: mangaURL, generation: pageCacheGeneration
+        ) {
+            // Details never ran (or were recycled): keep using the list
+            // instance so its `memo` reaches the chapter request unchanged.
+            manga = listed.value
+            if !mangaTitle.isEmpty, mangaTitle != listed.title {
+                runtime.manga(manga).title = runtime.newString(mangaTitle)
             }
+        } else {
+            manga = mangaInstance(sourceIndex: sourceIndex, url: mangaURL, title: mangaTitle)
         }
         let update = try callSuspend(
             source,
@@ -477,6 +602,7 @@ final class MihonEngine: @unchecked Sendable {
         pageLists.removeAll(keepingCapacity: true)
         chapterObjects.removeAll(keepingCapacity: true)
         mangaObjects.removeAll(keepingCapacity: true)
+        listMangaObjects.invalidate()
         pageCacheGeneration &+= 1
     }
 
@@ -628,16 +754,52 @@ final class MihonEngine: @unchecked Sendable {
         values: [String] = [],
         kind: MihonSourcePreference.Kind = .text
     ) throws {
-        _ = try source(at: sourceIndex)
+        let source = try source(at: sourceIndex)
         guard !key.isEmpty, let preferences = runtime.host?.preferences() else { return }
-        switch kind {
-        case .multiSelect:
-            preferences.setStringSet(Set(values), forKey: key)
-        case .toggle:
-            preferences.setBool(value == "true", forKey: key)
-        case .text, .list, .header:
-            preferences.setString(value, forKey: key)
+        // The settings UI is a `Preference`, so its change listener runs before
+        // the edit is stored; a `false` answer leaves the stored value alone.
+        let preference = preferenceObject(named: key, in: source)
+        try runtime.applyPreferenceValue(
+            preference,
+            key: key,
+            value: value,
+            values: values,
+            kind: kind,
+            store: preferences
+        )
+    }
+
+    /// The preference object `setupPreferenceScreen` builds for `key`. The UI
+    /// writes long after the screen call, so the screen is rebuilt to reach the
+    /// instance that owns the change listener.
+    private func preferenceObject(named key: String, in source: VMValue) -> VMValue? {
+        guard let cls = runtime.classOf(source),
+              let method = cls.lookupVirtual(key: "setupPreferenceScreen(Landroidx/preference/PreferenceScreen;)V") else {
+            return nil
         }
+        let screen = runtime.makeNative(
+            "Landroidx/preference/PreferenceScreen;",
+            payload: VMUiPreferenceScreenPayload()
+        )
+        guard (try? runtime.invoke(method, [source, screen])) != nil,
+              let payload = runtime.payload(screen, as: VMUiPreferenceScreenPayload.self) else {
+            return nil
+        }
+        var found: VMValue?
+        func search(_ children: [VMValue], depth: Int) {
+            guard found == nil, depth < 32 else { return }
+            for child in children {
+                guard let pref = runtime.payload(child, as: VMUiPreferencePayload.self) else { continue }
+                if pref.key == key {
+                    found = child
+                    return
+                }
+                search(pref.children, depth: depth + 1)
+                if found != nil { return }
+            }
+        }
+        search(payload.children, depth: 0)
+        return found
     }
 
     // MARK: - Helpers
@@ -704,11 +866,19 @@ final class MihonEngine: @unchecked Sendable {
         return (try? runtime.invoke(method, [source])) ?? list
     }
 
-    private func mangasPage(_ value: VMValue, source: VMValue) throws -> (items: [MihonManga], hasMore: Bool) {
+    private func mangasPage(_ value: VMValue, source: VMValue, sourceIndex: Int) throws -> (items: [MihonManga], hasMore: Bool) {
         guard let payload: VMMangasPagePayload = runtime.payload(value, as: VMMangasPagePayload.self) else {
             throw MihonEngineError("source returned no MangasPage")
         }
         let items = runtime.listItems(payload.mangas) ?? []
+        for item in items {
+            listMangaObjects.record(
+                item,
+                runtime: runtime,
+                sourceIndex: sourceIndex,
+                generation: pageCacheGeneration
+            )
+        }
         return (items.map { convertManga($0, source: source) }, payload.hasNextPage)
     }
 

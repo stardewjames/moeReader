@@ -55,89 +55,95 @@ final class VMJsonTree {
 }
 
 final class VMJsonParser {
-    private let characters: [Character]
+    /// The parser walks UTF-8 bytes rather than `Character`s: Swift treats CRLF
+    /// as one grapheme, so a `Character`-based whitespace test would reject the
+    /// `\r\n` that many servers emit and fail at the first object key.
+    private let bytes: [UInt8]
     private var index = 0
 
-    init(_ text: String) { characters = Array(text) }
+    private init(_ bytes: [UInt8]) { self.bytes = bytes }
 
     static func parse(_ text: String) throws -> VMJsonTree {
-        var parser = VMJsonParser(text)
+        var parser = VMJsonParser(Array(text.utf8))
         parser.skipWhitespace()
         let value = try parser.value()
         parser.skipWhitespace()
-        guard parser.index == parser.characters.count else {
+        guard parser.index == parser.bytes.count else {
             throw VMJavaException("Lkotlinx/serialization/SerializationException;", "unexpected trailing JSON")
         }
         return value
     }
 
     private func skipWhitespace() {
-        while index < characters.count, characters[index] == " " || characters[index] == "\n" || characters[index] == "\r" || characters[index] == "\t" {
-            index += 1
+        while index < bytes.count {
+            switch bytes[index] {
+            case 0x20, 0x0A, 0x0D, 0x09: index += 1
+            default: return
+            }
         }
     }
 
     private func value() throws -> VMJsonTree {
-        guard index < characters.count else {
+        guard index < bytes.count else {
             throw VMJavaException("Lkotlinx/serialization/SerializationException;", "unexpected end of JSON")
         }
-        switch characters[index] {
-        case "{":
+        switch bytes[index] {
+        case 0x7B: // {
             index += 1
             var fields: [String: VMJsonTree] = [:]
             skipWhitespace()
-            if index < characters.count, characters[index] == "}" { index += 1; return VMJsonTree(.object(fields)) }
+            if index < bytes.count, bytes[index] == 0x7D { index += 1; return VMJsonTree(.object(fields)) }
             while true {
                 skipWhitespace()
                 let key = try string()
                 skipWhitespace()
-                guard index < characters.count, characters[index] == ":" else {
+                guard index < bytes.count, bytes[index] == 0x3A else {
                     throw VMJavaException("Lkotlinx/serialization/SerializationException;", "expected ':'")
                 }
                 index += 1
                 skipWhitespace()
                 fields[key] = try value()
                 skipWhitespace()
-                if index < characters.count, characters[index] == "," { index += 1; continue }
-                if index < characters.count, characters[index] == "}" { index += 1; return VMJsonTree(.object(fields)) }
+                if index < bytes.count, bytes[index] == 0x2C { index += 1; continue }
+                if index < bytes.count, bytes[index] == 0x7D { index += 1; return VMJsonTree(.object(fields)) }
                 throw VMJavaException("Lkotlinx/serialization/SerializationException;", "expected ',' or '}'")
             }
-        case "[":
+        case 0x5B: // [
             index += 1
             var items: [VMJsonTree] = []
             skipWhitespace()
-            if index < characters.count, characters[index] == "]" { index += 1; return VMJsonTree(.array(items)) }
+            if index < bytes.count, bytes[index] == 0x5D { index += 1; return VMJsonTree(.array(items)) }
             while true {
                 skipWhitespace()
                 items.append(try value())
                 skipWhitespace()
-                if index < characters.count, characters[index] == "," { index += 1; continue }
-                if index < characters.count, characters[index] == "]" { index += 1; return VMJsonTree(.array(items)) }
+                if index < bytes.count, bytes[index] == 0x2C { index += 1; continue }
+                if index < bytes.count, bytes[index] == 0x5D { index += 1; return VMJsonTree(.array(items)) }
                 throw VMJavaException("Lkotlinx/serialization/SerializationException;", "expected ',' or ']'")
             }
-        case "\"":
+        case 0x22: // "
             return VMJsonTree(.string(try string()))
-        case "t":
+        case 0x74:
             try literal("true"); return VMJsonTree(.bool(true))
-        case "f":
+        case 0x66:
             try literal("false"); return VMJsonTree(.bool(false))
-        case "n":
+        case 0x6E:
             try literal("null"); return VMJsonTree(.null)
         default:
-            var number = ""
-            while index < characters.count, "-+.eE0123456789".contains(characters[index]) {
-                number.append(characters[index]); index += 1
-            }
-            guard !number.isEmpty else {
+            let start = index
+            while index < bytes.count, VMJsonParser.numberBytes.contains(bytes[index]) { index += 1 }
+            guard index > start else {
                 throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid JSON value")
             }
-            return VMJsonTree(.number(number))
+            return VMJsonTree(.number(String(decoding: bytes[start..<index], as: UTF8.self)))
         }
     }
 
+    private static let numberBytes: Set<UInt8> = Set("-+.eE0123456789".utf8)
+
     private func literal(_ text: String) throws {
-        for character in text {
-            guard index < characters.count, characters[index] == character else {
+        for byte in text.utf8 {
+            guard index < bytes.count, bytes[index] == byte else {
                 throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid literal")
             }
             index += 1
@@ -145,47 +151,123 @@ final class VMJsonParser {
     }
 
     private func string() throws -> String {
-        guard index < characters.count, characters[index] == "\"" else {
+        guard index < bytes.count, bytes[index] == 0x22 else {
             throw VMJavaException("Lkotlinx/serialization/SerializationException;", "expected string")
         }
         index += 1
-        var output = ""
-        while index < characters.count {
-            let character = characters[index]
+        var output: [UInt8] = []
+        while index < bytes.count {
+            let byte = bytes[index]
             index += 1
-            if character == "\"" { return output }
-            if character == "\\" {
-                guard index < characters.count else { break }
-                let escape = characters[index]
-                index += 1
-                switch escape {
-                case "n": output.append("\n")
-                case "t": output.append("\t")
-                case "r": output.append("\r")
-                case "b": output.append("\u{8}")
-                case "f": output.append("\u{C}")
-                case "\"": output.append("\"")
-                case "\\": output.append("\\")
-                case "/": output.append("/")
-                case "u":
-                    var hex = ""
-                    while hex.count < 4, index < characters.count { hex.append(characters[index]); index += 1 }
-                    if let code = UInt32(hex, radix: 16), let scalar = UnicodeScalar(code) { output.append(Character(scalar)) }
-                default: output.append(escape)
+            if byte == 0x22 { return String(decoding: output, as: UTF8.self) }
+            if byte != 0x5C { output.append(byte); continue }
+            guard index < bytes.count else { break }
+            let escape = bytes[index]
+            index += 1
+            switch escape {
+            case 0x22: output.append(0x22)
+            case 0x5C: output.append(0x5C)
+            case 0x2F: output.append(0x2F)
+            case 0x62: output.append(0x08)
+            case 0x66: output.append(0x0C)
+            case 0x6E: output.append(0x0A)
+            case 0x72: output.append(0x0D)
+            case 0x74: output.append(0x09)
+            case 0x75:
+                var code = try unicodeEscape()
+                // A high surrogate must pair with the following \uXXXX escape,
+                // otherwise the two halves would each be an invalid scalar.
+                if (0xD800...0xDBFF).contains(code),
+                   index + 5 < bytes.count, bytes[index] == 0x5C, bytes[index + 1] == 0x75 {
+                    let saved = index
+                    index += 2
+                    let low = try unicodeEscape()
+                    if (0xDC00...0xDFFF).contains(low) {
+                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                    } else {
+                        index = saved
+                    }
                 }
-            } else {
-                output.append(character)
+                if let scalar = UnicodeScalar(code) {
+                    output.append(contentsOf: String(scalar).utf8)
+                }
+            default: output.append(escape)
             }
         }
         throw VMJavaException("Lkotlinx/serialization/SerializationException;", "unterminated string")
     }
+
+    private func unicodeEscape() throws -> UInt32 {
+        var value: UInt32 = 0
+        for _ in 0..<4 {
+            guard index < bytes.count else {
+                throw VMJavaException("Lkotlinx/serialization/SerializationException;", "unterminated string")
+            }
+            let digit = bytes[index]
+            index += 1
+            let nibble: UInt32
+            switch digit {
+            case 0x30...0x39: nibble = UInt32(digit - 0x30)
+            case 0x41...0x46: nibble = UInt32(digit - 0x41 + 10)
+            case 0x61...0x66: nibble = UInt32(digit - 0x61 + 10)
+            default:
+                throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid unicode escape")
+            }
+            value = value << 4 | nibble
+        }
+        return value
+    }
+}
+
+/// `SerialKind` of a descriptor. Generated serializers describe classes; the
+/// builtin collection and primitive serializers need the real kind so format
+/// plugins (kotlinx's shaded protobuf decoder, for one) can tell a list from a
+/// message and a string from an inline wrapper.
+enum VMSerialDescriptorKind {
+    case classKind
+    case objectKind
+    case list
+    case map
+    case enumKind
+    case primitive(String)
 }
 
 final class VMSerialDescriptorPayload {
     var serialName: String
     var elements: [(name: String, optional: Bool)] = []
     var aliases: [Int: [String]] = [:]
+    /// Annotations pushed for each element, in element order. Serial format
+    /// plugins (`@ProtoNumber`, `@ProtoType`, …) are read back through
+    /// `getElementAnnotations`; the JSON path ignores them.
+    var annotations: [[VMValue]] = []
+    var kind: VMSerialDescriptorKind = .classKind
+    /// Descriptor of each element when it is known (collection element types).
+    var children: [VMValue?] = []
+    /// The generated serializer this descriptor was built for. Its
+    /// `childSerializers()` is the only source of element descriptors, and
+    /// format plugins (kotlinx's protobuf decoder) need them to tell a list
+    /// field from a message field.
+    var generatedSerializer: VMValue?
     init(serialName: String) { self.serialName = serialName }
+
+    /// Grows the per-element annotation slots to match `elements`. Descriptors
+    /// built by the enum/builtin paths assign `elements` directly.
+    func appendElement(_ name: String, optional: Bool) {
+        elements.append((name, optional))
+        annotations.append([])
+        children.append(nil)
+    }
+
+    func recordAnnotation(_ annotation: VMValue) {
+        while annotations.count < elements.count { annotations.append([]) }
+        if annotations.isEmpty { annotations.append([]) }
+        annotations[annotations.count - 1].append(annotation)
+    }
+
+    func elementAnnotations(_ index: Int) -> [VMValue] {
+        guard index >= 0, index < annotations.count, index < elements.count else { return [] }
+        return annotations[index]
+    }
 }
 
 final class VMSerializersModulePayload {
@@ -318,6 +400,14 @@ final class VMJsonEncoderPayload {
 final class VMJsonDecoderPayload {
     let tree: VMJsonTree
     var cursor = 0
+    /// Element indexes present in the JSON object, resolved once so absent keys
+    /// are skipped (kotlinx reports only present elements; the generated
+    /// synthetic-constructor mask then keeps the field's default value).
+    var pendingIndices: [Int32]?
+    /// Descriptor the cached `pendingIndices` were computed for. A decoder can
+    /// be asked about more than one descriptor (polymorphic values), so a
+    /// different descriptor invalidates the cache.
+    var pendingDescriptor: VMSerialDescriptorPayload?
     var descriptor: VMSerialDescriptorPayload?
     let isComposite: Bool
     var module: VMSerializersModulePayload?
@@ -343,6 +433,136 @@ struct SerializationRuntime {
     static func normalizedPrimitiveKind(_ name: String) -> String {
         let lower = name.lowercased()
         return lower == "boolean" ? "bool" : lower
+    }
+
+    /// The `SerialKind` singleton instance for a descriptor kind. Kinds live as
+    /// `INSTANCE` statics on their `StructureKind$x`/`PrimitiveKind$x` classes,
+    /// created by their `prepare` hook.
+    static func serialKind(_ runtime: VMRuntime, _ kind: VMSerialDescriptorKind) -> VMValue {
+        let descriptor: String
+        switch kind {
+        case .classKind: descriptor = "Lkotlinx/serialization/descriptors/StructureKind$CLASS;"
+        case .objectKind: descriptor = "Lkotlinx/serialization/descriptors/StructureKind$OBJECT;"
+        case .list: descriptor = "Lkotlinx/serialization/descriptors/StructureKind$LIST;"
+        case .map: descriptor = "Lkotlinx/serialization/descriptors/StructureKind$MAP;"
+        case .enumKind: descriptor = "Lkotlinx/serialization/descriptors/SerialKind$ENUM;"
+        case .primitive(let name): descriptor = "Lkotlinx/serialization/descriptors/PrimitiveKind$\(name.uppercased());"
+        }
+        if let cls = runtime.findClass(descriptor) {
+            try? runtime.ensureInitialized(cls)
+            if let value = cls.staticValues.first { return value }
+        }
+        return runtime.jsonKind()
+    }
+
+    /// Generic collection decoding through the `Decoder`/`CompositeDecoder`
+    /// protocol. The JSON decoder is served from its parsed tree elsewhere; this
+    /// path exists for decoders that own the element stream (the shaded protobuf
+    /// decoder, custom formats) and reuse kotlinx's collection serializers.
+    static func decodeCollection(
+        _ runtime: VMRuntime,
+        decoder: VMValue,
+        element: VMValue,
+        serializer: VMValue
+    ) throws -> VMValue {
+        guard let descriptor = runtime.callVirtual(serializer, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", []) else {
+            throw VMJavaException(serializationException, "collection serializer has no descriptor")
+        }
+        guard let cls = runtime.classOf(decoder),
+              let begin = cls.lookupVirtual(key: "beginStructure(Lkotlinx/serialization/descriptors/SerialDescriptor;)Lkotlinx/serialization/encoding/CompositeDecoder;") else {
+            throw VMJavaException(serializationException, "decoder cannot read a collection")
+        }
+        let composite = try runtime.invoke(begin, [decoder, descriptor])
+        // `beginStructure` may return a *different* decoder (kotlinx's protobuf
+        // decoder returns a list decoder whose `decodeElementIndex` is an
+        // override), so element methods must resolve on the composite object.
+        guard let compositeClass = runtime.classOf(composite),
+              let nextIndex = compositeClass.lookupVirtual(key: "decodeElementIndex(Lkotlinx/serialization/descriptors/SerialDescriptor;)I"),
+              let decodeElement = compositeClass.lookupVirtual(key: "decodeSerializableElement(Lkotlinx/serialization/descriptors/SerialDescriptor;ILkotlinx/serialization/DeserializationStrategy;Ljava/lang/Object;)Ljava/lang/Object;"),
+              let end = compositeClass.lookupVirtual(key: "endStructure(Lkotlinx/serialization/descriptors/SerialDescriptor;)V") else {
+            throw VMJavaException(serializationException, "decoder cannot read a collection")
+        }
+        var values: [VMValue] = []
+        // A malformed stream must fail, not spin the host: every iteration reads
+        // at least one byte from the decoder, so the cap is a guard only.
+        while values.count < 1_000_000 {
+            let index = try runtime.invoke(nextIndex, [composite, descriptor]).asInt32
+            if index == -1 { break }
+            values.append(try runtime.invoke(decodeElement, [composite, descriptor, .int32(index), element, .null]))
+        }
+        _ = try runtime.invoke(end, [composite, descriptor])
+        return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+    }
+
+    static func collectionDescriptor(_ runtime: VMRuntime, serialName: String, element: VMValue) -> VMValue {
+        let payload = VMSerialDescriptorPayload(serialName: serialName)
+        payload.kind = .list
+        payload.appendElement("", optional: false)
+        payload.children[0] = runtime.callVirtual(element, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", [])
+            ?? runtime.genericDescriptor()
+        return runtime.makeNative("Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;", payload: payload)
+    }
+
+    static func mapDescriptor(_ runtime: VMRuntime, key: VMValue, value: VMValue) -> VMValue {
+        let payload = VMSerialDescriptorPayload(serialName: "kotlin.collections.LinkedHashMap")
+        payload.kind = .map
+        payload.appendElement("key", optional: false)
+        payload.appendElement("value", optional: false)
+        payload.children[0] = runtime.callVirtual(key, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", [])
+            ?? runtime.genericDescriptor()
+        payload.children[1] = runtime.callVirtual(value, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", [])
+            ?? runtime.genericDescriptor()
+        return runtime.makeNative("Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;", payload: payload)
+    }
+
+    /// `KSerializer.deserialize` for a primitive against a decoder that is not
+    /// the JSON tree decoder: the serializer contract is the decoder's own
+    /// `decodeX()` call, boxed for the `Object` return.
+    static func decodePrimitive(_ runtime: VMRuntime, decoder: VMValue, kind: String) throws -> VMValue {
+        func call(_ key: String) throws -> VMValue {
+            guard let cls = runtime.classOf(decoder), let method = cls.lookupVirtual(key: key) else {
+                throw VMJavaException(serializationException, "decoder has no \(key)")
+            }
+            return try runtime.invoke(method, [decoder])
+        }
+        switch normalizedPrimitiveKind(kind) {
+        case "string": return try call("decodeString()Ljava/lang/String;")
+        case "int": return runtime.boxInt(try call("decodeInt()I").asInt32)
+        case "long": return runtime.boxLong(try call("decodeLong()J").asInt64)
+        case "bool": return runtime.boxBoolean(try call("decodeBoolean()Z").asBoolean)
+        case "double": return runtime.boxDouble(try call("decodeDouble()D").asDouble)
+        case "float": return runtime.boxFloat(try call("decodeFloat()F").asFloat)
+        case "short": return runtime.boxInt(try call("decodeShort()S").asInt32)
+        case "byte": return runtime.boxInt(try call("decodeByte()B").asInt32)
+        case "char": return runtime.boxInt(try call("decodeChar()C").asInt32)
+        default: return .null
+        }
+    }
+
+    /// The encode-side counterpart: `serialize` against a non-JSON encoder calls
+    /// the encoder's `encodeX` with the unboxed value.
+    static func encodePrimitive(_ runtime: VMRuntime, encoder: VMValue, kind: String, value: VMValue) throws {
+        let raw = runtime.isObjectValue(value) ? runtime.unboxedPrimitive(value) : value
+        let key: String
+        let argument: VMValue
+        switch normalizedPrimitiveKind(kind) {
+        case "string":
+            key = "encodeString(Ljava/lang/String;)V"
+            argument = runtime.newString(runtime.stringValue(value) ?? "")
+        case "int": key = "encodeInt(I)V"; argument = raw
+        case "long": key = "encodeLong(J)V"; argument = raw
+        case "bool": key = "encodeBoolean(Z)V"; argument = raw
+        case "double": key = "encodeDouble(D)V"; argument = raw
+        case "float": key = "encodeFloat(F)V"; argument = raw
+        case "short": key = "encodeShort(S)V"; argument = raw
+        case "byte": key = "encodeByte(B)V"; argument = raw
+        case "char": key = "encodeChar(C)V"; argument = raw
+        default: return
+        }
+        guard let cls = runtime.classOf(encoder), let method = cls.lookupVirtual(key: key) else {
+            throw VMJavaException(serializationException, "encoder has no \(key)")
+        }
+        _ = try runtime.invoke(method, [encoder, argument])
     }
 
     static func jsonText(_ tree: VMJsonTree) -> String {
@@ -395,6 +615,7 @@ struct SerializationRuntime {
         result += builtins()
         result += jsonClasses()
         result += legacySurface()
+        result += ProtoBufRuntime.classes()
         return result
     }
 
@@ -408,8 +629,10 @@ struct SerializationRuntime {
         descriptor.method("getElementIndex", "(Ljava/lang/String;)I") { _, _, _ in .int32(-1) }
         descriptor.method("getElementDescriptor", "(I)Lkotlinx/serialization/descriptors/SerialDescriptor;") { _, _, _ in .null }
         descriptor.method("isElementOptional", "(I)Z") { _, _, _ in .boolean(false) }
-        descriptor.method("getElementAnnotations", "(I)Ljava/util/List;") { runtime, _, _ in
-            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+        descriptor.method("getElementAnnotations", "(I)Ljava/util/List;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self)
+            let annotations = payload?.elementAnnotations(Int(args[1].asInt32)) ?? []
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(annotations, immutable: true))
         }
         descriptor.method("getKind", "()Lkotlinx/serialization/descriptors/SerialKind;") { _, _, _ in .null }
         descriptor.method("isInline", "()Z") { _, _, _ in .boolean(false) }
@@ -468,22 +691,72 @@ struct SerializationRuntime {
     private static func legacySurface() -> [NativeClass] {
         var result: [NativeClass] = []
 
+        // `AbstractDecoder` implements both interfaces in kotlinx. Subclasses
+        // (kotlinx's shaded protobuf decoder is one) declare neither, so the
+        // defaults below must live here, not on `CompositeDecoder`.
         let abstractDecoder = NativeClass(
             "Lkotlinx/serialization/encoding/AbstractDecoder;",
             superclass: "Ljava/lang/Object;",
-            interfaces: ["Lkotlinx/serialization/encoding/Decoder;"]
+            interfaces: [
+                "Lkotlinx/serialization/encoding/Decoder;",
+                "Lkotlinx/serialization/encoding/CompositeDecoder;",
+            ]
         )
         abstractDecoder.method("<init>", "()V") { _, _, _ in .zero }
+        // Errors must reach the caller: swallowing them into a null result made
+        // a failed decode look like an empty value.
+        func decodeSerializableValue(_ runtime: VMRuntime, _ args: UnsafePointer<VMValue>) throws -> VMValue {
+            guard let cls = runtime.classOf(args[1]),
+                  let method = cls.lookupVirtual(key: "deserialize(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") else {
+                throw VMJavaException(SerializationRuntime.serializationException, "invalid deserializer")
+            }
+            return try runtime.invoke(method, [args[1], args[0]])
+        }
         for signature in [
             "(Lkotlinx/serialization/DeserializationStrategy;)Ljava/lang/Object;",
             "(Lkotlinx/serialization/DeserializationStrategy;Ljava/lang/Object;)Ljava/lang/Object;",
         ] {
             abstractDecoder.method("decodeSerializableValue", signature) { runtime, args, _ in
-                runtime.callVirtual(
-                    args[1],
-                    "deserialize(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;",
-                    [args[0]]
-                ) ?? .null
+                try decodeSerializableValue(runtime, args)
+            }
+        }
+        abstractDecoder.method("decodeSequentially", "()Z") { _, _, _ in .boolean(false) }
+        abstractDecoder.method("decodeNotNullMark", "()Z") { _, _, _ in .boolean(true) }
+        abstractDecoder.method("decodeNull", "()Ljava/lang/Object;") { _, _, _ in .null }
+        abstractDecoder.method("decodeInline", "(Lkotlinx/serialization/descriptors/SerialDescriptor;)Lkotlinx/serialization/encoding/Decoder;") { _, args, _ in args[0] }
+        // `CompositeDecoder`'s element methods default to the element-less
+        // `decode*` calls. A decoder that subclasses `AbstractDecoder` (kotlinx's
+        // shaded protobuf decoder does) relies on this bridge; generated
+        // serializers only ever call the element forms.
+        for (name, signature, target) in [
+            ("decodeStringElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)Ljava/lang/String;", "decodeString()Ljava/lang/String;"),
+            ("decodeIntElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)I", "decodeInt()I"),
+            ("decodeLongElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)J", "decodeLong()J"),
+            ("decodeBooleanElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)Z", "decodeBoolean()Z"),
+            ("decodeDoubleElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)D", "decodeDouble()D"),
+            ("decodeFloatElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)F", "decodeFloat()F"),
+            ("decodeShortElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)S", "decodeShort()S"),
+            ("decodeByteElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)B", "decodeByte()B"),
+            ("decodeCharElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;I)C", "decodeChar()C"),
+        ] {
+            abstractDecoder.method(name, signature) { runtime, args, _ in
+                let cls = runtime.classOf(args[0])
+                guard let method = cls?.lookupVirtual(key: target) else {
+                    throw VMJavaException(SerializationRuntime.serializationException, "decoder has no \(target)")
+                }
+                return try runtime.invoke(method, [args[0]])
+            }
+        }
+        for (name, signature) in [
+            ("decodeSerializableElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;ILkotlinx/serialization/DeserializationStrategy;Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("decodeNullableSerializableElement", "(Lkotlinx/serialization/descriptors/SerialDescriptor;ILkotlinx/serialization/DeserializationStrategy;Ljava/lang/Object;)Ljava/lang/Object;"),
+        ] {
+            abstractDecoder.method(name, signature) { runtime, args, _ in
+                let cls = runtime.classOf(args[0])
+                guard let method = cls?.lookupVirtual(key: "decodeSerializableValue(Lkotlinx/serialization/DeserializationStrategy;Ljava/lang/Object;)Ljava/lang/Object;") else {
+                    throw VMJavaException(SerializationRuntime.serializationException, "decoder has no decodeSerializableValue")
+                }
+                return try runtime.invoke(method, [args[0], args[3], .null])
             }
         }
         result.append(abstractDecoder)
@@ -505,7 +778,17 @@ struct SerializationRuntime {
         result.append(abstractEncoder)
 
         let collectionSerializer = NativeClass("Lkotlinx/serialization/internal/AbstractCollectionSerializer;", superclass: "Ljava/lang/Object;")
-        collectionSerializer.method("merge", "(Lkotlinx/serialization/encoding/Decoder;Ljava/lang/Object;)Ljava/lang/Object;") { _, args, _ in args[2] }
+        // Formats that decode collections through `merge` (kotlinx's shaded
+        // protobuf decoder) must reach the serializer's own decode loop; `merge`
+        // only supplies the default to fall back to for an empty read.
+        collectionSerializer.method("merge", "(Lkotlinx/serialization/encoding/Decoder;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            guard let cls = runtime.classOf(args[0]),
+                  let deserialize = cls.lookupVirtual(key: "deserialize(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") else {
+                return args[2]
+            }
+            let value = try runtime.invoke(deserialize, [args[0], args[1]])
+            return value.bits == 0 ? args[2] : value
+        }
         result.append(collectionSerializer)
 
         let binaryFormat = NativeClass(
@@ -699,36 +982,38 @@ struct SerializationRuntime {
         var result: [NativeClass] = []
         let descriptor = NativeClass("Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/descriptors/SerialDescriptor;"])
         descriptor.method("<init>", "(Ljava/lang/String;Lkotlinx/serialization/internal/GeneratedSerializer;I)V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMSerialDescriptorPayload(serialName: runtime.stringValue(args[1]) ?? ""))
+            let payload = VMSerialDescriptorPayload(serialName: runtime.stringValue(args[1]) ?? "")
+            payload.generatedSerializer = args[2]
+            runtime.setPayload(args[0], payload)
             return .zero
+        }
+        // An element annotation is both data (`getElementAnnotations`, used by
+        // serial-format plugins) and, for `@JsonNames`, the alias source.
+        func recordElementAnnotation(_ runtime: VMRuntime, _ descriptorValue: VMValue, _ annotation: VMValue) {
+            guard let payload = runtime.payload(descriptorValue, as: VMSerialDescriptorPayload.self) else { return }
+            payload.recordAnnotation(annotation)
+            guard let names = runtime.callVirtual(annotation, "names()[Ljava/lang/String;", []) else { return }
+            var aliases: [String] = []
+            for index in 0..<runtime.arrayLength(names) {
+                if let name = runtime.stringValue(runtime.arrayElement(names, index)) { aliases.append(name) }
+            }
+            if !aliases.isEmpty { payload.aliases[payload.elements.count - 1] = aliases }
         }
         descriptor.method("addElement", "(Ljava/lang/String;Z)V") { runtime, args, _ in
             let payload: VMSerialDescriptorPayload = try runtime.payloadBox(args[0])
             let name = runtime.stringValue(args[1]) ?? ""
-            payload.elements.append((name, args[2].asBoolean))
+            payload.appendElement(name, optional: args[2].asBoolean)
             if runtime.traceEnabled {
                 FileHandle.standardError.write("DESC add \(payload.serialName).\(name) optional=\(args[2].asBoolean)\n".data(using: .utf8)!)
             }
             return .zero
         }
         descriptor.method("pushAnnotation", "(Ljava/lang/Object;)V") { runtime, args, _ in
-            guard let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self),
-                  let annotation = runtime.callVirtual(args[1], "names()[Ljava/lang/String;", []) else { return .zero }
-            var names: [String] = []
-            for index in 0..<runtime.arrayLength(annotation) {
-                if let name = runtime.stringValue(runtime.arrayElement(annotation, index)) { names.append(name) }
-            }
-            if !names.isEmpty { payload.aliases[payload.elements.count - 1] = names }
+            recordElementAnnotation(runtime, args[0], args[1])
             return .zero
         }
         descriptor.method("pushAnnotation", "(Ljava/lang/annotation/Annotation;)V") { runtime, args, _ in
-            guard let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self),
-                  let annotation = runtime.callVirtual(args[1], "names()[Ljava/lang/String;", []) else { return .zero }
-            var names: [String] = []
-            for index in 0..<runtime.arrayLength(annotation) {
-                if let name = runtime.stringValue(runtime.arrayElement(annotation, index)) { names.append(name) }
-            }
-            if !names.isEmpty { payload.aliases[payload.elements.count - 1] = names }
+            recordElementAnnotation(runtime, args[0], args[1])
             return .zero
         }
         // Class-level annotations (`@JsonClassDiscriminator`) do not change the
@@ -755,7 +1040,22 @@ struct SerializationRuntime {
             return .int32(Int32(index))
         }
         descriptor.method("getElementDescriptor", "(I)Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
-            runtime.genericDescriptor()
+            let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self)
+            let index = Int(args[1].asInt32)
+            guard let payload, index >= 0 else { return runtime.genericDescriptor() }
+            if index < payload.children.count, let child = payload.children[index] {
+                return child
+            }
+            if let serializer = payload.generatedSerializer,
+               let children = runtime.callVirtual(serializer, "childSerializers()[Lkotlinx/serialization/KSerializer;", []),
+               index < runtime.arrayLength(children) {
+                let child = runtime.arrayElement(children, index)
+                if child.bits != 0,
+                   let descriptor = runtime.callVirtual(child, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", []) {
+                    return descriptor
+                }
+            }
+            return runtime.genericDescriptor()
         }
         descriptor.method("isElementOptional", "(I)Z") { runtime, args, _ in
             let elements = runtime.payload(args[0], as: VMSerialDescriptorPayload.self)?.elements ?? []
@@ -763,11 +1063,14 @@ struct SerializationRuntime {
             guard index >= 0, index < elements.count else { return .boolean(false) }
             return .boolean(elements[index].optional)
         }
-        descriptor.method("getElementAnnotations", "(I)Ljava/util/List;") { runtime, _, _ in
-            runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+        descriptor.method("getElementAnnotations", "(I)Ljava/util/List;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self)
+            let annotations = payload?.elementAnnotations(Int(args[1].asInt32)) ?? []
+            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(annotations, immutable: true))
         }
-        descriptor.method("getKind", "()Lkotlinx/serialization/descriptors/SerialKind;") { runtime, _, _ in
-            runtime.jsonKind()
+        descriptor.method("getKind", "()Lkotlinx/serialization/descriptors/SerialKind;") { runtime, args, _ in
+            let payload = runtime.payload(args[0], as: VMSerialDescriptorPayload.self)
+            return SerializationRuntime.serialKind(runtime, payload?.kind ?? .classKind)
         }
         descriptor.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             runtime.newString(runtime.payload(args[0], as: VMSerialDescriptorPayload.self)?.serialName ?? "")
@@ -775,14 +1078,20 @@ struct SerializationRuntime {
         result.append(descriptor)
 
         let builder = NativeClass("Lkotlinx/serialization/descriptors/ClassSerialDescriptorBuilder;", superclass: "Ljava/lang/Object;")
+        // `element(name, descriptor, annotations, optional)`: the annotations
+        // list is what serial-format plugins read back from the descriptor.
+        func addElement(_ runtime: VMRuntime, _ builderValue: VMValue, name: VMValue, annotations: VMValue, optional: VMValue) {
+            guard let payload = runtime.payload(builderValue, as: VMSerialDescriptorPayload.self) else { return }
+            payload.appendElement(runtime.stringValue(name) ?? "", optional: optional.asBoolean)
+            guard annotations.bits != 0, let list = runtime.listItems(annotations) else { return }
+            for annotation in list { payload.recordAnnotation(annotation) }
+        }
         builder.method("element", "(Ljava/lang/String;Lkotlinx/serialization/descriptors/SerialDescriptor;Ljava/util/List;Z)V") { runtime, args, _ in
-            let payload: VMSerialDescriptorPayload = try runtime.payloadBox(args[0])
-            payload.elements.append((runtime.stringValue(args[1]) ?? "", args[3].asBoolean))
+            addElement(runtime, args[0], name: args[1], annotations: args[2], optional: args[3])
             return .zero
         }
         builder.method("element$default", "(Lkotlinx/serialization/descriptors/ClassSerialDescriptorBuilder;Ljava/lang/String;Lkotlinx/serialization/descriptors/SerialDescriptor;Ljava/util/List;ZILjava/lang/Object;)V") { runtime, args, _ in
-            let payload: VMSerialDescriptorPayload = try runtime.payloadBox(args[0])
-            payload.elements.append((runtime.stringValue(args[1]) ?? "", args[4].asBoolean))
+            addElement(runtime, args[0], name: args[1], annotations: args[2], optional: args[4])
             return .zero
         }
         result.append(builder)
@@ -882,12 +1191,14 @@ struct SerializationRuntime {
             superclass: "Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;"
         )
         inlineDescriptor.method("<init>", "(Ljava/lang/String;Lkotlinx/serialization/internal/GeneratedSerializer;)V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMSerialDescriptorPayload(serialName: runtime.stringValue(args[1]) ?? ""))
+            let payload = VMSerialDescriptorPayload(serialName: runtime.stringValue(args[1]) ?? "")
+            payload.generatedSerializer = args[2]
+            runtime.setPayload(args[0], payload)
             return .zero
         }
         inlineDescriptor.method("addElement", "(Ljava/lang/String;Z)V") { runtime, args, _ in
             let payload: VMSerialDescriptorPayload = try runtime.payloadBox(args[0])
-            payload.elements.append((runtime.stringValue(args[1]) ?? "", args[2].asBoolean))
+            payload.appendElement(runtime.stringValue(args[1]) ?? "", optional: args[2].asBoolean)
             return .zero
         }
         result.append(inlineDescriptor)
@@ -950,14 +1261,17 @@ struct SerializationRuntime {
                 return serializer.descriptor
             }
             cls.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { runtime, args, _ in
-                guard let payload: VMSerializerPayload = runtime.payload(args[0], as: VMSerializerPayload.self),
-                      let encoder: VMJsonEncoderPayload = runtime.payload(args[1], as: VMJsonEncoderPayload.self) else { return .zero }
-                let value = args[2]
+                guard let payload: VMSerializerPayload = runtime.payload(args[0], as: VMSerializerPayload.self) else { return .zero }
                 let kind: String
                 switch payload.kind {
                 case .primitive(let name): kind = SerializationRuntime.normalizedPrimitiveKind(name)
                 default: return .zero
                 }
+                guard let encoder: VMJsonEncoderPayload = runtime.payload(args[1], as: VMJsonEncoderPayload.self) else {
+                    try SerializationRuntime.encodePrimitive(runtime, encoder: args[1], kind: kind, value: args[2])
+                    return .zero
+                }
+                let value = args[2]
                 // This entry point receives boxed values (list elements, nested
                 // `encodeSerializableElement(..., IntSerializer, boxed)`), so raw
                 // `asInt32`/`asInt64`/`asBoolean` would read the reference bits.
@@ -977,12 +1291,14 @@ struct SerializationRuntime {
                 return .zero
             }
             cls.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
-                guard let payload: VMSerializerPayload = runtime.payload(args[0], as: VMSerializerPayload.self),
-                      let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) else { return .null }
+                guard let payload: VMSerializerPayload = runtime.payload(args[0], as: VMSerializerPayload.self) else { return .null }
                 let kind: String
                 switch payload.kind {
                 case .primitive(let name): kind = SerializationRuntime.normalizedPrimitiveKind(name)
                 default: return .null
+                }
+                guard let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) else {
+                    return try SerializationRuntime.decodePrimitive(runtime, decoder: args[1], kind: kind)
                 }
                 let value = runtime.jsonPrimitiveValue(decoder.tree, kind: kind)
                 switch kind {
@@ -998,10 +1314,23 @@ struct SerializationRuntime {
         }
 
         let nullableSerializer = NativeClass("Lmihoncompat/NullableSerializer;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/KSerializer;"])
-        nullableSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
-        nullableSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
+        nullableSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
             guard let payload: VMNullableSerializerPayload = runtime.payload(args[0], as: VMNullableSerializerPayload.self),
-                  let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) else { return .null }
+                  let descriptor = runtime.callVirtual(payload.inner, "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;", []) else {
+                return runtime.genericDescriptor()
+            }
+            return descriptor
+        }
+        nullableSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
+            guard let payload: VMNullableSerializerPayload = runtime.payload(args[0], as: VMNullableSerializerPayload.self) else { return .null }
+            guard let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) else {
+                if let cls = runtime.classOf(args[1]),
+                   let mark = cls.lookupVirtual(key: "decodeNotNullMark()Z"),
+                   try runtime.invoke(mark, [args[1]]).asBoolean == false {
+                    return .null
+                }
+                return try runtime.deserializeWith(payload.inner, decoder: args[1])
+            }
             if case .null = decoder.tree.kind { return .null }
             let child = runtime.makeNative("Lkotlinx/serialization/json/JsonDecoder;", payload: VMJsonDecoderPayload(tree: decoder.tree, module: decoder.module))
             return try runtime.deserializeWith(payload.inner, decoder: child)
@@ -1021,7 +1350,12 @@ struct SerializationRuntime {
         result.append(nullableSerializer)
 
         let mapSerializer = NativeClass("Lmihoncompat/MapSerializer;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/KSerializer;"])
-        mapSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
+        mapSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            guard let payload: VMMapSerializerPayload = runtime.payload(args[0], as: VMMapSerializerPayload.self) else {
+                return runtime.genericDescriptor()
+            }
+            return SerializationRuntime.mapDescriptor(runtime, key: payload.key, value: payload.value)
+        }
         mapSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
             guard let payload: VMMapSerializerPayload = runtime.payload(args[0], as: VMMapSerializerPayload.self),
                   let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self),
@@ -1056,7 +1390,12 @@ struct SerializationRuntime {
             runtime.setPayload(args[0], VMMapSerializerPayload(key: args[1], value: args[2]))
             return .zero
         }
-        linkedMapSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
+        linkedMapSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            guard let payload: VMMapSerializerPayload = runtime.payload(args[0], as: VMMapSerializerPayload.self) else {
+                return runtime.genericDescriptor()
+            }
+            return SerializationRuntime.mapDescriptor(runtime, key: payload.key, value: payload.value)
+        }
         linkedMapSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
             guard let payload: VMMapSerializerPayload = runtime.payload(args[0], as: VMMapSerializerPayload.self),
                   let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self),
@@ -1146,13 +1485,16 @@ struct SerializationRuntime {
             result.append(serializer)
         }
 
-        let listSerializer = NativeClass("Lkotlinx/serialization/internal/ArrayListSerializer;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/KSerializer;"])
+        let listSerializer = NativeClass("Lkotlinx/serialization/internal/ArrayListSerializer;", superclass: "Lkotlinx/serialization/internal/AbstractCollectionSerializer;", interfaces: ["Lkotlinx/serialization/KSerializer;"])
         listSerializer.method("<init>", "(Lkotlinx/serialization/KSerializer;)V") { runtime, args, _ in
             runtime.setPayload(args[0], VMListSerializerPayload(element: args[1]))
             return .zero
         }
-        listSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in
-            runtime.genericDescriptor()
+        listSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            guard let payload: VMListSerializerPayload = runtime.payload(args[0], as: VMListSerializerPayload.self) else {
+                return runtime.genericDescriptor()
+            }
+            return SerializationRuntime.collectionDescriptor(runtime, serialName: "kotlin.collections.ArrayList", element: payload.element)
         }
         listSerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { runtime, args, _ in
             guard let payload: VMListSerializerPayload = runtime.payload(args[0], as: VMListSerializerPayload.self) else { return .zero }
@@ -1160,21 +1502,30 @@ struct SerializationRuntime {
             return .zero
         }
         listSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
-            guard let payload: VMListSerializerPayload = runtime.payload(args[0], as: VMListSerializerPayload.self),
-                  let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self),
-                  case .array(let items) = decoder.tree.kind else {
+            guard let payload: VMListSerializerPayload = runtime.payload(args[0], as: VMListSerializerPayload.self) else {
                 return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
             }
-            var values: [VMValue] = []
-            values.reserveCapacity(items.count)
-            for item in items {
-                let child = runtime.makeNative(
-                    "Lkotlinx/serialization/json/JsonDecoder;",
-                    payload: VMJsonDecoderPayload(tree: item, module: decoder.module)
-                )
-                values.append(try runtime.deserializeWith(payload.element, decoder: child))
+            if let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) {
+                guard case .array(let items) = decoder.tree.kind else {
+                    return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload())
+                }
+                var values: [VMValue] = []
+                values.reserveCapacity(items.count)
+                for item in items {
+                    let child = runtime.makeNative(
+                        "Lkotlinx/serialization/json/JsonDecoder;",
+                        payload: VMJsonDecoderPayload(tree: item, module: decoder.module)
+                    )
+                    values.append(try runtime.deserializeWith(payload.element, decoder: child))
+                }
+                return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
             }
-            return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+            return try SerializationRuntime.decodeCollection(
+                runtime,
+                decoder: args[1],
+                element: payload.element,
+                serializer: args[0]
+            )
         }
         result.append(listSerializer)
 
@@ -1206,8 +1557,15 @@ struct SerializationRuntime {
             return .zero
         }
         enumSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
-            guard let payload: VMEnumSerializerPayload = runtime.payload(args[0], as: VMEnumSerializerPayload.self),
-                  let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) else { return .null }
+            guard let payload: VMEnumSerializerPayload = runtime.payload(args[0], as: VMEnumSerializerPayload.self) else { return .null }
+            guard let decoder: VMJsonDecoderPayload = runtime.payload(args[1], as: VMJsonDecoderPayload.self) else {
+                guard let cls = runtime.classOf(args[1]), let method = cls.lookupVirtual(key: "decodeInt()I") else { return .null }
+                let ordinal = Int(try runtime.invoke(method, [args[1]]).asInt32)
+                guard ordinal >= 0, ordinal < payload.values.count else {
+                    throw VMJavaException("Lkotlinx/serialization/SerializationException;", "invalid enum ordinal \(ordinal) for \(payload.serialName)")
+                }
+                return payload.values[ordinal]
+            }
             let name = decoder.tree.stringValue ?? ""
             if let index = payload.names.firstIndex(of: name) { return payload.values[index] }
             throw VMJavaException("Lkotlinx/serialization/SerializationException;", "unknown enum value \(name) for \(payload.serialName)")
@@ -1809,7 +2167,7 @@ struct SerializationRuntime {
         }
         result.append(elementBuilders)
 
-        let jsonNames = NativeClass("Lkotlinx/serialization/json/JsonNames;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        let jsonNames = NativeClass("Lkotlinx/serialization/json/JsonNames;", superclass: nil, interfaces: ["Ljava/lang/annotation/Annotation;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         jsonNames.method("names", "()[Ljava/lang/String;") { runtime, _, _ in
             runtime.newArray(component: "Ljava/lang/String;", count: 0)
         }
@@ -2422,24 +2780,46 @@ struct SerializationRuntime {
             return runtime.makeNative("Lkotlinx/serialization/json/JsonCompositeDecoder;", payload: VMJsonDecoderPayload(tree: payload.tree, descriptor: descriptor, isComposite: true, module: payload.module))
         }
         cls.method("decodeSequentially", "()Z") { _, _, _ in .boolean(false) }
+        // kotlinx reports an element only when the JSON object actually has it.
+        // Reporting every descriptor element would make the generated
+        // synthetic-constructor mask mark absent fields as seen and pass
+        // `default`/`null` instead of the property's default value (an
+        // optional `List<T>` became null rather than `emptyList()`).
         cls.method("decodeElementIndex", "(Lkotlinx/serialization/descriptors/SerialDescriptor;)I") { runtime, args, _ in
             guard let payload: VMJsonDecoderPayload = runtime.payload(args[0], as: VMJsonDecoderPayload.self),
                   let descriptor = runtime.payload(args[1], as: VMSerialDescriptorPayload.self),
                   case .object(let fields) = payload.tree.kind else { return .int32(-1) }
-            while payload.cursor < descriptor.elements.count {
-                let index = payload.cursor
-                payload.cursor += 1
-                if runtime.traceEnabled {
-                    let present = fields[descriptor.elements[index].name] != nil
+            if payload.pendingIndices == nil || payload.pendingDescriptor !== descriptor {
+                var indices: [Int32] = []
+                indices.reserveCapacity(descriptor.elements.count)
+                for (index, element) in descriptor.elements.enumerated() {
+                    let present = fields[element.name] != nil
                         || (descriptor.aliases[index] ?? []).contains(where: { fields[$0] != nil })
-                    FileHandle.standardError.write("DEC index \(descriptor.serialName)[\(index)=\(descriptor.elements[index].name)] present=\(present)\n".data(using: .utf8)!)
+                    // Absent *optional* elements are skipped so the generated
+                    // synthetic constructor applies the property's default
+                    // (`emptyList()` instead of null). Required elements keep
+                    // the engine's historical tolerance: return them so an
+                    // absent key decodes as the element's zero/null value
+                    // instead of aborting a whole feed over one missing field.
+                    if present || !element.optional { indices.append(Int32(index)) }
                 }
-                return .int32(Int32(index))
+                payload.pendingIndices = indices
+                payload.pendingDescriptor = descriptor
+                payload.cursor = 0
             }
+            guard let indices = payload.pendingIndices, payload.cursor < indices.count else {
+                if runtime.traceEnabled {
+                    FileHandle.standardError.write("DEC end \(descriptor.serialName) elements=\(descriptor.elements.count)\n".data(using: .utf8)!)
+                }
+                return .int32(-1)
+            }
+            let index = indices[payload.cursor]
+            payload.cursor += 1
             if runtime.traceEnabled {
-                FileHandle.standardError.write("DEC end \(descriptor.serialName) elements=\(descriptor.elements.count)\n".data(using: .utf8)!)
+                let name = Int(index) < descriptor.elements.count ? descriptor.elements[Int(index)].name : ""
+                FileHandle.standardError.write("DEC index \(descriptor.serialName)[\(index)=\(name)]\n".data(using: .utf8)!)
             }
-            return .int32(-1)
+            return .int32(index)
         }
         cls.method("endStructure", "(Lkotlinx/serialization/descriptors/SerialDescriptor;)V") { _, _, _ in .zero }
         cls.method("decodeNotNullMark", "()Z") { _, _, _ in .boolean(true) }
@@ -2509,7 +2889,9 @@ extension VMRuntime {
     func primitiveSerializer(_ companion: String) -> VMValue {
         if let cached = primitiveSerializerCache[companion] { return cached }
         let type = companion.replacingOccurrences(of: "CompanionObject", with: "")
-        let descriptor = makeNative("Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;", payload: VMSerialDescriptorPayload(serialName: type.uppercased()))
+        let payload = VMSerialDescriptorPayload(serialName: type.uppercased())
+        payload.kind = .primitive(type)
+        let descriptor = makeNative("Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;", payload: payload)
         let serializer = makeNative("Lkotlinx/serialization/internal/\(type)Serializer;", payload: VMSerializerPayload(kind: .primitive(type), descriptor: descriptor))
         primitiveSerializerCache[companion] = serializer
         return serializer

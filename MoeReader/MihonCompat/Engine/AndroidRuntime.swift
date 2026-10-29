@@ -27,10 +27,81 @@ final class VMSharedPreferencesPayload {
     init(preferences: VMPreferences) { self.preferences = preferences }
 }
 
+/// A value written to `SharedPreferences`, tagged with the Java type the write
+/// used. The store exposes typed getters but not the stored value's type, so an
+/// editor commit compares through this model to decide whether a value changed.
+enum VMSharedPreferenceValue: Equatable {
+    case string(String)
+    case bool(Bool)
+    case int(Int)
+    case stringSet(Set<String>)
+
+    /// The value one staged editor entry writes.
+    init?(_ entry: Any) {
+        switch entry {
+        case let text as String: self = .string(text)
+        case let flag as Bool: self = .bool(flag)
+        case let number as Int: self = .int(number)
+        case let strings as Set<String>: self = .stringSet(strings)
+        default: return nil
+        }
+    }
+
+    /// Android compares values before writing: a no-op edit does not touch the
+    /// store and does not notify listeners. String sets compare by content.
+    func matches(_ stored: VMSharedPreferenceValue?) -> Bool {
+        guard let stored else { return false }
+        if self == stored { return true }
+        // The store's typed getters cannot distinguish `false` from `0`, so a
+        // stored zero matches either write; the stored bytes are the same.
+        switch (self, stored) {
+        case (.bool(false), .int(0)), (.int(0), .bool(false)): return true
+        default: return false
+        }
+    }
+}
+
+/// Change listeners registered on one preferences store, plus the instance
+/// Android hands them. Android keeps the registrations per preferences file and
+/// fires only for keys whose value actually changed.
+final class VMSharedPreferencesListeners {
+    private struct Entry {
+        var key: String?
+        var listener: VMValue
+    }
+
+    /// The `SharedPreferences` object the listeners registered on; Android
+    /// passes the same instance back to `onSharedPreferenceChanged`.
+    var owner: VMValue = .null
+
+    private var entries: [Entry] = []
+
+    var isEmpty: Bool { entries.isEmpty }
+
+    /// `key == nil` subscribes to every key, like Android's plain registration.
+    /// Registering the same listener for the same scope twice is a no-op.
+    func register(_ listener: VMValue, forKey key: String? = nil) {
+        guard listener.object != nil else { return }
+        guard !entries.contains(where: { $0.key == key && $0.listener.bits == listener.bits }) else { return }
+        entries.append(Entry(key: key, listener: listener))
+    }
+
+    func unregister(_ listener: VMValue, forKey key: String? = nil) {
+        entries.removeAll { $0.key == key && $0.listener.bits == listener.bits }
+    }
+
+    func listeners(forKey key: String) -> [VMValue] {
+        entries.filter { $0.key == nil || $0.key == key }.map(\.listener)
+    }
+}
+
 final class VMEditorPayload {
     let preferences: VMPreferences
     var values: [String: Any] = [:]
     var removals: Set<String> = []
+    /// `clear()` was called: Android marks every stored key modified, and a
+    /// later `put` of the same value still notifies because the map was wiped.
+    var cleared = false
     init(preferences: VMPreferences) { self.preferences = preferences }
 }
 
@@ -616,7 +687,18 @@ enum AndroidRuntime {
         prefs.method("getLong", "(Ljava/lang/String;J)J") { _, _, _ in .int64(0) }
         prefs.method("getStringSet", "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;") { _, args, _ in args[2] }
         prefs.method("edit", "()Landroid/content/SharedPreferences$Editor;") { _, _, _ in .null }
+        prefs.method("registerOnSharedPreferenceChangeListener", "(Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;)V") { _, _, _ in .zero }
+        prefs.method("unregisterOnSharedPreferenceChangeListener", "(Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;)V") { _, _, _ in .zero }
         result.append(prefs)
+
+        let changeListener = NativeClass(
+            "Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        changeListener.method("onSharedPreferenceChanged", "(Landroid/content/SharedPreferences;Ljava/lang/String;)V") { _, _, _ in .zero }
+        result.append(changeListener)
 
         let editor = NativeClass("Landroid/content/SharedPreferences$Editor;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         editor.method("putString", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;") { _, args, _ in args[0] }
@@ -677,6 +759,16 @@ enum AndroidRuntime {
             let entries = payload.preferences.allKeys().map { ($0, payload.preferences.string(forKey: $0) ?? "") }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries.map { (runtime.newString($0.0), runtime.newString($0.1)) }))
         }
+        impl.method("registerOnSharedPreferenceChangeListener", "(Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;)V") { runtime, args, _ in
+            let payload: VMSharedPreferencesPayload = try runtime.payloadBox(args[0])
+            runtime.registerSharedPreferenceChangeListener(args[1], on: args[0], in: payload.preferences)
+            return .zero
+        }
+        impl.method("unregisterOnSharedPreferenceChangeListener", "(Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;)V") { runtime, args, _ in
+            let payload: VMSharedPreferencesPayload = try runtime.payloadBox(args[0])
+            runtime.unregisterSharedPreferenceChangeListener(args[1], in: payload.preferences)
+            return .zero
+        }
         result.append(impl)
 
         let editorImpl = NativeClass("Lmihoncompat/EditorImpl;", superclass: "Ljava/lang/Object;", interfaces: ["Landroid/content/SharedPreferences$Editor;"])
@@ -708,12 +800,19 @@ enum AndroidRuntime {
         }
         editorImpl.method("remove", "(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;") { runtime, args, _ in
             let payload: VMEditorPayload = try runtime.payloadBox(args[0])
-            payload.removals.insert(runtime.stringValue(args[1]) ?? "")
+            let key = runtime.stringValue(args[1]) ?? ""
+            // Android's editor keeps one entry per key: a later `remove`
+            // replaces a value staged earlier by `put`.
+            payload.values.removeValue(forKey: key)
+            payload.removals.insert(key)
             return args[0]
         }
         editorImpl.method("clear", "()Landroid/content/SharedPreferences$Editor;") { runtime, args, _ in
             let payload: VMEditorPayload = try runtime.payloadBox(args[0])
+            // `clear()` wipes the stored map at commit time; edits staged before
+            // it still apply afterwards, as `EditorImpl.mModified` survives.
             for key in payload.preferences.allKeys() { payload.removals.insert(key) }
+            payload.cleared = true
             return args[0]
         }
         editorImpl.method("apply", "()V") { runtime, args, _ in
@@ -779,10 +878,19 @@ enum AndroidRuntime {
         // `Application` is a `ContextWrapper` on Android, and extensions reach
         // the wrapper-only members (`getExternalCacheDir`, `getResources`)
         // through the application instance Injekt hands them.
+        // `Application` is the engine's catch-all injected instance: Injekt's
+        // type token drops the generic argument under R8, so a token can only
+        // be satisfied by what the instance *is*. Declaring the formats here
+        // makes `injekt<Json>()` and `injekt<ProtoBuf>()` casts succeed; both
+        // classes' members then dispatch through the interface entry.
         let application = NativeClass(
             "Landroid/app/Application;",
             superclass: "Landroid/content/ContextWrapper;",
-            interfaces: ["Landroid/content/SharedPreferences;", "Lkotlinx/serialization/json/Json;"]
+            interfaces: [
+                "Landroid/content/SharedPreferences;",
+                "Lkotlinx/serialization/json/Json;",
+                "Lkotlinx/serialization/protobuf/ProtoBuf;",
+            ]
         )
         application.method("<init>", "()V") { _, _, _ in .zero }
         application.method("onCreate", "()V") { _, _, _ in .zero }
@@ -834,6 +942,21 @@ enum AndroidRuntime {
             let prefs = runtime.host?.preferences() ?? VMInMemoryPreferences()
             let entries = prefs.allKeys().map { (runtime.newString($0), runtime.newString(prefs.string(forKey: $0) ?? "")) }
             return runtime.makeNative("Ljava/util/LinkedHashMap;", payload: VMMapPayload(entries))
+        }
+        // `Application` declares the `SharedPreferences` interface here, so an
+        // extension that registers through the injected instance must see the
+        // same notifications as one holding `getSharedPreferences`'s result.
+        application.method("registerOnSharedPreferenceChangeListener", "(Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;)V") { runtime, args, _ in
+            if let prefs = runtime.host?.preferences() {
+                runtime.registerSharedPreferenceChangeListener(args[1], on: args[0], in: prefs)
+            }
+            return .zero
+        }
+        application.method("unregisterOnSharedPreferenceChangeListener", "(Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;)V") { runtime, args, _ in
+            if let prefs = runtime.host?.preferences() {
+                runtime.unregisterSharedPreferenceChangeListener(args[1], in: prefs)
+            }
+            return .zero
         }
         // The engine drives no activity lifecycle, so listeners are only kept:
         // registration and removal answer each other and nothing is ever
@@ -1019,15 +1142,121 @@ enum AndroidRuntime {
 extension VMRuntime {
     func commitEditor(_ value: VMValue) throws {
         let payload: VMEditorPayload = try payloadBox(value)
-        for key in payload.removals { payload.preferences.removeValue(forKey: key) }
-        for (key, entry) in payload.values {
-            switch entry {
-            case let text as String: payload.preferences.setString(text, forKey: key)
-            case let flag as Bool: payload.preferences.setBool(flag, forKey: key)
-            case let number as Int: payload.preferences.setInt(number, forKey: key)
-            case let strings as Set<String>: payload.preferences.setStringSet(strings, forKey: key)
-            default: break
+        let preferences = payload.preferences
+        // Android's `commitToMemory` applies every staged change first and only
+        // then notifies listeners, so a throwing listener cannot skip the rest
+        // of the batch. A key the same editor both removed and wrote ends with
+        // the written value (a `put` after `clear` survives on Android), so only
+        // that value is applied and reported.
+        var changed: [String] = []
+        for key in payload.removals.sorted() where payload.values[key] == nil {
+            if removeSharedPreferenceValue(forKey: key, in: preferences) { changed.append(key) }
+        }
+        for key in payload.values.keys.sorted() {
+            guard let entry = payload.values[key], let stored = VMSharedPreferenceValue(entry) else { continue }
+            if storeSharedPreferenceValue(stored, forKey: key, in: preferences, force: payload.cleared) {
+                changed.append(key)
             }
+        }
+        for key in changed { try notifySharedPreferenceChange(key: key, in: preferences) }
+    }
+
+    /// The value behind `key`, tagged with the type the store's typed getters
+    /// imply. `nil` when the key is absent.
+    func storedSharedPreferenceValue(_ preferences: VMPreferences, forKey key: String) -> VMSharedPreferenceValue? {
+        guard preferences.allKeys().contains(key) else { return nil }
+        if let text = preferences.string(forKey: key) { return .string(text) }
+        if let strings = preferences.stringSet(forKey: key) { return .stringSet(strings) }
+        if preferences.bool(forKey: key) { return .bool(true) }
+        let number = preferences.int(forKey: key)
+        if number != 0 { return .int(number) }
+        // `false` and `0` read back identically through the store API.
+        return .int(0)
+    }
+
+    func applySharedPreferenceValue(_ value: VMSharedPreferenceValue, forKey key: String, in preferences: VMPreferences) {
+        switch value {
+        case .string(let text): preferences.setString(text, forKey: key)
+        case .bool(let flag): preferences.setBool(flag, forKey: key)
+        case .int(let number): preferences.setInt(number, forKey: key)
+        case .stringSet(let strings): preferences.setStringSet(strings, forKey: key)
+        }
+    }
+
+    /// The boxed Java value a listener receives for a stored value.
+    func sharedPreferenceValue(_ value: VMSharedPreferenceValue) -> VMValue {
+        switch value {
+        case .string(let text): return newString(text)
+        case .bool(let flag): return boxBoolean(flag)
+        case .int(let number): return boxInt(Int32(truncatingIfNeeded: number))
+        case .stringSet(let strings):
+            return makeNative("Ljava/util/LinkedHashSet;", payload: VMSetPayload(strings.map { newString($0) }))
+        }
+    }
+
+    /// Stores `value` only when the store's value differs: Android writes the
+    /// file for real changes only. `force` is the `clear()` case, where Android
+    /// treats the rewritten value as a change. Returns whether the store was
+    /// written; the caller notifies listeners once the batch is applied.
+    @discardableResult
+    func storeSharedPreferenceValue(
+        _ value: VMSharedPreferenceValue,
+        forKey key: String,
+        in preferences: VMPreferences,
+        force: Bool = false
+    ) -> Bool {
+        if !force, value.matches(storedSharedPreferenceValue(preferences, forKey: key)) { return false }
+        applySharedPreferenceValue(value, forKey: key, in: preferences)
+        return true
+    }
+
+    /// Removes `key` when it is stored. Returns whether the store changed.
+    @discardableResult
+    func removeSharedPreferenceValue(forKey key: String, in preferences: VMPreferences) -> Bool {
+        guard preferences.allKeys().contains(key) else { return false }
+        preferences.removeValue(forKey: key)
+        return true
+    }
+
+    func sharedPreferenceListeners(for preferences: VMPreferences) -> VMSharedPreferencesListeners {
+        let identifier = ObjectIdentifier(preferences)
+        if let existing = sharedPreferenceListenerHubs[identifier] { return existing }
+        let created = VMSharedPreferencesListeners()
+        sharedPreferenceListenerHubs[identifier] = created
+        return created
+    }
+
+    func registerSharedPreferenceChangeListener(
+        _ listener: VMValue,
+        forKey key: String? = nil,
+        on owner: VMValue? = nil,
+        in preferences: VMPreferences
+    ) {
+        let hub = sharedPreferenceListeners(for: preferences)
+        if let owner, owner.object != nil { hub.owner = owner }
+        hub.register(listener, forKey: key)
+    }
+
+    func unregisterSharedPreferenceChangeListener(
+        _ listener: VMValue,
+        forKey key: String? = nil,
+        in preferences: VMPreferences
+    ) {
+        let identifier = ObjectIdentifier(preferences)
+        guard let hub = sharedPreferenceListenerHubs[identifier] else { return }
+        hub.unregister(listener, forKey: key)
+        if hub.isEmpty { sharedPreferenceListenerHubs.removeValue(forKey: identifier) }
+    }
+
+    func notifySharedPreferenceChange(key: String, in preferences: VMPreferences) throws {
+        guard let hub = sharedPreferenceListenerHubs[ObjectIdentifier(preferences)] else { return }
+        let listeners = hub.listeners(forKey: key)
+        guard !listeners.isEmpty else { return }
+        let callback = "onSharedPreferenceChanged(Landroid/content/SharedPreferences;Ljava/lang/String;)V"
+        let keyValue = newString(key)
+        for listener in listeners {
+            guard let method = classOf(listener)?.lookupVirtual(key: callback) else { continue }
+            _ = try invoke(method, [listener, hub.owner, keyValue])
         }
     }
 }

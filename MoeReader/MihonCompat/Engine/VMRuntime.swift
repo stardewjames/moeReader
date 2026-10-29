@@ -79,6 +79,9 @@ final class VMRuntime: @unchecked Sendable {
 
     /// Native payload table. `aux` of a native object stores index + 1.
     var nativeObjects: [Any] = []
+    /// `SharedPreferences.OnSharedPreferenceChangeListener` registrations, one
+    /// hub per store. Hubs hold `VMValue`s, so they die with the arena.
+    var sharedPreferenceListenerHubs: [ObjectIdentifier: VMSharedPreferencesListeners] = [:]
 
     private var stringConstants: [ObjectIdentifier: [Int: VMValue]] = [:]
     var boxedPrimitiveCache: [String: [Int64: VMValue]] = [:]
@@ -88,6 +91,9 @@ final class VMRuntime: @unchecked Sendable {
 
     weak var host: VMHost?
     var standardOutput: ((String) -> Void)?
+    /// Method currently executing, for diagnostics that fire without a Java
+    /// stack (a class that cannot be linked).
+    private(set) var activeFrame = ""
     /// Guards runaway execution in a hostile extension.
     var instructionBudget = 50_000_000
     private var instructionsExecuted = 0
@@ -414,6 +420,7 @@ final class VMRuntime: @unchecked Sendable {
     func resetArena() {
         heap.reset()
         nativeObjects.removeAll(keepingCapacity: false)
+        sharedPreferenceListenerHubs.removeAll(keepingCapacity: false)
         stringConstants.removeAll(keepingCapacity: false)
         boxedPrimitiveCache.removeAll(keepingCapacity: false)
         classObjects.removeAll(keepingCapacity: false)
@@ -444,6 +451,9 @@ final class VMRuntime: @unchecked Sendable {
         if traceEnabled {
             FileHandle.standardError.write("CALL \(method.ownerDescriptor).\(method.key)\n".data(using: .utf8)!)
         }
+        let previousFrame = activeFrame
+        activeFrame = "\(method.ownerDescriptor).\(method.key)"
+        defer { activeFrame = previousFrame }
         try checkNativeStack()
         if let body = method.body {
             let parameterCount = (method.isStatic ? 0 : 1) + method.parameterTypes.count
@@ -641,10 +651,19 @@ struct VMCallTimeout: Error, CustomStringConvertible, Equatable {
 }
 
 extension VMClass {
+    /// Declaration lookup by key for `invoke-direct`, `invoke-super` and the
+    /// `AbstractMethodError` diagnosis. Instance declarations win over a static
+    /// with the same key: bytecode cannot hold both, but a native host may
+    /// register a static helper beside an instance helper.
     func findMethodByKey(_ key: String) -> VMMethod? {
         var cursor: VMClass? = self
         while let cls = cursor {
             if let method = cls.methods[key] { return method }
+            cursor = cls.superclass
+        }
+        cursor = self
+        while let cls = cursor {
+            if let method = cls.staticMethods[key] { return method }
             cursor = cls.superclass
         }
         return nil

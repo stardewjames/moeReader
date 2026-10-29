@@ -885,9 +885,10 @@ enum PlatformRuntime {
         let cookieJar = NativeClass("Lokhttp3/CookieJar;", superclass: "Ljava/lang/Object;")
         cookieJar.staticField("NO_COOKIES", "Lokhttp3/CookieJar;")
         cookieJar.prepare = { runtime, cls in
-            cls.staticValues[0] = runtime.makeNative("Lokhttp3/CookieJar;", payload: NSNull())
+            cls.staticValues[0] = runtime.makeNative("Lokhttp3/CookieJar;", payload: VMNoCookiesJar())
         }
         cookieJar.method("saveFromResponse", "(Lokhttp3/HttpUrl;Ljava/util/List;)V") { runtime, args, _ in
+            guard runtime.payload(args[0], as: VMSharedCookieJar.self) != nil else { return .zero }
             let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
             for item in runtime.listItems(args[2]) ?? [] {
                 guard let payload = runtime.payload(item, as: VMHttpCookiePayload.self),
@@ -897,10 +898,12 @@ enum PlatformRuntime {
             return .zero
         }
         cookieJar.method("loadForRequest", "(Lokhttp3/HttpUrl;)Ljava/util/List;") { runtime, args, _ in
-            let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
             var values: [VMValue] = []
-            if let url = runtime.payload(args[1], as: VMHttpUrlPayload.self), let host = URL(string: url.string) {
-                for stored in storage.cookies(for: host) ?? [] {
+            let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
+            if runtime.payload(args[0], as: VMSharedCookieJar.self) != nil,
+               let url = runtime.payload(args[1], as: VMHttpUrlPayload.self),
+               let target = URL(string: url.string) {
+                for stored in VMCookieJar.cookies(storage: storage, for: target) {
                     values.append(runtime.makeNative("Lokhttp3/Cookie;", payload: VMHttpCookiePayload(stored)))
                 }
             }
