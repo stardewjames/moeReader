@@ -618,66 +618,52 @@ extension JsoupHTML {
                 name.append(content[index])
                 index = content.index(after: index)
             }
-            var currentName: String?
-            var currentValue = ""
-            var inQuote: Character?
-            var expectingValue = false
-            var buffer = ""
-            while index < content.endIndex {
-                let character = content[index]
-                index = content.index(after: index)
-                if let quote = inQuote {
-                    if character == quote {
-                        inQuote = nil
-                        if let name = currentName {
-                            attributes.append((name, decodeEntities(currentValue)))
-                        }
-                        currentName = nil
-                        currentValue = ""
-                        expectingValue = false
-                    } else {
-                        currentValue.append(character)
-                    }
-                    continue
+
+            func skipWhitespace() {
+                while index < content.endIndex, content[index].isWhitespace {
+                    index = content.index(after: index)
                 }
-                if character == "\"" || character == "'" {
-                    inQuote = character
-                    continue
-                }
-                if character == "=" {
-                    expectingValue = true
-                    currentName = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                    buffer = ""
-                    continue
-                }
-                if character.isWhitespace {
-                    if !buffer.isEmpty {
-                        if expectingValue {
-                            currentValue += buffer
-                            buffer = ""
-                        } else if let name = currentName {
-                            attributes.append((name, currentValue))
-                            currentName = nil
-                            currentValue = ""
-                        } else {
-                            attributes.append((buffer, ""))
-                            buffer = ""
-                        }
-                    } else if expectingValue {
-                        // value continues after whitespace
-                    }
-                    continue
-                }
-                buffer.append(character)
             }
-            if !buffer.isEmpty {
-                if expectingValue, let name = currentName {
-                    attributes.append((name, decodeEntities(buffer)))
-                } else {
-                    attributes.append((buffer, ""))
+
+            while true {
+                skipWhitespace()
+                guard index < content.endIndex, content[index] != "/" else { return }
+                var attribute = ""
+                while index < content.endIndex,
+                      !content[index].isWhitespace,
+                      content[index] != "=",
+                      content[index] != "/" {
+                    attribute.append(content[index])
+                    index = content.index(after: index)
                 }
-            } else if expectingValue, let name = currentName {
-                attributes.append((name, ""))
+                guard !attribute.isEmpty else {
+                    index = content.index(after: index)
+                    continue
+                }
+                skipWhitespace()
+                guard index < content.endIndex, content[index] == "=" else {
+                    attributes.append((attribute, ""))
+                    continue
+                }
+                index = content.index(after: index)
+                skipWhitespace()
+                var value = ""
+                if index < content.endIndex, content[index] == "\"" || content[index] == "'" {
+                    let quote = content[index]
+                    index = content.index(after: index)
+                    while index < content.endIndex, content[index] != quote {
+                        value.append(content[index])
+                        index = content.index(after: index)
+                    }
+                    if index < content.endIndex { index = content.index(after: index) }
+                } else {
+                    // HTML allows unquoted values; they end at whitespace.
+                    while index < content.endIndex, !content[index].isWhitespace {
+                        value.append(content[index])
+                        index = content.index(after: index)
+                    }
+                }
+                attributes.append((attribute, decodeEntities(value)))
             }
         }
     }

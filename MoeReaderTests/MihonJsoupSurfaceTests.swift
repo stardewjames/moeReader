@@ -164,6 +164,40 @@ final class MihonJsoupSurfaceTests: XCTestCase {
         XCTAssertEqual(try string(runtime, "Lorg/jsoup/nodes/Attribute;", "getValue", "()Ljava/lang/String;", receiver: attribute), "lead")
     }
 
+    /// HTML permits unquoted attribute values. A tag such as
+    /// `<img src=/a/b.jpg alt='text'>` must keep `src` when the next attribute
+    /// starts, and `abs:src` must resolve it against the document.
+    func testUnquotedAttributesSurviveAdjacentAttributes() throws {
+        let runtime = VMRuntime()
+        let document = try parseDocument(runtime, """
+        <div class=main-image-container data-x=one?y=2><picture>\
+        <img src=/comic/a/b.jpg alt='two words' hidden></picture></div>
+        """)
+        let image = try first(runtime, of: try elements(runtime, in: document, selector: "div.main-image-container img"))
+        XCTAssertEqual(
+            try string(runtime, "Lorg/jsoup/nodes/Element;", "attr", "(Ljava/lang/String;)Ljava/lang/String;", [runtime.newString("src")], receiver: image),
+            "/comic/a/b.jpg"
+        )
+        XCTAssertEqual(
+            try string(runtime, "Lorg/jsoup/nodes/Element;", "attr", "(Ljava/lang/String;)Ljava/lang/String;", [runtime.newString("abs:src")], receiver: image),
+            "https://example.test/comic/a/b.jpg"
+        )
+        XCTAssertEqual(
+            try string(runtime, "Lorg/jsoup/nodes/Element;", "attr", "(Ljava/lang/String;)Ljava/lang/String;", [runtime.newString("alt")], receiver: image),
+            "two words"
+        )
+        XCTAssertEqual(
+            try string(runtime, "Lorg/jsoup/nodes/Element;", "attr", "(Ljava/lang/String;)Ljava/lang/String;", [runtime.newString("hidden")], receiver: image),
+            ""
+        )
+        let container = try first(runtime, of: try elements(runtime, in: document, selector: "div.main-image-container"))
+        XCTAssertEqual(
+            try string(runtime, "Lorg/jsoup/nodes/Element;", "attr", "(Ljava/lang/String;)Ljava/lang/String;", [runtime.newString("data-x")], receiver: container),
+            "one?y=2"
+        )
+        XCTAssertEqual(try string(runtime, "Lorg/jsoup/nodes/Element;", "html", "()Ljava/lang/String;", receiver: container)?.contains("src=\"/comic/a/b.jpg\""), true)
+    }
+
     func testParsedAttributesIteratorFindsDataAttribute() throws {
         let runtime = VMRuntime()
         let document = try parseDocument(runtime, """

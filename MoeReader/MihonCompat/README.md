@@ -303,7 +303,8 @@ and the suspend lib-1.6 API in practice:
   tree-builder choice (XML documents keep no implied tags), `Document`,
   `Element`, `Elements`, `Attributes`/`Attribute`, `TextNode` and `Node`,
   `Jsoup.parse`/`parseBodyFragment`, iterable `Attributes` whose entries expose
-  their keys and values, text and attribute access including `hasText`,
+  their keys and values, quoted and unquoted attribute values, text and
+  attribute access including `hasText`,
   a CSS selector engine (`>`, `+`, `~`, `:has`, `:is`,
   `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), typed
   `Evaluator` instances, and the
@@ -394,8 +395,9 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - `MihonJsoupSurfaceTests` covers `Parser.htmlParser()`/`xmlParser()` tree
   selection, XML parsing, element/attribute mutation and `TextNode`/
   `Attributes` access and iteration (including empty/exhausted iterators),
-  typed evaluator parity with string selectors, fail-closed helper statics,
-  and a 2 MB page select inside the time budget.
+  unquoted attribute values surviving adjacent attributes and `abs:`
+  resolution, typed evaluator parity with string selectors, fail-closed helper
+  statics, and a 2 MB page select inside the time budget.
 - `OkioOkHttpSurfaceTests` covers `ByteString` representations, base64/hex
   decoding, digest vectors, equality/slicing, buffer ordering and EOF checks,
   `BufferedSource` reads/skips/ranges, `ResponseBody.Companion.create` with
