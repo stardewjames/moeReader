@@ -2616,8 +2616,13 @@ enum WebKitRuntime {
 /// queue (`WebKitRuntime.runOnMain` keeps the engine draining its events while
 /// it waits), and every callback reaches the interpreter through
 /// `VMWebViewEvents`; nothing re-enters the interpreter from the main thread.
-final class VMWKWebViewPlatform: NSObject, VMWebViewPlatform, WKNavigationDelegate, WKScriptMessageHandler,
-    WKUIDelegate, @unchecked Sendable {
+///
+/// `WKNavigationDelegate` and its siblings are main-actor protocols, so the
+/// class inherits that isolation while `VMWebViewPlatform` is engine-thread
+/// API. `@preconcurrency` on that conformance records the hop each method makes
+/// through `onMain` instead of pretending the two actors are one.
+final class VMWKWebViewPlatform: NSObject, @preconcurrency VMWebViewPlatform,
+    WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate, @unchecked Sendable {
     static let consoleHandler = "mihonConsole"
 
     /// Overrides `console.*` so page messages reach `onConsoleMessage`.
