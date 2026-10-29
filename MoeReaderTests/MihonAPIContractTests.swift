@@ -534,6 +534,65 @@ final class MihonAPIContractTests: XCTestCase {
         XCTAssertTrue(updated[3].ascending)
     }
 
+    /// Filters nested inside a group keep their constructor defaults until a
+    /// selection names their positional path, and replaying one child leaves
+    /// its siblings untouched.
+    func testNestedFilterReplayAppliesSelectionAndKeepsDefaults() throws {
+        let runtime = VMRuntime()
+        func construct(_ descriptor: String, _ signature: String, _ arguments: [VMValue]) throws -> VMValue {
+            let cls = try runtime.linkClass(descriptor)
+            let value = VMValue.reference(runtime.allocateObject(cls))
+            let constructor = try XCTUnwrap(cls.lookupVirtual(key: "<init>" + signature))
+            _ = try runtime.invoke(constructor, [value] + arguments)
+            return value
+        }
+
+        let values = runtime.newArray(component: "Ljava/lang/Object;", count: 3)
+        runtime.setArrayElement(values, index: 0, value: runtime.newString("Any"))
+        runtime.setArrayElement(values, index: 1, value: runtime.newString("Action"))
+        runtime.setArrayElement(values, index: 2, value: runtime.newString("Drama"))
+        let select = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$Select;",
+            "(Ljava/lang/String;[Ljava/lang/Object;I)V",
+            [runtime.newString("Genre"), values, .int32(0)]
+        )
+        let triState = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$TriState;",
+            "(Ljava/lang/String;I)V",
+            [runtime.newString("Status"), .int32(0)]
+        )
+        let text = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$Text;",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            [runtime.newString("Query"), runtime.newString("initial")]
+        )
+        let children = runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload([select, triState, text]))
+        let group = try construct(
+            "Leu/kanade/tachiyomi/source/model/Filter$Group;",
+            "(Ljava/lang/String;Ljava/util/List;)V",
+            [runtime.newString("Filters"), children]
+        )
+        let list = runtime.makeNative(
+            "Leu/kanade/tachiyomi/source/model/FilterList;",
+            payload: VMListPayload([group])
+        )
+
+        let tree = MihonFilters.tree(runtime: runtime, list: list)
+        let nested = try XCTUnwrap(tree.first)
+        XCTAssertEqual(nested.children.map(\.id), ["0.0", "0.1", "0.2"])
+        XCTAssertEqual(nested.children.map(\.value), ["0", "0", "initial"])
+
+        MihonFilters.apply(
+            runtime: runtime,
+            list: list,
+            selections: ["0.0": MihonFilterSelection(value: "2")]
+        )
+        let updated = try XCTUnwrap(MihonFilters.tree(runtime: runtime, list: list).first)
+        XCTAssertEqual(updated.children[0].value, "2")
+        XCTAssertEqual(updated.children[1].value, "0")
+        XCTAssertEqual(updated.children[2].value, "initial")
+    }
+
     func testFilterObjectStateIsBoxedAndDefaultArgumentsApply() throws {
         let runtime = VMRuntime()
         func construct(_ descriptor: String, _ signature: String, _ arguments: [VMValue]) throws -> VMValue {
@@ -760,6 +819,7 @@ final class MihonAPIContractTests: XCTestCase {
                 "super": cls.superDescriptor ?? "",
                 "interfaces": cls.interfaces,
                 "methods": cls.methods.map { $0.name + $0.signature },
+                "fields": (cls.instanceFields + cls.staticFields).map { $0.name + ":" + $0.type },
             ]
         }
         let data = try JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys])

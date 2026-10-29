@@ -1450,12 +1450,10 @@ enum MihonAPI {
             result.append(cls)
         }
 
-        // The compiled host surface (and the oneechan runtime overlay) exposes only
-        // `client`, `cloudflareClient` and `defaultUserAgentProvider()`. The reference
-        // implementations also have a `cookieJar`, but its concrete type differs per
-        // host (`McCookieJar`/`AndroidCookieJar`/`PersistentCookieJar`) and no such
-        // native class or real cookie store exists here, so `getCookieJar` is
-        // deliberately absent rather than returning a fake no-op jar.
+        // The reference hosts expose `cookieJar` through this getter; the
+        // concrete type differs per host, so the engine returns one instance
+        // whose `saveFromResponse`/`loadForRequest` run over the same shared
+        // jar the transport and WebView use.
         let helper = NativeClass("Leu/kanade/tachiyomi/network/NetworkHelper;", superclass: "Ljava/lang/Object;")
         helper.method("<init>", "(Landroid/content/Context;)V") { runtime, args, _ in
             let payload = VMSourcePayload()
@@ -1469,6 +1467,9 @@ enum MihonAPI {
             let client = runtime.defaultMihonClient()
             payload?.client = client
             return client
+        }
+        helper.method("getCookieJar", "()Lokhttp3/CookieJar;") { runtime, _, _ in
+            runtime.makeNative("Lokhttp3/CookieJar;", payload: VMSharedCookieJar())
         }
         result.append(helper)
 

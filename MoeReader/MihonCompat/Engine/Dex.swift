@@ -58,12 +58,15 @@ struct DexCode {
     let registersSize: Int
     let insSize: Int
     let outsSize: Int
-    let insns: UnsafePointer<UInt16>
+    /// First instruction unit, inside the mapped dex bytes. Kept raw and read
+    /// unaligned: a malformed `code_off` that is not 4-byte aligned must not
+    /// turn into a misaligned `UInt16` load (a SIGBUS on ARM).
+    let insns: UnsafeRawPointer
     let insnUnits: Int
     let tries: [DexTryBlock]
 
     @inline(__always) func unit(_ index: Int) -> UInt16 {
-        UInt16(littleEndian: insns[index])
+        UInt16(littleEndian: insns.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self))
     }
 }
 
@@ -473,7 +476,10 @@ final class DexFile: @unchecked Sendable {
         if interfacesOffset != 0, interfacesOffset + 4 <= buffer.count {
             let count = Int(buffer.u32(interfacesOffset))
             let available = max(0, (buffer.count - interfacesOffset - 4) / 2)
-            let safeCount = min(min(count, available), 256)
+            // `type_ids` indexes are u16, so a class definition can legally
+            // list any count that fits that table; the buffer bound is what
+            // rejects a truncated list.
+            let safeCount = min(count, available)
             if safeCount > 0 {
                 interfaces.reserveCapacity(safeCount)
                 for item in 0..<safeCount {
@@ -597,7 +603,6 @@ final class DexFile: @unchecked Sendable {
         else { return nil }
 
         let insns = UnsafeRawPointer(buffer.bytes + offset + 16)
-            .assumingMemoryBound(to: UInt16.self)
 
         var tries: [DexTryBlock] = []
         if triesSize > 0 {

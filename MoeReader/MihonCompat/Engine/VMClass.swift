@@ -170,7 +170,15 @@ final class VMClass {
     var instanceFields: [VMField] = []
     var staticFields: [VMField] = []
     var staticValues: [VMValue] = []
+    /// Instance methods, constructors and private instance methods.
+    ///
+    /// Statics live in `staticMethods`: a native registration may declare an
+    /// instance and a static method under one name+signature, so one table per
+    /// shape keeps either from shadowing the other. Bytecode cannot declare two
+    /// methods with one key, so DEX classes still hold one entry per key.
     var methods: [String: VMMethod] = [:]
+    /// Static methods declared by this class.
+    var staticMethods: [String: VMMethod] = [:]
     var privateMethods: [String: VMMethod] = [:]
 
     var nativeClass: NativeClass?
@@ -207,7 +215,11 @@ final class VMClass {
     var instanceFieldCount: Int { instanceFields.count }
 
     func addMethod(_ method: VMMethod) {
-        methods[method.key] = method
+        if method.isStatic {
+            staticMethods[method.key] = method
+        } else {
+            methods[method.key] = method
+        }
         virtualCache.removeAll(keepingCapacity: true)
         virtualMisses.removeAll(keepingCapacity: true)
     }
@@ -272,7 +284,7 @@ final class VMClass {
         // JVM resolution: concrete class hierarchy first, interface defaults only on a miss.
         var cursor: VMClass? = self
         while let cls = cursor {
-            if let method = cls.methods[key], !method.isStatic, !method.isAbstract {
+            if let method = cls.methods[key], !method.isAbstract {
                 virtualCache[key] = method
                 return method
             }
@@ -303,7 +315,7 @@ final class VMClass {
     func hasImplementation(key: String, excluding ownerDescriptors: Set<String>) -> Bool {
         var cursor: VMClass? = self
         while let cls = cursor {
-            if let method = cls.methods[key], !method.isStatic, !method.isAbstract {
+            if let method = cls.methods[key], !method.isAbstract {
                 return !ownerDescriptors.contains(cls.descriptor)
             }
             cursor = cls.superclass
@@ -316,7 +328,7 @@ final class VMClass {
         var seen: Set<ObjectIdentifier> = []
         while let cls = stack.popLast() {
             if !seen.insert(ObjectIdentifier(cls)).inserted { continue }
-            if let method = cls.methods[key], !method.isAbstract, !method.isStatic {
+            if let method = cls.methods[key], !method.isAbstract {
                 return method
             }
             stack.append(contentsOf: cls.interfaces)
@@ -326,7 +338,7 @@ final class VMClass {
 
     func findInterfaceDefaultForSuper(_ key: String) -> VMMethod? {
         for proto in interfaces {
-            if let method = proto.methods[key], !method.isAbstract, !method.isStatic {
+            if let method = proto.methods[key], !method.isAbstract {
                 return method
             }
             if let method = proto.findInterfaceDefaultForSuper(key) { return method }
@@ -338,7 +350,7 @@ final class VMClass {
         let key = name + signature
         var cursor: VMClass? = self
         while let cls = cursor {
-            if let method = cls.methods[key], method.isStatic { return method }
+            if let method = cls.staticMethods[key] { return method }
             cursor = cls.superclass
         }
         var visited: Set<ObjectIdentifier> = []
@@ -348,7 +360,7 @@ final class VMClass {
     private func findInterfaceStatic(_ key: String, visited: inout Set<ObjectIdentifier>) -> VMMethod? {
         guard visited.insert(ObjectIdentifier(self)).inserted else { return nil }
         for proto in interfaces {
-            if let method = proto.methods[key], method.isStatic { return method }
+            if let method = proto.staticMethods[key] { return method }
             if let found = proto.findInterfaceStatic(key, visited: &visited) { return found }
         }
         return nil
@@ -394,7 +406,8 @@ extension VMRuntime {
             }
         }
 
-        throw VMError.unsupported("class \(DexDescriptor.displayName(descriptor))")
+        let frame = activeFrame.isEmpty ? "" : " while \(activeFrame)"
+        throw VMError.unsupported("class \(DexDescriptor.displayName(descriptor))\(frame)")
     }
 
     private func buildNativeClass(_ native: NativeClass) throws -> VMClass {
@@ -436,14 +449,10 @@ extension VMRuntime {
                 body: method.body,
                 dex: nil
             )
-            if vm.isStatic {
-                cls.addMethod(vm)
-            } else if method.access & DexAccess.isPrivate != 0 {
+            if method.access & DexAccess.isPrivate != 0 {
                 cls.privateMethods[vm.key] = vm
-                cls.methods[vm.key] = vm
-            } else {
-                cls.addMethod(vm)
             }
+            cls.addMethod(vm)
         }
         classCache[native.descriptor] = cls
         return cls
@@ -511,12 +520,10 @@ extension VMRuntime {
                 body: nil,
                 dex: dex
             )
-            if vm.isConstructor || method.access & DexAccess.isPrivate != 0 || isStatic {
+            if vm.isConstructor || method.access & DexAccess.isPrivate != 0 {
                 cls.privateMethods[vm.key] = vm
-                cls.methods[vm.key] = vm
-            } else {
-                cls.addMethod(vm)
             }
+            cls.addMethod(vm)
         }
 
         return cls

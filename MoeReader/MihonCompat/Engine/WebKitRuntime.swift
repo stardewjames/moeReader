@@ -112,6 +112,81 @@ final class VMWebSettingsPayload: @unchecked Sendable {
     var defaultTextEncodingName = "UTF-8"
 }
 
+/// `ImageReader` state: the geometry the extension asked for and the listener
+/// it installed. No image is ever produced, so `acquireLatestImage` and
+/// `getSurface` fail closed.
+final class VMImageReaderState: @unchecked Sendable {
+    let width: Int32
+    let height: Int32
+    let format: Int32
+    let maxImages: Int32
+    var listener: VMValue = .null
+    var handler: VMValue = .null
+    var closed = false
+
+    init(width: Int32, height: Int32, format: Int32, maxImages: Int32) {
+        self.width = width
+        self.height = height
+        self.format = format
+        self.maxImages = maxImages
+    }
+}
+
+/// One pointer's coordinates copied out of a `MotionEvent.PointerCoords`.
+struct VMMotionEventPointer {
+    var x: Float = 0
+    var y: Float = 0
+    var pressure: Float = 0
+    var size: Float = 0
+    var touchMajor: Float = 0
+    var touchMinor: Float = 0
+    var toolMajor: Float = 0
+    var toolMinor: Float = 0
+    var orientation: Float = 0
+}
+
+/// The data `MotionEvent.obtain` copies from the pointer arrays. `recycle`
+/// clears it; nothing is ever delivered to a real input pipeline.
+final class VMMotionEventPayload: @unchecked Sendable {
+    var downTime: Int64 = 0
+    var eventTime: Int64 = 0
+    var action: Int32 = 0
+    var pointerCount: Int32 = 0
+    var metaState: Int32 = 0
+    var buttonState: Int32 = 0
+    var xOffset: Float = 0
+    var yOffset: Float = 0
+    var xPrecision: Float = 1
+    var yPrecision: Float = 1
+    var deviceId: Int32 = 0
+    var edgeFlags: Int32 = 0
+    var source: Int32 = 0
+    var flags: Int32 = 0
+    var pointerIds: [Int32] = []
+    var toolTypes: [Int32] = []
+    var pointers: [VMMotionEventPointer] = []
+
+    func reset() {
+        downTime = 0
+        eventTime = 0
+        action = 0
+        pointerCount = 0
+        metaState = 0
+        buttonState = 0
+        xOffset = 0
+        yOffset = 0
+        xPrecision = 1
+        yPrecision = 1
+        deviceId = 0
+        edgeFlags = 0
+        source = 0
+        flags = 0
+        pointerIds.removeAll()
+        toolTypes.removeAll()
+        pointers.removeAll()
+    }
+}
+
 final class VMWebViewPayload: VMViewPayload {
     /// The Java object, used as the first argument of client callbacks.
     var selfValue: VMValue = .null
@@ -229,6 +304,7 @@ enum WebKitRuntime {
         result += urlUtilClasses()
         result += viewClasses()
         result += webViewClasses()
+        result += displayCaptureClasses()
         result += webKitClasses()
         return result
     }
@@ -1199,6 +1275,297 @@ enum WebKitRuntime {
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36"
     }
 
+    // MARK: - Display and pointer capture
+
+    /// `Presentation`, `DisplayManager`, `VirtualDisplay`, `ImageReader` and
+    /// `Image` are registered so extensions that render a page off-screen can
+    /// link and construct them. The host owns neither pixels nor a second
+    /// display, so every operation that would need one throws the engine's
+    /// typed `UnsupportedOperationException` instead of returning made-up data.
+    private static func displayCaptureClasses() -> [NativeClass] {
+        var result: [NativeClass] = []
+
+        // A presentation is a dialog bound to a display; only the display side
+        // is missing, so its dialog state is the real `Dialog` state.
+        let presentation = NativeClass("Landroid/app/Presentation;", superclass: "Landroid/app/Dialog;")
+        presentation.method("<init>", "(Landroid/content/Context;Landroid/view/Display;)V") { runtime, args, _ in
+            let state = VMDialogPayload()
+            state.context = args[1]
+            runtime.setPayload(args[0], state)
+            return .zero
+        }
+        presentation.method("show", "()V") { _, _, _ in
+            throw VMBitmapStore.unsupported("android.app.Presentation.show")
+        }
+        result.append(presentation)
+
+        let displayManager = NativeClass("Landroid/hardware/display/DisplayManager;", superclass: "Ljava/lang/Object;")
+        displayManager.method(
+            "createVirtualDisplay",
+            "(Ljava/lang/String;IIILandroid/view/Surface;I)Landroid/hardware/display/VirtualDisplay;"
+        ) { _, _, _ in
+            throw VMBitmapStore.unsupported("android.hardware.display.DisplayManager.createVirtualDisplay")
+        }
+        result.append(displayManager)
+
+        let virtualDisplay = NativeClass("Landroid/hardware/display/VirtualDisplay;", superclass: "Ljava/lang/Object;")
+        virtualDisplay.method("getDisplay", "()Landroid/view/Display;") { _, _, _ in
+            throw VMBitmapStore.unsupported("android.hardware.display.VirtualDisplay.getDisplay")
+        }
+        virtualDisplay.method("release", "()V") { _, _, _ in .zero }
+        result.append(virtualDisplay)
+
+        // `Image` is only ever handed out by an `ImageReader`; close is the
+        // teardown of a buffer that does not exist.
+        let image = NativeClass("Landroid/media/Image;", superclass: "Ljava/lang/Object;")
+        image.method("close", "()V") { _, _, _ in .zero }
+        result.append(image)
+
+        let imageListener = NativeClass(
+            "Landroid/media/ImageReader$OnImageAvailableListener;",
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
+        imageListener.method("onImageAvailable", "(Landroid/media/ImageReader;)V") { _, _, _ in .zero }
+        result.append(imageListener)
+
+        let imageReader = NativeClass("Landroid/media/ImageReader;", superclass: "Ljava/lang/Object;")
+        imageReader.staticMethod("newInstance", "(IIII)Landroid/media/ImageReader;") { runtime, args, _ in
+            runtime.makeNative(
+                "Landroid/media/ImageReader;",
+                payload: VMImageReaderState(
+                    width: args[0].asInt32,
+                    height: args[1].asInt32,
+                    format: args[2].asInt32,
+                    maxImages: args[3].asInt32
+                )
+            )
+        }
+        imageReader.method("getSurface", "()Landroid/view/Surface;") { _, _, _ in
+            throw VMBitmapStore.unsupported("android.media.ImageReader.getSurface")
+        }
+        imageReader.method("acquireLatestImage", "()Landroid/media/Image;") { _, _, _ in
+            throw VMBitmapStore.unsupported("android.media.ImageReader.acquireLatestImage")
+        }
+        imageReader.method(
+            "setOnImageAvailableListener",
+            "(Landroid/media/ImageReader$OnImageAvailableListener;Landroid/os/Handler;)V"
+        ) { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMImageReaderState.self) else { return .zero }
+            state.listener = args[1]
+            state.handler = args[2]
+            return .zero
+        }
+        imageReader.method("close", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMImageReaderState.self)?.closed = true
+            return .zero
+        }
+        result.append(imageReader)
+
+        result.append(motionEventClass())
+        result.append(pointerPropertiesClass())
+        result.append(pointerCoordsClass())
+        return result
+    }
+
+    private static func motionEventClass() -> NativeClass {
+        let event = NativeClass("Landroid/view/MotionEvent;", superclass: "Ljava/lang/Object;")
+        event.staticMethod(
+            "obtain",
+            "(JJII[Landroid/view/MotionEvent$PointerProperties;[Landroid/view/MotionEvent$PointerCoords;IIFFIIII)Landroid/view/MotionEvent;"
+        ) { runtime, args, _ in
+            let state = VMMotionEventPayload()
+            state.downTime = args[0].asInt64
+            state.eventTime = args[1].asInt64
+            state.action = args[2].asInt32
+            let requested = max(0, Int(args[3].asInt32))
+            state.metaState = args[6].asInt32
+            state.buttonState = args[7].asInt32
+            state.xPrecision = args[8].asFloat
+            state.yPrecision = args[9].asFloat
+            state.deviceId = args[10].asInt32
+            state.edgeFlags = args[11].asInt32
+            state.source = args[12].asInt32
+            state.flags = args[13].asInt32
+
+            let properties = args[4]
+            let coords = args[5]
+            let available = min(runtime.arrayLength(properties), runtime.arrayLength(coords))
+            let count = min(requested, available)
+            state.pointerCount = Int32(count)
+            for index in 0..<count {
+                let property = runtime.arrayElement(properties, index)
+                state.pointerIds.append(intField(property, "id"))
+                state.toolTypes.append(intField(property, "toolType"))
+                let coordinate = runtime.arrayElement(coords, index)
+                state.pointers.append(VMMotionEventPointer(
+                    x: floatField(coordinate, "x"),
+                    y: floatField(coordinate, "y"),
+                    pressure: floatField(coordinate, "pressure"),
+                    size: floatField(coordinate, "size"),
+                    touchMajor: floatField(coordinate, "touchMajor"),
+                    touchMinor: floatField(coordinate, "touchMinor"),
+                    toolMajor: floatField(coordinate, "toolMajor"),
+                    toolMinor: floatField(coordinate, "toolMinor"),
+                    orientation: floatField(coordinate, "orientation")
+                ))
+            }
+            return runtime.makeNative("Landroid/view/MotionEvent;", payload: state)
+        }
+        event.method("recycle", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMMotionEventPayload.self)?.reset()
+            return .zero
+        }
+
+        event.method("getDownTime", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMMotionEventPayload.self)?.downTime ?? 0)
+        }
+        event.method("getEventTime", "()J") { runtime, args, _ in
+            .int64(runtime.payload(args[0], as: VMMotionEventPayload.self)?.eventTime ?? 0)
+        }
+        event.method("getAction", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.action ?? 0)
+        }
+        event.method("getActionMasked", "()I") { runtime, args, _ in
+            .int32((runtime.payload(args[0], as: VMMotionEventPayload.self)?.action ?? 0) & 0xFF)
+        }
+        event.method("getActionIndex", "()I") { runtime, args, _ in
+            .int32(((runtime.payload(args[0], as: VMMotionEventPayload.self)?.action ?? 0) >> 8) & 0xFF)
+        }
+        event.method("getPointerCount", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.pointerCount ?? 0)
+        }
+        event.method("getMetaState", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.metaState ?? 0)
+        }
+        event.method("getButtonState", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.buttonState ?? 0)
+        }
+        event.method("getDeviceId", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.deviceId ?? 0)
+        }
+        event.method("getEdgeFlags", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.edgeFlags ?? 0)
+        }
+        event.method("getSource", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.source ?? 0)
+        }
+        event.method("getFlags", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMMotionEventPayload.self)?.flags ?? 0)
+        }
+        event.method("getXPrecision", "()F") { runtime, args, _ in
+            .float(runtime.payload(args[0], as: VMMotionEventPayload.self)?.xPrecision ?? 0)
+        }
+        event.method("getYPrecision", "()F") { runtime, args, _ in
+            .float(runtime.payload(args[0], as: VMMotionEventPayload.self)?.yPrecision ?? 0)
+        }
+        event.method("getXOffset", "()F") { runtime, args, _ in
+            .float(runtime.payload(args[0], as: VMMotionEventPayload.self)?.xOffset ?? 0)
+        }
+        event.method("getYOffset", "()F") { runtime, args, _ in
+            .float(runtime.payload(args[0], as: VMMotionEventPayload.self)?.yOffset ?? 0)
+        }
+        event.method("getRawX", "()F") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMMotionEventPayload.self) else { return .float(0) }
+            return .float((state.pointers.first?.x ?? 0) + state.xOffset)
+        }
+        event.method("getRawY", "()F") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMMotionEventPayload.self) else { return .float(0) }
+            return .float((state.pointers.first?.y ?? 0) + state.yOffset)
+        }
+        event.method("getX", "()F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: 0)?.x ?? 0)
+        }
+        event.method("getY", "()F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: 0)?.y ?? 0)
+        }
+        event.method("getPressure", "()F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: 0)?.pressure ?? 0)
+        }
+        event.method("getSize", "()F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: 0)?.size ?? 0)
+        }
+        event.method("getX", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.x ?? 0)
+        }
+        event.method("getY", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.y ?? 0)
+        }
+        event.method("getPressure", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.pressure ?? 0)
+        }
+        event.method("getSize", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.size ?? 0)
+        }
+        event.method("getTouchMajor", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.touchMajor ?? 0)
+        }
+        event.method("getTouchMinor", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.touchMinor ?? 0)
+        }
+        event.method("getToolMajor", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.toolMajor ?? 0)
+        }
+        event.method("getToolMinor", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.toolMinor ?? 0)
+        }
+        event.method("getOrientation", "(I)F") { runtime, args, _ in
+            .float(motionPointer(runtime, args[0], index: args[1].asInt32)?.orientation ?? 0)
+        }
+        event.method("getPointerId", "(I)I") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMMotionEventPayload.self) else { return .int32(0) }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < Int(state.pointerCount), index < state.pointerIds.count else { return .int32(0) }
+            return .int32(state.pointerIds[index])
+        }
+        event.method("getToolType", "(I)I") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMMotionEventPayload.self) else { return .int32(0) }
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < Int(state.pointerCount), index < state.toolTypes.count else { return .int32(0) }
+            return .int32(state.toolTypes[index])
+        }
+        return event
+    }
+
+    private static func pointerPropertiesClass() -> NativeClass {
+        let properties = NativeClass("Landroid/view/MotionEvent$PointerProperties;", superclass: "Ljava/lang/Object;")
+        properties.method("<init>", "()V") { _, _, _ in .zero }
+        properties.field("id", "I")
+        properties.field("toolType", "I")
+        return properties
+    }
+
+    private static func pointerCoordsClass() -> NativeClass {
+        let coords = NativeClass("Landroid/view/MotionEvent$PointerCoords;", superclass: "Ljava/lang/Object;")
+        coords.method("<init>", "()V") { _, _, _ in .zero }
+        for name in ["x", "y", "pressure", "size", "touchMajor", "touchMinor", "toolMajor", "toolMinor", "orientation"] {
+            coords.field(name, "F")
+        }
+        return coords
+    }
+
+    private static func motionPointer(_ runtime: VMRuntime, _ value: VMValue, index: Int32) -> VMMotionEventPointer? {
+        guard let state = runtime.payload(value, as: VMMotionEventPayload.self) else { return nil }
+        let offset = Int(index)
+        guard offset >= 0, offset < Int(state.pointerCount), offset < state.pointers.count else { return nil }
+        return state.pointers[offset]
+    }
+
+    @inline(__always)
+    private static func floatField(_ value: VMValue, _ name: String) -> Float {
+        guard let pointer = value.object,
+              let field = VMObjectLayout.cls(pointer).resolveField(key: name + ":F") else { return 0 }
+        return VMObjectLayout.slot(pointer, field.offset).pointee.asFloat
+    }
+
+    @inline(__always)
+    private static func intField(_ value: VMValue, _ name: String) -> Int32 {
+        guard let pointer = value.object,
+              let field = VMObjectLayout.cls(pointer).resolveField(key: name + ":I") else { return 0 }
+        return VMObjectLayout.slot(pointer, field.offset).pointee.asInt32
+    }
+
     // MARK: - WebView
 
     private static func webViewClasses() -> [NativeClass] {
@@ -1315,6 +1682,15 @@ enum WebKitRuntime {
             destroy(runtime, payload)
             return .zero
         }
+        // The platform posts the visual state back once the frame is committed;
+        // there is no compositor here, so the callback runs on the engine
+        // thread before this call returns.
+        webView.method("postVisualStateCallback", "(JLandroid/webkit/WebView$VisualStateCallback;)V") { runtime, args, _ in
+            let callback = args[2]
+            guard callback.object != nil else { return .zero }
+            _ = runtime.callVirtual(callback, "onComplete(J)V", [.int64(args[1].asInt64)])
+            return .zero
+        }
         webView.method("getUrl", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self) else { return .null }
             return payload.loading || !payload.url.isEmpty ? runtime.newString(payload.url) : .null
@@ -1346,6 +1722,18 @@ enum WebKitRuntime {
         }
         webView.staticMethod("setWebContentsDebuggingEnabled", "(Z)V") { _, _, _ in .zero }
         result.append(webView)
+
+        // `VisualStateCallback` is the abstract hook the platform calls once a
+        // posted visual state is committed; extensions subclass it in dex.
+        let visualStateCallback = NativeClass(
+            "Landroid/webkit/WebView$VisualStateCallback;",
+            superclass: "Ljava/lang/Object;",
+            access: DexAccess.isPublic | DexAccess.isAbstract
+        )
+        visualStateCallback.method("<init>", "()V") { _, _, _ in .zero }
+        visualStateCallback.method("onComplete", "(J)V") { _, _, _ in .zero }
+        result.append(visualStateCallback)
+
         result += settingsClasses()
         return result
     }

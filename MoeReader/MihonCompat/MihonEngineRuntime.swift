@@ -89,6 +89,19 @@ final class MihonResponseDownloader: NSObject, URLSessionDataDelegate, @unchecke
         return pending.removeValue(forKey: identifier)
     }
 
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        // Return the 3xx as the hop's response. The engine follows redirects
+        // itself so it can store the hop's cookies and keep the `Location`
+        // path verbatim (`FoundationNetworking` drops a trailing `/` here).
+        completionHandler(nil)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let box = box(for: dataTask.taskIdentifier), box.error == nil else { return }
         if box.response == nil {
@@ -149,6 +162,63 @@ enum MihonChallengeUserAgent {
     }
 }
 
+/// Redirects are followed by the engine one hop at a time so the shared jar is
+/// applied and updated around every hop on every platform.
+///
+/// FoundationNetworking rewrites a relative `Location` whose path ends in `/`
+/// to the same path without the slash (`/api/?page=1` becomes `/api?page=1`),
+/// so a site that bounces `/api/index.html` to `/api/` loops until the
+/// transport's redirect cap; it also stores no cookies between hops because
+/// `HTTPCookieStorage` is not wired into it. Following the hops here avoids
+/// both, and the pinned transport's rules (relative resolution, `303` to
+/// bodyless `GET`, five-hop cap, no HTTPS downgrade) stay the one policy for
+/// both paths.
+enum MihonRedirectFollower {
+    static func follow(
+        _ request: VMHTTPRequest,
+        storage: HTTPCookieStorage,
+        maximumHops: Int = PinnedRedirectPolicy.maximumHops,
+        perform: (VMHTTPRequest) throws -> VMHTTPResponse
+    ) throws -> VMHTTPResponse {
+        var current = request
+        var visited: Set<String> = [request.url]
+        var hops = 0
+        while true {
+            guard let hopURL = URL(string: current.url) else {
+                throw PinnedHTTPError.invalidRequest("unsupported URL \(current.url)")
+            }
+            var hop = current
+            if let cookie = VMCookieJar.header(for: hopURL, storage: storage) {
+                hop.headers.removeAll { $0.0.caseInsensitiveCompare("Cookie") == .orderedSame }
+                hop.headers.append(("Cookie", cookie))
+            }
+            var response = try perform(hop)
+            // One transport-boundary split: a URLSession response merges
+            // repeated `Set-Cookie` values into a comma-joined string, and
+            // `Expires` dates contain commas of their own.
+            response.headers = VMCookieJar.splitSetCookieHeaders(response.headers)
+            VMCookieJar.store(headers: response.headers, for: hopURL, storage: storage)
+            guard let next = try PinnedRedirectPolicy.follow(
+                request: PinnedHTTPRequest(url: hopURL, method: hop.method, body: hop.body),
+                status: response.code,
+                headers: response.headers
+            ) else {
+                return response
+            }
+            hops += 1
+            guard hops <= maximumHops else {
+                throw PinnedHTTPError.tooManyRedirects(maximumHops)
+            }
+            guard visited.insert(next.url.absoluteString).inserted else {
+                throw PinnedHTTPError.redirectLoop(next.url.absoluteString)
+            }
+            current.url = next.url.absoluteString
+            current.method = next.method
+            current.body = next.body
+        }
+    }
+}
+
 final class MihonEngineHost: VMHost {
     /// What the transport sends when a source supplies no agent of its own.
     /// It is the same browser identity Mihon's HTTP layer hands to sources, so
@@ -166,8 +236,12 @@ final class MihonEngineHost: VMHost {
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 60
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.httpCookieStorage = HTTPCookieStorage.shared
-        configuration.httpShouldSetCookies = true
+        // The engine applies the shared jar around every hop
+        // (`MihonRedirectFollower`), so URLSession's own cookie store is off:
+        // it would duplicate that work on Apple and is not wired to
+        // `HTTPCookieStorage` on Linux anyway.
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
         let downloader = MihonResponseDownloader()
         self.downloader = downloader
         self.session = URLSession(configuration: configuration, delegate: downloader, delegateQueue: nil)
@@ -190,6 +264,22 @@ final class MihonEngineHost: VMHost {
         }
         if DoHConfiguration.current().enabled {
             return try pinnedRequest(request, url: url)
+        }
+        do {
+            return try MihonRedirectFollower.follow(request, storage: cookieStorage()) { hop in
+                try self.sessionRequest(hop)
+            }
+        } catch let error as PinnedHTTPError {
+            throw VMJavaException("Ljava/io/IOException;", error.description)
+        }
+    }
+
+    /// Exactly one request/response exchange. Redirects never reach here: the
+    /// engine stops URLSession from following them so it can store the hop's
+    /// cookies first.
+    private func sessionRequest(_ request: VMHTTPRequest) throws -> VMHTTPResponse {
+        guard let url = URL(string: request.url) else {
+            throw VMJavaException("Ljava/io/IOException;", "unsupported URL: \(request.url)")
         }
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = request.method

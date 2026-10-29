@@ -37,6 +37,13 @@ final class VMUiPreferencePayload {
     var children: [VMValue] = []
     var enabled = true
     var visible = true
+    /// The default `setDefaultValue` installed, in the type the preference's
+    /// kind stores (`Boolean`, `String` or a string set). Android writes it to
+    /// the store when the preference first joins a screen and the key is unset.
+    var defaultValue: VMSharedPreferenceValue?
+    /// `setOnPreferenceChangeListener`: consulted before the settings UI
+    /// stores an edit; a `false` answer rejects it.
+    var changeListener: VMValue = .null
     init(kind: MihonSourcePreference.Kind) { self.kind = kind }
 }
 
@@ -112,6 +119,12 @@ enum PreferencesRuntime {
                 if !values.isEmpty {
                     payload.values = Set(values)
                     payload.value = values.sorted().joined(separator: ",")
+                    if payload.kind == .multiSelect {
+                        payload.defaultValue = .stringSet(payload.values)
+                    } else {
+                        payload.defaultValue = .string(payload.value)
+                    }
+                    try runtime.persistPreferenceDefault(args[0])
                     return .zero
                 }
             }
@@ -120,12 +133,17 @@ enum PreferencesRuntime {
             } else if args[1].bits != 0 {
                 payload.value = runtime.stringValue(runtime.javaToString(args[1])) ?? ""
             }
+            payload.defaultValue = args[1].bits == 0 ? nil : runtime.preferenceDefaultValue(payload)
+            try runtime.persistPreferenceDefault(args[0])
             return .zero
         }
         preference.method("getContext", "()Landroid/content/Context;") { runtime, _, _ in
             runtime.makeNative("Landroid/app/Application;", payload: NSNull())
         }
-        preference.method("setOnPreferenceChangeListener", "(Landroidx/preference/Preference$OnPreferenceChangeListener;)V") { _, _, _ in .zero }
+        preference.method("setOnPreferenceChangeListener", "(Landroidx/preference/Preference$OnPreferenceChangeListener;)V") { runtime, args, _ in
+            try runtime.preference(args[0]).changeListener = args[1]
+            return .zero
+        }
         preference.method("setOnPreferenceClickListener", "(Landroidx/preference/Preference$OnPreferenceClickListener;)V") { _, _, _ in .zero }
         preference.method("setIcon", "(Landroid/graphics/drawable/Drawable;)V") { _, _, _ in .zero }
         result.append(preference)
@@ -142,6 +160,10 @@ enum PreferencesRuntime {
         screen.method("addPreference", "(Landroidx/preference/Preference;)Z") { runtime, args, _ in
             let payload = try runtime.payloadBox(args[0], as: VMUiPreferenceScreenPayload.self)
             payload.children.append(args[1])
+            // `Preference.onSetInitialValue`: a keyed preference installs its
+            // default when it joins the hierarchy, so the source's own reads
+            // through `SharedPreferences` see it before the user edits anything.
+            try runtime.persistPreferenceDefault(args[1])
             return .boolean(true)
         }
         screen.method("removePreference", "(Landroidx/preference/Preference;)V") { runtime, args, _ in
@@ -468,6 +490,64 @@ extension VMRuntime {
 
     func preference(_ value: VMValue) throws -> VMUiPreferencePayload {
         try payloadBox(value, as: VMUiPreferencePayload.self)
+    }
+
+    /// The stored type a preference's kind uses, from the value the extension
+    /// set through `setDefaultValue`.
+    func preferenceDefaultValue(_ payload: VMUiPreferencePayload) -> VMSharedPreferenceValue {
+        switch payload.kind {
+        case .toggle: return .bool(payload.value == "true")
+        case .multiSelect: return .stringSet(payload.values)
+        case .text, .list, .header: return .string(payload.value)
+        }
+    }
+
+    /// Android's `Preference.onSetInitialValue` write: a keyed preference whose
+    /// key has no stored value yet installs its default, so later reads through
+    /// `SharedPreferences` see it. An existing value (the user's) always wins.
+    func persistPreferenceDefault(_ preference: VMValue) throws {
+        guard let payload = payload(preference, as: VMUiPreferencePayload.self),
+              !payload.key.isEmpty,
+              let value = payload.defaultValue,
+              let store = host?.preferences(),
+              !store.allKeys().contains(payload.key) else { return }
+        if storeSharedPreferenceValue(value, forKey: payload.key, in: store) {
+            try notifySharedPreferenceChange(key: payload.key, in: store)
+        }
+    }
+
+    /// The settings-UI write path for a `Preference`. Android asks the
+    /// preference's change listener first; `false` rejects the edit and leaves
+    /// the stored value untouched. Returns whether the value was accepted.
+    @discardableResult
+    func applyPreferenceValue(
+        _ preference: VMValue?,
+        key: String,
+        value: String,
+        values: [String],
+        kind: MihonSourcePreference.Kind,
+        store: VMPreferences
+    ) throws -> Bool {
+        guard !key.isEmpty else { return false }
+        let newValue: VMSharedPreferenceValue
+        switch kind {
+        case .multiSelect: newValue = .stringSet(Set(values))
+        case .toggle: newValue = .bool(value == "true")
+        case .text, .list, .header: newValue = .string(value)
+        }
+        if let preference,
+           let payload = payload(preference, as: VMUiPreferencePayload.self),
+           payload.changeListener.object != nil,
+           let method = classOf(payload.changeListener)?.lookupVirtual(
+               key: "onPreferenceChange(Landroidx/preference/Preference;Ljava/lang/Object;)Z"
+           ) {
+            let accepted = try invoke(method, [payload.changeListener, preference, sharedPreferenceValue(newValue)])
+            guard accepted.asBoolean else { return false }
+        }
+        if storeSharedPreferenceValue(newValue, forKey: key, in: store) {
+            try notifySharedPreferenceChange(key: key, in: store)
+        }
+        return true
     }
 
     func stringArray(_ value: VMValue) -> [String] {

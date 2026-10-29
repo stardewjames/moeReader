@@ -174,8 +174,15 @@ and the suspend lib-1.6 API in practice:
   groups and `RegexOption` (plus `Regex.Companion.escape`/`Pattern.quote`),
   `MatchResult.Destructured`, `Charsets`, sequences (including `sequence {}`
   builders), `Duration`, `Instant`
-  (including `parseOrNull`), `Ref` holders, spread builders, function/property
-  reference classes, the `ReadWriteProperty`/`PropertyDelegateProvider`
+  (including `parseOrNull`), `Ref` holders, spread builders, the full
+  `kotlin.reflect` callable hierarchy (`KAnnotatedElement`, `KCallable`,
+  `KProperty`/`KProperty0`/`KProperty1`, `KMutableProperty*`, `KFunction*`) and
+  the stdlib reference classes behind it (`CallableReference`,
+  `PropertyReference*`, `FunctionReference*`): a property/function reference
+  implements the interfaces its Kotlin type declares, so an array of
+  `KProperty` accepts a `PropertyReference1Impl`, and `get`/`set`/`invoke`
+  dispatch to the getter, setter or function the reference names, the
+  `ReadWriteProperty`/`PropertyDelegateProvider`
   delegate interfaces, `Random`, hex helpers, `kotlin.io` URL/byte/text
   streams, `kotlin.time.Clock` and `TimeSource` marks,
   `kotlin.coroutines` internals, and the `kotlinx.coroutines` builders needed
@@ -191,7 +198,17 @@ and the suspend lib-1.6 API in practice:
   `SerializersModule` fallbacks, JSON element trees (`JsonObject`/`JsonArray`/
   `JsonPrimitive`), `buildJsonObject`/`buildJsonArray` and
   `JsonElementBuildersKt`, `JsonTransformingSerializer`, and
-  `decodeFromJsonElement`/`encodeToJsonElement`/`encodeToString`.
+  `decodeFromJsonElement`/`encodeToJsonElement`/`encodeToString`. The JSON
+  parser reads UTF-8 bytes directly, so CRLF documents, `\u` surrogate pairs
+  and a BOM are handled the way kotlinx handles them. The protobuf format is
+  present as well: `ProtoBuf` (byte and hex entry points), `ProtoBufBuilder`,
+  `ProtoIntegerType` and the `ProtoNumber`/`ProtoType`/`ProtoOneOf`/
+  `ProtoPacked` annotations, with varint/zigzag/fixed/length-delimited
+  encoding, packed scalars, repeated message fields and unknown-field
+  skipping. Descriptors carry element annotations, element descriptors and
+  real `SerialKind` values, and collection decoding resolves the composite
+  decoder that `beginStructure` returns, so an extension's own shaded
+  `AbstractDecoder` works too.
 - **Android**: `android.net.Uri`, `android.text.Html`/`TextUtils`, `android.util`
   helpers (`Base64`, `Log`, `LruCache` with its `create`/`entryRemoved`/
   `sizeOf` hooks, `DisplayMetrics`, `AttributeSet`, `Patterns`),
@@ -203,7 +220,7 @@ and the suspend lib-1.6 API in practice:
   padding, content-description, click-listener, context and resource members a
   headless widget reads, `ViewGroup`/`LayoutParams` with the child list behind
   `addView`/`getChildAt`, `View.MeasureSpec`), `android.content` shared
-  preferences (including string sets), `Intent`/`ComponentName`/`ResultReceiver`
+  preferences (including string sets and change listeners), `Intent`/`ComponentName`/`ResultReceiver`
   parcel plumbing, and `androidx.preference` controls for source preference
   screens.
   `android.graphics` (Bitmap and BitmapFactory over ImageIO, Canvas drawing,
@@ -217,11 +234,22 @@ and the suspend lib-1.6 API in practice:
   JavaScript bridge, client and chrome callbacks; a host without WebKit throws
   a typed exception when one is constructed. `app.cash.quickjs.QuickJs` runs
   its scripts on JavaScriptCore on Apple hosts and fails closed with a typed
-  `UnsupportedOperationException` elsewhere.
+  `UnsupportedOperationException` elsewhere. The screen-capture and
+  pointer-injection surface is registered as well: `android.app.Presentation`,
+  `DisplayManager`/`VirtualDisplay`, `android.media.ImageReader`/`Image`,
+  `android.view.MotionEvent` with `PointerCoords`/`PointerProperties`, and
+  `WebView.VisualStateCallback`/`postVisualStateCallback`. `MotionEvent`
+  carries real pointer data (`obtain` copies the arrays, `recycle` clears
+  them), and the visual-state callback is delivered with its token; anything
+  that would need a second display or real captured pixels throws the typed
+  unsupported error instead of returning fabricated images.
 - **okhttp3**: `Request`/`Response`/`Headers`/`HttpUrl` including the
   `HttpUrl.Builder` surface (path segments, query add/set/remove, host, scheme,
   port, fragment), calls, client builders, `CacheControl`, interceptor chains,
-  form bodies, multipart bodies with a rendered boundary, byte-backed request
+  form bodies (a `FormBody.Builder` renders its pairs into the bytes that
+  `contentLength`, `writeTo` and the transport send, percent-encoding `add`
+  text with `+` for spaces while `addEncoded` stays verbatim), multipart bodies
+  with a rendered boundary, byte-backed request
   bodies (`RequestBody.create` from `String` or `byte[]`, plus the `$default`
   overloads), compression markers, `Dispatcher`, `Cookie`/`CookieJar` over the
   shared jar, and the `Duration` timeout overloads. `ResponseBody.Companion.create`
@@ -246,11 +274,17 @@ and the suspend lib-1.6 API in practice:
   `hasText`, a CSS selector engine (`>`, `+`, `~`, `:has`, `:is`,
   `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), typed
   `Evaluator` instances, and the
-  `selectText`/`selectInt`/`attrOrText`/`asJsoup` helpers. One `select` call
+  `selectText`/`selectInt`/`attrOrText`/`asJsoup` helpers. An `Elements` is a
+  `java.util.List`, so Kotlin `List` overloads (`first`, `last`, `dropLast`,
+  `takeLast`, `getLastIndex`, ...) and `java.util` collection methods read its
+  nodes through the same read-only view, cached per `Elements`. One `select` call
   memoizes normalized text, class lists, regex/selector parses and `:has`
   answer sets per node; `:has` results are folded into descendant and
   child sets so a repeated `:has` costs a lookup, and selectors stay tens of
-  milliseconds on multi-megabyte pages. The candidate loop probes the
+  milliseconds on multi-megabyte pages. Element queries start at the receiver,
+  as jsoup's `Collector` does: `select`/`selectFirst`, `getElements*` and
+  `getAllElements` include the element itself, and `Elements.select` unions
+  overlapping roots without duplicates. The candidate loop probes the
   operation deadline, so a runaway selector ends in `VMCallTimeout`
   (`MIHON_OP_TIMEOUT`) instead of blocking the host thread.
 - **Mihon**: `Source`, `CatalogueSource`, `HttpSource` (including its
@@ -340,9 +374,22 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   no site reference is committed; local notes are in the ignored
   `site-notes.local.md`.
 - The portable suite (engine sources plus the MihonExtensions runtime files,
-  built on Linux) passes over 200 tests with no failures. The runner takes every
+  built on Linux) runs 452 tests with no failures (10 skipped: they need app
+  sources, Apple frameworks or a DEX fixture). The runner takes every
   file in `MoeReaderTests`, then drops the ones that need app sources or Apple
   frameworks, so a new engine test is picked up without editing a list.
+- Randomised live sweeps of the published index (fixed seeds, 24 + 24 + 30
+  extensions, each run through load, popular both pages, latest, both search
+  modes, details, chapters, pages and the preference screen) were recorded
+  before and after this surface work. The first two samples went from 14 to 22
+  of 48 ending `RESULT OK`; the independent third sample went from 10 to 15 of
+  30, and every remaining failure there is a site 403/404, a login or WebView
+  wall, or a chapter body with no image references (0 matching attributes in
+  the served body), not an engine error. The extensions that gained the most
+  were the ones whose metadata or parse path previously failed: the
+  Kotlin companion `Regex.escape` call (referenced by 244 of 1,435 APKs),
+  property/function references in `<clinit>`, `Elements` used through Kotlin
+  list helpers, kotlinx protobuf bodies, and form-style redirects.
 - A live harness sweep of the 35 most-downloaded lib-1.6 extensions runs load,
   popular (both pages), latest, both search modes, details, chapters and pages:
   25 of the 35 end `RESULT OK` on the extension's default host, and 27 when a
@@ -357,11 +404,11 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - The same measurement was run over the whole published index: 1,435
   extensions, all on extension-lib 1.6, audited by dumping the engine's runtime
   registry and comparing every APK's DEX host-API references against it. The
-  baseline found 1,044 missing host symbols referenced by 1,055 extensions;
-  with the surface in this tree the residue is 30 symbols referenced by a
-  single extension, all of them the virtual-display and touch-injection
-  presentation surface, which the engine deliberately does not fake. Per-symbol
-  data is kept outside the repository.
+  original baseline found 1,044 missing host symbols referenced by 1,055
+  extensions; the residue then narrowed to 30 symbols referenced by a single
+  extension; with the surface in this tree the dump (951 native classes) reports
+  **zero missing host classes, methods, fields or supertypes across all 1,435
+  APKs**. Per-symbol data is kept outside the repository.
 - Page images reach the reader through the extension: `getImage` when the
   source overrides it, otherwise `imageRequest` and the source's
   `OkHttpClient`, so its interceptors see the request and the returned bytes
@@ -397,10 +444,20 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   truncated bodies, interim responses, gzip marker passthrough), redirect
   rewrite/hop cap/loop detection/HTTPS-downgrade rejection, the cookie bridge,
   and the fail-closed branch on a host without `Network`.
-  `DoHEngineRoutingTests` pins the switch: with the setting on, the engine host
+- `DoHEngineRoutingTests` pins the switch: with the setting on, the engine host
   and the app's HTTP client take the pinned route and report a typed failure
   where `Network` is missing. The `NWConnection` exchange itself can only be
   exercised on a device.
+- `MihonCookieTransportTests` drives the engine's redirect follower over
+  synthetic hops: every hop carries the cookies stored from the preceding
+  response, a merged `Set-Cookie` value lands as separate cookies while an
+  `Expires` comma does not split, a `Location` path keeps its trailing slash,
+  and the five-hop cap plus HTTPS-downgrade rejection still hold.
+  `NetworkHelper.getCookieJar()` saves and loads through the shared jar. It
+  also pins form bodies: `FormBody.Builder.add` percent-encodes form text
+  (space as `+`, UTF-8), `addEncoded` stays verbatim, and `contentLength`,
+  `writeTo` and the transport send the same rendered bytes, including for the
+  array constructor.
 - `MihonChallengeDetectionTests` covers both protection families (server
   header, interstitial markup, clearance-cookie names, status codes),
   `MihonChallengeRetryTests` covers the single retry with a fresh cookie jar,
@@ -409,6 +466,38 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 - Engine unit tests cover the DEX reader, interpreter arithmetic/control
   flow/exceptions against JVM-produced expected values, the string/collection
   runtime, selector pseudos, and arena recycling.
+- `MihonVMMethodTableTests` pins the split instance/static method tables: a
+  native class may declare both shapes under one name+signature (Kotlin
+  companions do), virtual dispatch reaches the instance body, static dispatch
+  the static one, and `Regex.Companion.escape` answers through both.
+- `MihonKotlinReflectHierarchyTests` builds property and function references
+  through the stdlib constructors, asserts their `KProperty`/`KMutableProperty`/
+  `KCallable`/`KFunction` ancestry including an `aput-object` into a
+  `KProperty[]`, and drives getter/setter dispatch through the reference.
+- `MihonProtoBufTests` covers the protobuf format: annotation materialisation
+  (`annotationType`, `number`, `getElementAnnotations`), round-trips with
+  non-positional field numbers, zigzag/packed/repeated message fields, nested
+  messages, unknown-field skipping, missing required fields as
+  `MissingFieldException`, hex helpers, and the UTF-8 JSON parser's CRLF and
+  surrogate-pair handling.
+- `MihonPreferenceListenerTests` covers `SharedPreferences` and
+  `androidx.preference` listeners (change/no-op/remove/clear, unregister,
+  rejection, defaults applied on first display) and
+  `MihonDisplaySurfaceTests` covers the presentation/pointer surface
+  (registration, `obtain`/`recycle` data, the visual-state callback, and the
+  typed failure for pixel/second-display paths).
+- `MihonMangaUpdatePathTests` pins the `getMangaUpdate` path: a browse list
+  item's `SManga` (including `memo`) reaches details and chapter refresh, also
+  after an arena recycle; `CollectionsKt.addAll` to a set destination, jsoup
+  attribute selectors with `]` inside quoted values, and `Map.asSequence`
+  yielding `Map.Entry`.
+- `MihonJsoupPageListTests` covers receiver-inclusive jsoup queries
+  (`select`/`selectFirst`, `getElements*`, `Elements.select` dedupe) and the
+  reader-container selectors page lists use.
+- `MihonVMByteCodeRegressionTests` pins primitive `Character` statics (no
+  pointer dereference), boxed `Boolean`/`Character` payloads, a zero-register
+  `code_item` (load and execute) and `ByteArray` boxing (`boxByte`) through
+  `joinToString`/`toList`.
 - Calibration run: five independent lib-1.6 extensions all load their sources
   and complete a `getPopularManga` call against a generic fixture. Each gap found
   by that run (static `$default` thunks, `ResponseBody.Companion`, Kotlin
@@ -428,7 +517,8 @@ The engine runs extensions that stay inside the surface above. Edge behaviour
 that is explicitly covered: destination/source separation for literal
 operations, array covariance and store checks, `clone`, immutable collections,
 rounded `Int`/`Long`/`Char` conversion, preference defaults, removal and string
-sets, filter construction defaults and selection replay (text, checkbox,
+sets, preference change listeners (`SharedPreferences` writes and the source
+settings UI), filter construction defaults and selection replay (text, checkbox,
 tri-state, select, sort, grouped filters), interceptor list views, `TimeUnit`
 conversions, JSON encode/decode and JSON element conversion, and file/okio
 round-trips under a per-extension root. The runtime also resolves class methods before
@@ -443,9 +533,8 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 | Apple-only frameworks | `android.graphics`/`android.text` pixel work (CoreGraphics/ImageIO/CoreText), `app.cash.quickjs` (JavaScriptCore) and `android.webkit.WebView` (WebKit) exist only on Apple hosts. Elsewhere each raises a typed `UnsupportedOperationException` naming the operation, so a source that needs them stops instead of receiving fabricated bytes. |
 | RxJava-only sources | Extensions whose only fetch entry points are the RxJava `fetch*` overrides are not executed. Request/parse-style lib-1.4/1.5 sources and the suspend API run without RxJava. |
 | Zstd response bodies | `OkioZstd` reads only raw/RLE-block frames. Entropy-coded zstd (what servers send) fails closed with an `IOException`. |
-| Duplicate response headers | URLSession merges repeated `Set-Cookie` response headers into one value before the engine sees them; request headers keep duplicates. |
-| Preference change listeners | `setOnPreferenceChangeListener` callbacks are accepted but not invoked; the extension’s next source call sees the stored value instead. |
-| `NetworkHelper.cookieJar` | The concrete jar type differs per host, so `getCookieJar` is not exposed; `client`, `cloudflareClient` and the shared cookie jar are available. |
+| Duplicate response headers | URLSession merges repeated `Set-Cookie` response headers into one value; the engine splits that value once when it enters from the transport, honouring `Expires` commas, so the jar and `Response.headers` see one cookie per header. Other repeated response headers stay merged. |
+| `NetworkHelper.cookieJar` | `getCookieJar` returns the shared jar: `saveFromResponse`/`loadForRequest` run over the same `HTTPCookieStorage` the transport and WebView use. `client` and `cloudflareClient` are also available. |
 | Constructor reflection | `Field`/`Method` access and `Method.invoke` work, as do `Class.forName`, `getDeclaredMethod` and `getResource` (a class absent from the APK throws `ClassNotFoundException`); `Constructor.newInstance` is not implemented. |
 
 Unsupported APIs fail closed with a typed error. The engine never guesses at a
@@ -524,4 +613,7 @@ Register a class in the appropriate provider and add it to
 `NativeLibrary.classes()`. Native methods receive normalised arguments
 (`args[0]` is the receiver for instance methods) and return a `VMValue`. Prefer
 payload objects (`setPayload`/`payload(_:as:)`) over VM fields for state that
-belongs to Swift, and let the arena own VM references.
+belongs to Swift, and let the arena own VM references. `method` and
+`staticMethod` fill separate tables, so one class may declare both shapes under
+the same name and signature (Kotlin companions do); virtual dispatch reaches the
+instance body and static invocation the static one.
