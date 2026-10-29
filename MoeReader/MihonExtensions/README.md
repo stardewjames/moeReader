@@ -41,19 +41,25 @@ destination (from Settings and the home Library), the runtime picker in
 - **Source runtimes.** Source calls go through `MihonSourceRuntime`, obtained
   from the active backend. There is no per-site native runner; extensions that
   need something a backend does not provide report a typed error.
-- **Browsing and reading.** The layer includes its own source browser, manga
-  detail/chapter list, remote image pipeline, and paged reader. Search filters
+- **Browsing and reading.** The layer includes a source browser, manga
+  detail/chapter list, chapter scanlator filter, chapter ordering, and searches
+  that run against one source or every enabled source at once. Search filters
   are rendered from the extension's `FilterList` and replayed onto a fresh list
   for each search, persisted per source, and re-applied after view recreation.
   Source preferences are edited in a sheet, including text, single-choice,
   toggle, and multi-select controls; only changed keys are written. Covers use
-  the source's request headers over the shared cookie jar; reader pages come
-  from the runtime's `pageImage`, so the extension's interceptors apply.
+  the source's request headers over the shared cookie jar.
+- **One reader.** Extension chapters open in the same `ReaderView` as local
+  books. `MihonReaderPageSource` feeds `runtime.pageImage` into the reader's
+  image-provider seam, so the extension's interceptors apply while paging,
+  zoom, chrome, and reading modes are shared.
 - **One home library.** A manga can be added from a source, which stores a
   display snapshot and source identity in the library index. It then appears
   beside imported local books; opening it re-resolves the installed extension
-  and the active backend. The last chapter opened is recorded on the entry.
-  `MihonReaderView` still keeps per-chapter page progress in `UserDefaults`.
+  and the active backend. The last chapter opened and a per-manga reading mode
+  are recorded on the entry; per-chapter page progress stays in `UserDefaults`.
+  The extension manager only installs and enables packages; sources are found
+  through the library's search menu.
 
 ## Runtime backends
 
@@ -122,9 +128,12 @@ needs). Nothing in this layer names a backend.
 | `MihonCompatStore.swift` | Actor-owned persistence and install lifecycle |
 | `MihonSourceRuntime.swift` | Runtime protocols and the shared source, filter and preference models |
 | `MihonRuntimeBackend.swift` | Backend protocol and the user's backend selection |
-| `MihonRemoteImageView.swift` | Page bytes from the runtime, cover fetch over URLSession, decode cache, prefetch. Page keys include the backend's descriptor id, so a page decoded by one runtime is not served to, or waited on by, another after a backend switch |
-| `MihonCompatView.swift` | Repository/extension manager |
-| `MihonBrowseView.swift`, `MihonMangaView.swift`, `MihonReaderView.swift` | Source browser and reader |
+| `MihonRemoteImageView.swift` | Cover fetch over URLSession, decode cache, prefetch |
+| `MihonCompatView.swift` | Repository/extension manager (no source browsing) |
+| `MihonBrowseView.swift`, `MihonMangaView.swift` | Source browser and manga detail with scanlator filtering and chapter order |
+| `MihonReaderSession.swift` | Extension chapter session and image provider for the shared reader |
+| `MihonSourceCatalog.swift` | Enabled installed sources and their active-backend runtimes |
+| `MihonAllSourcesSearchView.swift`, `MihonSourcePickerView.swift` | All-source search and one-source search entry points |
 | `MihonLibraryMangaView.swift`, `MihonLibraryManga.swift` | Resolve a saved home-library entry against the installed extension and active backend |
 | `MihonFilterView.swift` | FilterList sheet for source searches |
 | `MihonSourceSettingsView.swift` | Source preference sheet |

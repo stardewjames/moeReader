@@ -110,6 +110,21 @@ final class LibraryModelTests: XCTestCase {
         XCTAssertEqual(index.defaultReadingMode, .pagedRightToLeft)
         XCTAssertEqual(index.tapZoneLayout, .sides)
         XCTAssertTrue(index.remoteManga.isEmpty)
+        XCTAssertEqual(index.sortOrder, .newest)
+    }
+
+    @MainActor
+    func testLibrarySortPersists() async throws {
+        let (library, documents, caches) = try makeLibrary()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        library.updateSortOrder(.titleDescending)
+        await library.flush()
+
+        let reloaded = LibraryModel(documents: documents, caches: caches)
+        XCTAssertEqual(reloaded.sortOrder, .titleDescending)
     }
 
     @MainActor
@@ -191,6 +206,13 @@ final class LibraryModelTests: XCTestCase {
             mangaID: entry.mangaID,
             chapterTitle: "Ch. 2"
         )
+        library.updateRemoteReadingMode(
+            packageName: entry.packageName,
+            sourceID: entry.sourceID,
+            sourceLanguage: entry.sourceLanguage,
+            mangaID: entry.mangaID,
+            mode: .longStrip
+        )
 
         var refreshed = entry
         refreshed.title = "Updated title"
@@ -201,6 +223,7 @@ final class LibraryModelTests: XCTestCase {
         let saved = try XCTUnwrap(reloaded.remoteManga.first)
         XCTAssertEqual(saved.title, "Updated title")
         XCTAssertEqual(saved.lastChapterTitle, "Ch. 2")
+        XCTAssertEqual(saved.readingMode, .longStrip)
         XCTAssertNotNil(saved.lastReadAt)
         XCTAssertNotNil(saved.lastOpenedAt)
     }

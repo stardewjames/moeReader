@@ -17,7 +17,13 @@ private final class DecodedImageCache: @unchecked Sendable {
     }
 }
 
-actor PageLoader {
+/// The image source the reader renders. Local archives and extension chapters
+/// both provide decoded pages through this seam.
+protocol ReaderImageProviding: Sendable {
+    func image(at index: Int, maxPixelSize: Int) async -> DecodedImage?
+}
+
+actor PageLoader: ReaderImageProviding {
     let source: any PageSource
 
     private let cache: DecodedImageCache

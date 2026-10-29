@@ -1,7 +1,6 @@
 import SwiftUI
 
 struct MihonCompatView: View {
-    let library: LibraryModel
     @State private var model = MihonCompatModel()
     @State private var isAddingRepository = false
     @State private var pendingRepositoryRemoval: MihonRepository?
@@ -11,7 +10,6 @@ struct MihonCompatView: View {
         List {
             repositoriesSection
             installedSection
-            sourcesSection
             availableSection
         }
         .navigationTitle("Mihon extensions")
@@ -144,42 +142,6 @@ struct MihonCompatView: View {
     }
 
     @ViewBuilder
-    private var sourcesSection: some View {
-        let sources = model.availableSources
-        if !sources.isEmpty {
-            Section {
-                ForEach(sources) { entry in
-                    NavigationLink {
-                        MihonBrowseView(
-                            source: entry.source,
-                            packageName: entry.installed.packageName,
-                            runtime: entry.runtime,
-                            library: library
-                        )
-                        .id(entry.runtime.descriptor.id)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack {
-                                Text(entry.source.name)
-                                    .foregroundStyle(.white)
-                                Spacer()
-                                Text(model.languageName(entry.source.language))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(entry.runtime.descriptor.name)
-                                .font(.caption2)
-                                .foregroundStyle(Palette.amber)
-                        }
-                    }
-                }
-            } header: {
-                Text("Sources")
-            }
-        }
-    }
-
-    @ViewBuilder
     private var availableSection: some View {
         Section {
             Picker("Language", selection: $model.languageFilter) {
@@ -213,7 +175,7 @@ struct MihonCompatView: View {
         } header: {
             Text("Available · \(model.visibleExtensions.count)")
         } footer: {
-            Text("Install and enable an extension to list its sources. Installed extensions use the runtime selected in Settings.")
+            Text("Install and enable an extension to use its sources in search. Installed extensions use the runtime selected in Settings.")
         }
     }
 }

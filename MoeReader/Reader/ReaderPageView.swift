@@ -216,7 +216,7 @@ struct ReaderPageView: View {
 
     private func loadImage() async {
         state = .loading
-        if let image = await model.loader.image(at: page, maxPixelSize: pixelSize) {
+        if let image = await model.image(at: page, maxPixelSize: pixelSize) {
             guard !Task.isCancelled else { return }
             state = .loaded(image)
         } else {

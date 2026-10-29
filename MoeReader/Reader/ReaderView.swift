@@ -2,12 +2,27 @@ import SwiftUI
 import UIKit
 
 struct ReaderView: View {
-    let book: Book
+    private enum Launch {
+        case local(Book)
+        case remote(MihonReaderSession)
+    }
+
+    private let launch: Launch
     let library: LibraryModel
 
     @State private var model: ReaderModel?
     @State private var openError: String?
     @Environment(\.dismiss) private var dismiss
+
+    init(book: Book, library: LibraryModel) {
+        self.launch = .local(book)
+        self.library = library
+    }
+
+    init(remote: MihonReaderSession, library: LibraryModel) {
+        self.launch = .remote(remote)
+        self.library = library
+    }
 
     var body: some View {
         Group {
@@ -33,7 +48,7 @@ struct ReaderView: View {
             await openIfNeeded()
         }
         .alert(
-            "Can’t open book",
+            "Can’t open manga",
             isPresented: Binding(
                 get: { openError != nil },
                 set: { if !$0 { openError = nil } }
@@ -48,14 +63,55 @@ struct ReaderView: View {
     @MainActor
     private func openIfNeeded() async {
         guard model == nil, openError == nil else { return }
-        let book = self.book
-        let documents = library.documents
         do {
-            let source = try await Task.detached(priority: .userInitiated) {
-                try LocalSource.makeSource(for: book, documents: documents)
-            }.value
-            guard !Task.isCancelled else { return }
-            model = ReaderModel(book: book, source: source, library: library)
+            switch launch {
+            case .local(let book):
+                let documents = library.documents
+                let source = try await Task.detached(priority: .userInitiated) {
+                    try LocalSource.makeSource(for: book, documents: documents)
+                }.value
+                guard !Task.isCancelled else { return }
+                model = ReaderModel(book: book, source: source, library: library)
+            case .remote(let session):
+                let pages = try await session.runtime.pages(
+                    chapter: session.chapter,
+                    manga: session.manga,
+                    source: session.source
+                )
+                guard !pages.isEmpty else {
+                    throw MihonError.malformedResponse("No pages in this chapter.")
+                }
+                guard !Task.isCancelled else { return }
+                let saved = UserDefaults.standard.integer(forKey: session.progressKey)
+                let entry = library.remoteMangaEntry(
+                    packageName: session.packageName,
+                    sourceID: session.source.id,
+                    sourceLanguage: session.source.language,
+                    mangaID: session.manga.id
+                )
+                let key = session.progressKey
+                model = ReaderModel(
+                    title: session.manga.title,
+                    subtitle: session.chapter.displayTitle,
+                    pageCount: pages.count,
+                    initialPage: saved,
+                    modeSetting: entry?.readingMode ?? .defaultMode,
+                    images: MihonReaderPageSource(session: session, pages: pages),
+                    library: library,
+                    onProgress: { page in
+                        UserDefaults.standard.set(page, forKey: key)
+                    },
+                    onReadingMode: { mode in
+                        library.updateRemoteReadingMode(
+                            packageName: session.packageName,
+                            sourceID: session.source.id,
+                            sourceLanguage: session.source.language,
+                            mangaID: session.manga.id,
+                            mode: mode
+                        )
+                    }
+                )
+            }
         } catch {
             openError = error.localizedDescription
         }

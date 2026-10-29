@@ -88,17 +88,36 @@ private enum LegacyReadingDirection: String, Codable {
     case rightToLeft, leftToRight
 }
 
+enum LibrarySort: String, Codable, CaseIterable, Identifiable, Sendable {
+    case newest
+    case oldest
+    case titleAscending
+    case titleDescending
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .newest: "Newest first"
+        case .oldest: "Oldest first"
+        case .titleAscending: "Title A–Z"
+        case .titleDescending: "Title Z–A"
+        }
+    }
+}
+
 struct LibraryIndex: Codable, Sendable {
-    var version = 4
+    var version = 5
     var books: [Book] = []
     var remoteManga: [RemoteMangaEntry] = []
+    var sortOrder: LibrarySort = .newest
     var defaultReadingMode: ReadingMode = .pagedRightToLeft
     var tapZoneLayout: TapZoneLayout = .sides
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case version, books, remoteManga, defaultReadingMode, tapZoneLayout
+        case version, books, remoteManga, sortOrder, defaultReadingMode, tapZoneLayout
     }
 
     init(from decoder: any Decoder) throws {
@@ -109,6 +128,10 @@ struct LibraryIndex: Codable, Sendable {
             [RemoteMangaEntry].self,
             forKey: .remoteManga
         ) ?? []
+        sortOrder = try container.decodeIfPresent(
+            LibrarySort.self,
+            forKey: .sortOrder
+        ) ?? .newest
         let stored = try container.decodeIfPresent(
             ReadingMode.self,
             forKey: .defaultReadingMode
@@ -126,6 +149,7 @@ struct LibraryIndex: Codable, Sendable {
         try container.encode(version, forKey: .version)
         try container.encode(books, forKey: .books)
         try container.encode(remoteManga, forKey: .remoteManga)
+        try container.encode(sortOrder, forKey: .sortOrder)
         try container.encode(defaultReadingMode, forKey: .defaultReadingMode)
         try container.encode(tapZoneLayout, forKey: .tapZoneLayout)
     }

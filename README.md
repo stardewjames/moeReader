@@ -9,13 +9,15 @@ Liquid Glass.
 
 - Imports **CBZ**, uncompressed **CBT**, and image folders into an on-device library.
 - Keeps one home library for local files and manga saved from extension
-  sources. Open a source, pick a manga, and choose **Add to Library**; the entry
-  stores a display snapshot and its source identity. Opening it resolves the
-  installed extension and the active runtime, so extension updates and backend
-  switches need no migration.
+  sources. Search all sources or choose one source from the library, pick a
+  manga, and choose **Add to Library**; the entry stores a display snapshot and
+  its source identity. Opening it resolves the installed extension and the
+  active runtime, so extension updates and backend switches need no migration.
+  The shelf sorts by newest, oldest, or title.
 - Browses **Mihon/Tachiyomi extension repositories**: parses `index.pb`, verifies
   and installs extension APKs against the repository signing key, and exposes the
-  declared sources.
+  declared sources. The extension screen only installs and enables packages;
+  source browsing starts from the library search menu.
 - Runs installed lib-1.4–1.6 extensions on a **custom Dalvik engine** inside
   `MihonCompat`: an in-process interpreter plus native Android, Kotlin, OkHttp,
   okio, Jsoup and `eu.kanade.tachiyomi` hosts. Request/parse-style sources use
@@ -31,8 +33,11 @@ Liquid Glass.
   in Settings → Extension runtime. The VM is GPL-2.0-only, so builds that
   bundle it are GPLv2 combined works for sideloading, not the App Store.
 - Browses sources with **search filters** rendered from the extension's
-  `FilterList`, and edits source preferences (text, toggles, single-choice
-  lists, multi-select values) from a settings sheet.
+  `FilterList`, filters chapters by scanlator, and orders chapters newest or
+  oldest first. Source preferences (text, toggles, single-choice lists,
+  multi-select values) are edited from a settings sheet.
+- Reads local and extension manga in the **same paged, vertical, or long-strip
+  reader**, with the same progress, zoom, tap zones, chrome, and per-manga mode.
 - **Settings → Encrypted DNS** (off by default): resolves source and
   repository hostnames over HTTPS using a public resolver or a custom endpoint,
   then connects to the resolved address while keeping the hostname as TLS SNI

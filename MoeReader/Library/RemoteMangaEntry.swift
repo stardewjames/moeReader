@@ -25,6 +25,8 @@ struct RemoteMangaEntry: Identifiable, Hashable, Codable, Sendable {
     var lastOpenedAt: Date?
     var lastChapterTitle: String?
     var lastReadAt: Date?
+    /// Per-manga override; nil keeps the library default.
+    var readingMode: ReadingMode?
 
     init(
         id: UUID = UUID(),
@@ -44,7 +46,8 @@ struct RemoteMangaEntry: Identifiable, Hashable, Codable, Sendable {
         addedAt: Date = .now,
         lastOpenedAt: Date? = nil,
         lastChapterTitle: String? = nil,
-        lastReadAt: Date? = nil
+        lastReadAt: Date? = nil,
+        readingMode: ReadingMode? = nil
     ) {
         self.id = id
         self.packageName = packageName
@@ -64,6 +67,7 @@ struct RemoteMangaEntry: Identifiable, Hashable, Codable, Sendable {
         self.lastOpenedAt = lastOpenedAt
         self.lastChapterTitle = lastChapterTitle
         self.lastReadAt = lastReadAt
+        self.readingMode = readingMode
     }
 
     var sourceIdentity: String { "\(sourceLanguage)#\(sourceID)" }

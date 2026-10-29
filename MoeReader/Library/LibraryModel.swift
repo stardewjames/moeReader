@@ -9,6 +9,7 @@ final class LibraryModel {
     let caches: URL
     private(set) var books: [Book]
     private(set) var remoteManga: [RemoteMangaEntry]
+    private(set) var sortOrder: LibrarySort
     private(set) var defaultReadingMode: ReadingMode
     private(set) var tapZoneLayout: TapZoneLayout
     var isImporting = false
@@ -56,12 +57,14 @@ final class LibraryModel {
         if isUITesting {
             self.books = []
             self.remoteManga = []
+            self.sortOrder = .newest
             self.defaultReadingMode = .pagedRightToLeft
             self.tapZoneLayout = .sides
         } else {
             let index = Self.loadIndex(documents: documents)
             self.books = index.books
             self.remoteManga = index.remoteManga
+            self.sortOrder = index.sortOrder
             self.defaultReadingMode = index.defaultReadingMode
             self.tapZoneLayout = index.tapZoneLayout
         }
@@ -69,6 +72,7 @@ final class LibraryModel {
         let index = Self.loadIndex(documents: documents)
         self.books = index.books
         self.remoteManga = index.remoteManga
+        self.sortOrder = index.sortOrder
         self.defaultReadingMode = index.defaultReadingMode
         self.tapZoneLayout = index.tapZoneLayout
         #endif
@@ -227,6 +231,26 @@ final class LibraryModel {
         scheduleSave()
     }
 
+    func updateRemoteReadingMode(
+        packageName: String,
+        sourceID: Int64,
+        sourceLanguage: String,
+        mangaID: String,
+        mode: ReadingMode
+    ) {
+        guard let index = remoteManga.firstIndex(where: {
+            $0.matches(
+                packageName: packageName,
+                sourceID: sourceID,
+                sourceLanguage: sourceLanguage,
+                mangaID: mangaID
+            )
+        }) else { return }
+        guard remoteManga[index].readingMode != mode else { return }
+        remoteManga[index].readingMode = mode
+        scheduleSave()
+    }
+
     func deleteRemoteManga(_ entry: RemoteMangaEntry) async {
         remoteManga.removeAll { $0.id == entry.id }
         try? FileManager.default.removeItem(
@@ -254,6 +278,12 @@ final class LibraryModel {
         guard let index = books.firstIndex(where: { $0.id == bookID }) else { return }
         guard books[index].readingMode != mode else { return }
         books[index].readingMode = mode
+        scheduleSave()
+    }
+
+    func updateSortOrder(_ order: LibrarySort) {
+        guard sortOrder != order else { return }
+        sortOrder = order
         scheduleSave()
     }
 
@@ -295,6 +325,7 @@ final class LibraryModel {
         )
         books = []
         remoteManga = []
+        sortOrder = .newest
         defaultReadingMode = .pagedRightToLeft
         tapZoneLayout = .sides
         errorMessage = nil
@@ -327,6 +358,7 @@ final class LibraryModel {
         var index = LibraryIndex()
         index.books = books
         index.remoteManga = remoteManga
+        index.sortOrder = sortOrder
         index.defaultReadingMode = defaultReadingMode
         index.tapZoneLayout = tapZoneLayout
         let encoder = JSONEncoder()

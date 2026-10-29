@@ -5,11 +5,15 @@ struct LibraryView: View {
     let library: LibraryModel
 
     @State private var coverStore = CoverStore()
+    @State private var sourceCatalog = MihonSourceCatalog()
+    @State private var runtimeSelection = MihonRuntimeSelection.shared
     @State private var openBook: Book?
     @State private var openRemoteManga: RemoteMangaEntry?
     @State private var isImporterPresented = false
     @State private var isSettingsPresented = false
     @State private var isSourcesPresented = false
+    @State private var isGlobalSearchPresented = false
+    @State private var isSourcePickerPresented = false
     @State private var pendingDeletion: ShelfItem?
     @Environment(\.scenePhase) private var scenePhase
 
@@ -39,8 +43,27 @@ struct LibraryView: View {
                     } label: {
                         Image(systemName: "puzzlepiece.extension")
                     }
-                    .accessibilityIdentifier("library.sources")
-                    .accessibilityLabel("Sources")
+                    .accessibilityIdentifier("library.extensions")
+                    .accessibilityLabel("Manage extensions")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        ForEach(LibrarySort.allCases) { order in
+                            Button {
+                                library.updateSortOrder(order)
+                            } label: {
+                                if order == library.sortOrder {
+                                    Label(order.title, systemImage: "checkmark")
+                                } else {
+                                    Text(order.title)
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
+                    .accessibilityIdentifier("library.sort")
+                    .accessibilityLabel("Sort library")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -52,13 +75,41 @@ struct LibraryView: View {
                     .accessibilityLabel("Settings")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        isImporterPresented = true
+                    Menu {
+                        if sourceCatalog.isLoading {
+                            Text("Loading sources…")
+                        } else if sourceCatalog.sources.isEmpty {
+                            Button {
+                                isSourcesPresented = true
+                            } label: {
+                                Label("Install extensions", systemImage: "puzzlepiece.extension")
+                            }
+                        } else {
+                            Section("Search") {
+                                Button {
+                                    isGlobalSearchPresented = true
+                                } label: {
+                                    Label("All sources", systemImage: "magnifyingglass")
+                                }
+                                Button {
+                                    isSourcePickerPresented = true
+                                } label: {
+                                    Label("Choose a source…", systemImage: "list.bullet")
+                                }
+                            }
+                        }
+                        Section {
+                            Button {
+                                isImporterPresented = true
+                            } label: {
+                                Label("Import files", systemImage: "plus")
+                            }
+                        }
                     } label: {
-                        Image(systemName: "plus")
+                        Image(systemName: "magnifyingglass")
                     }
-                    .accessibilityIdentifier("library.import")
-                    .accessibilityLabel("Import")
+                    .accessibilityIdentifier("library.search")
+                    .accessibilityLabel("Search")
                 }
             }
             .toolbarBackground(.hidden, for: .navigationBar)
@@ -100,10 +151,26 @@ struct LibraryView: View {
                 MihonLibraryMangaView(entry: entry, library: library)
             }
             .navigationDestination(isPresented: $isSourcesPresented) {
-                MihonCompatView(library: library)
+                MihonCompatView()
             }
             .navigationDestination(isPresented: $isSettingsPresented) {
                 SettingsView(library: library)
+            }
+            .sheet(isPresented: $isGlobalSearchPresented) {
+                NavigationStack {
+                    MihonAllSourcesSearchView(
+                        sources: sourceCatalog.sources,
+                        library: library
+                    )
+                }
+            }
+            .sheet(isPresented: $isSourcePickerPresented) {
+                NavigationStack {
+                    MihonSourcePickerView(
+                        sources: sourceCatalog.sources,
+                        library: library
+                    )
+                }
             }
             .confirmationDialog(
                 "Remove from library?",
@@ -127,10 +194,24 @@ struct LibraryView: View {
                 #if DEBUG
                 await library.bootstrapUITestingIfNeeded()
                 #endif
+                await sourceCatalog.reload()
+            }
+            .onChange(of: isSourcesPresented) {
+                if !isSourcesPresented {
+                    Task { await sourceCatalog.reload() }
+                }
+            }
+            .onChange(of: runtimeSelection.activeID) {
+                Task { await sourceCatalog.reload() }
             }
             .onChange(of: scenePhase) {
-                if scenePhase == .background {
+                switch scenePhase {
+                case .active:
+                    Task { await sourceCatalog.reload() }
+                case .background:
                     Task { await library.flush() }
+                default:
+                    break
                 }
             }
         }
@@ -188,13 +269,25 @@ struct LibraryView: View {
         }
     }
 
-    /// Local books and extension entries share one newest-first shelf.
+    /// Local books and extension entries share one shelf.
     private var shelfItems: [ShelfItem] {
         let local = library.books.map(ShelfItem.book)
         let remote = library.remoteManga.map(ShelfItem.remote)
-        return (local + remote).sorted {
-            if $0.addedAt == $1.addedAt { return $0.id < $1.id }
-            return $0.addedAt > $1.addedAt
+        let items = local + remote
+        return items.sorted { lhs, rhs in
+            switch library.sortOrder {
+            case .newest:
+                if lhs.addedAt != rhs.addedAt { return lhs.addedAt > rhs.addedAt }
+            case .oldest:
+                if lhs.addedAt != rhs.addedAt { return lhs.addedAt < rhs.addedAt }
+            case .titleAscending:
+                let order = lhs.title.localizedStandardCompare(rhs.title)
+                if order != .orderedSame { return order == .orderedAscending }
+            case .titleDescending:
+                let order = lhs.title.localizedStandardCompare(rhs.title)
+                if order != .orderedSame { return order == .orderedDescending }
+            }
+            return lhs.id < rhs.id
         }
     }
 
@@ -232,9 +325,9 @@ struct LibraryView: View {
                     .buttonStyle(.glassProminent)
                     .tint(Palette.amber)
                     Button {
-                        isSourcesPresented = true
+                        isSourcePickerPresented = true
                     } label: {
-                        Label("Browse sources", systemImage: "puzzlepiece.extension")
+                        Label("Search sources", systemImage: "magnifyingglass")
                             .padding(.horizontal, 8)
                     }
                     .buttonStyle(.glass)

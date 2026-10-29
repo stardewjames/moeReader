@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-struct MihonAvailableSource: Identifiable {
+struct MihonAvailableSource: Identifiable, Sendable {
     let installed: MihonInstalledExtension
     let source: MihonSource
     let runtime: any MihonSourceRuntime
@@ -163,32 +163,6 @@ final class MihonCompatModel {
         }
         return values.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
-        }
-    }
-
-    var availableSources: [MihonAvailableSource] {
-        var values: [MihonAvailableSource] = []
-        for installedExtension in installed where installedExtension.isEnabled {
-            guard passesContentWarning(installedExtension.contentWarning) else { continue }
-            guard let runtime = runtime(for: installedExtension) else { continue }
-            for source in installedExtension.sources {
-                if !showAllLanguages, languageFilter != "all", source.language != languageFilter {
-                    continue
-                }
-                values.append(
-                    MihonAvailableSource(
-                        installed: installedExtension,
-                        source: source,
-                        runtime: runtime
-                    )
-                )
-            }
-        }
-        return values.sorted {
-            if $0.source.language == $1.source.language {
-                return $0.installed.name.localizedStandardCompare($1.installed.name) == .orderedAscending
-            }
-            return $0.source.language < $1.source.language
         }
     }
 

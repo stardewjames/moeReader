@@ -40,10 +40,18 @@ struct ReaderChrome: View {
             .accessibilityIdentifier("reader.chrome.back")
             .accessibilityLabel("Back")
 
-            Text(model.book.title)
-                .font(.subheadline.weight(.semibold))
-                .lineLimit(1)
-                .foregroundStyle(.white)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(model.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(.white)
+                if let subtitle = model.subtitle {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .foregroundStyle(.white.opacity(0.65))
+                }
+            }
 
             Spacer(minLength: 8)
 

@@ -5,9 +5,10 @@ import Observation
 @MainActor
 @Observable
 final class ReaderModel {
-    let book: Book
+    let title: String
+    let subtitle: String?
     let library: LibraryModel
-    let loader: PageLoader
+    let images: any ReaderImageProviding
     let pageCount: Int
     private(set) var displayOrder: [Int]
     private(set) var modeSetting: ReadingMode
@@ -17,22 +18,54 @@ final class ReaderModel {
     var chromeVisible = true
     var pixelSize: Int
 
+    @ObservationIgnored private let onProgress: @MainActor (Int) -> Void
+    @ObservationIgnored private let onReadingMode: @MainActor (ReadingMode) -> Void
     @ObservationIgnored private var hideTask: Task<Void, Never>?
     @ObservationIgnored private var prefetchTask: Task<Void, Never>?
 
-    init(book: Book, source: any PageSource, library: LibraryModel) {
-        self.book = book
+    init(
+        title: String,
+        subtitle: String? = nil,
+        pageCount: Int,
+        initialPage: Int,
+        modeSetting: ReadingMode,
+        images: any ReaderImageProviding,
+        library: LibraryModel,
+        onProgress: @escaping @MainActor (Int) -> Void,
+        onReadingMode: @escaping @MainActor (ReadingMode) -> Void
+    ) {
+        let count = max(0, pageCount)
+        let resolved = modeSetting.resolved(using: library.defaultReadingMode)
+        self.title = title
+        self.subtitle = subtitle
         self.library = library
-        self.loader = PageLoader(source: source)
-        let count = source.pageNames.count
-        let setting = book.readingMode
-        let resolved = setting.resolved(using: library.defaultReadingMode)
+        self.images = images
         self.pageCount = count
-        self.visiblePage = min(max(book.lastPage, 0), max(0, count - 1))
-        self.modeSetting = setting
+        self.visiblePage = min(max(initialPage, 0), max(0, count - 1))
+        self.modeSetting = modeSetting
         self.readingMode = resolved
         self.pixelSize = 2048
         self.displayOrder = Self.pageOrder(for: resolved, pageCount: count)
+        self.onProgress = onProgress
+        self.onReadingMode = onReadingMode
+    }
+
+    convenience init(book: Book, source: any PageSource, library: LibraryModel) {
+        let loader = PageLoader(source: source)
+        self.init(
+            title: book.title,
+            pageCount: source.pageNames.count,
+            initialPage: book.lastPage,
+            modeSetting: book.readingMode,
+            images: loader,
+            library: library,
+            onProgress: { page in
+                library.updateProgress(bookID: book.id, page: page)
+            },
+            onReadingMode: { mode in
+                library.updateReadingMode(bookID: book.id, mode: mode)
+            }
+        )
     }
 
     func updatePixelSize(_ size: Int) {
@@ -47,14 +80,14 @@ final class ReaderModel {
         let clamped = min(max(page, 0), pageCount - 1)
         visiblePage = clamped
         zoomedPage = nil
-        library.updateProgress(bookID: book.id, page: clamped)
+        onProgress(clamped)
         prefetch()
     }
 
     func setReadingMode(_ setting: ReadingMode) {
         guard modeSetting != setting else { return }
         modeSetting = setting
-        library.updateReadingMode(bookID: book.id, mode: setting)
+        onReadingMode(setting)
 
         let resolved = setting.resolved(using: library.defaultReadingMode)
         guard resolved != readingMode else { return }
@@ -85,7 +118,7 @@ final class ReaderModel {
     func prefetch() {
         prefetchTask?.cancel()
         guard pageCount > 0 else { return }
-        let loader = loader
+        let images = images
         let pixelSize = pixelSize
         let lower = max(0, visiblePage - 2)
         let upper = min(pageCount - 1, visiblePage + 2)
@@ -95,15 +128,19 @@ final class ReaderModel {
             guard !Task.isCancelled else { return }
             for page in lower...upper {
                 Task.detached(priority: .utility) {
-                    _ = await loader.image(at: page, maxPixelSize: pixelSize)
+                    _ = await images.image(at: page, maxPixelSize: pixelSize)
                 }
             }
         }
     }
 
+    func image(at page: Int, maxPixelSize: Int) async -> DecodedImage? {
+        await images.image(at: page, maxPixelSize: maxPixelSize)
+    }
+
     func persistProgress() {
         guard pageCount > 0 else { return }
-        library.updateProgress(bookID: book.id, page: visiblePage)
+        onProgress(visiblePage)
     }
 
     func tapAction(at location: CGPoint, in size: CGSize) -> ReaderTapAction {

@@ -8,7 +8,7 @@ struct SettingsView: View {
         List {
             Section {
                 NavigationLink {
-                    MihonCompatView(library: library)
+                    MihonCompatView()
                 } label: {
                     HStack(spacing: 12) {
                         Image(systemName: "puzzlepiece.extension")

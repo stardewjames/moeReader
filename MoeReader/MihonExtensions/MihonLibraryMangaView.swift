@@ -50,7 +50,7 @@ struct MihonLibraryMangaView: View {
         .tint(Palette.amber)
         .task { await resolve(force: false) }
         .navigationDestination(isPresented: $isSourcesPresented) {
-            MihonCompatView(library: library)
+            MihonCompatView()
         }
     }
 

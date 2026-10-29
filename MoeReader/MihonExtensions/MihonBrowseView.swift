@@ -27,7 +27,9 @@ struct MihonBrowseView: View {
         source: MihonSource,
         packageName: String,
         runtime: any MihonSourceRuntime,
-        library: LibraryModel
+        library: LibraryModel,
+        initialQuery: String = "",
+        startsWithSearch: Bool = false
     ) {
         let store = MihonFilterSelectionStore()
         let savedSelections = store.selections(forSourceIdentity: source.identity)
@@ -37,7 +39,10 @@ struct MihonBrowseView: View {
         self.library = library
         self.filterStore = store
         _filterSelections = State(initialValue: savedSelections)
-        _mode = State(initialValue: savedSelections.isEmpty ? .popular : .search)
+        _query = State(initialValue: initialQuery)
+        _mode = State(
+            initialValue: startsWithSearch || !savedSelections.isEmpty ? .search : .popular
+        )
     }
 
     var body: some View {

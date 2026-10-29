@@ -12,6 +12,12 @@ final class ReaderModelTests: XCTestCase {
         }
     }
 
+    private struct StubImages: ReaderImageProviding {
+        func image(at index: Int, maxPixelSize: Int) async -> DecodedImage? {
+            nil
+        }
+    }
+
     @MainActor
     func testDefaultModeResolutionAndPageOrder() throws {
         let documents = try TestFixtures.temporaryDirectory()
@@ -47,6 +53,45 @@ final class ReaderModelTests: XCTestCase {
         model.setReadingMode(.defaultMode)
         XCTAssertEqual(model.readingMode, .longStrip)
         XCTAssertEqual(model.displayOrder, [0, 1, 2])
+    }
+
+    @MainActor
+    func testGenericReaderModelUsesProvidedCountAndCallbacks() throws {
+        let documents = try TestFixtures.temporaryDirectory()
+        let caches = try TestFixtures.temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+
+        let library = LibraryModel(documents: documents, caches: caches)
+        var progress = -1
+        var savedMode: ReadingMode?
+        let model = ReaderModel(
+            title: "Remote manga",
+            subtitle: "Ch. 4",
+            pageCount: 5,
+            initialPage: 3,
+            modeSetting: .pagedLeftToRight,
+            images: StubImages(),
+            library: library,
+            onProgress: { progress = $0 },
+            onReadingMode: { savedMode = $0 }
+        )
+
+        XCTAssertEqual(model.title, "Remote manga")
+        XCTAssertEqual(model.subtitle, "Ch. 4")
+        XCTAssertEqual(model.pageCount, 5)
+        XCTAssertEqual(model.visiblePage, 3)
+        XCTAssertEqual(model.displayOrder, [0, 1, 2, 3, 4])
+
+        model.seek(to: 1)
+        XCTAssertEqual(progress, 1)
+        XCTAssertEqual(model.visiblePage, 1)
+
+        model.setReadingMode(.longStrip)
+        XCTAssertEqual(savedMode, .longStrip)
+        XCTAssertEqual(model.readingMode, .longStrip)
     }
 
     @MainActor
