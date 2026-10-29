@@ -51,6 +51,28 @@ struct SettingsView: View {
             }
 
             Section {
+                ForEach(LibrarySort.allCases) { order in
+                    Button {
+                        library.updateSortOrder(order)
+                    } label: {
+                        SettingsOptionRow(
+                            title: order.title,
+                            summary: order.summary,
+                            isSelected: order == library.sortOrder
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("settings.sort.\(order.rawValue)")
+                    .accessibilityLabel(order.title)
+                    .accessibilityHint(order.summary)
+                }
+            } header: {
+                Text("Library sorting")
+            } footer: {
+                Text("Applies to imported books and extension entries on the home shelf.")
+            }
+
+            Section {
                 ForEach(ReadingMode.concreteCases) { mode in
                     Button {
                         library.updateDefaultReadingMode(mode)

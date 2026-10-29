@@ -104,6 +104,15 @@ enum LibrarySort: String, Codable, CaseIterable, Identifiable, Sendable {
         case .titleDescending: "Title Z–A"
         }
     }
+
+    var summary: String {
+        switch self {
+        case .newest: "Most recently added first"
+        case .oldest: "Earliest added first"
+        case .titleAscending: "Alphabetical order"
+        case .titleDescending: "Reverse alphabetical order"
+        }
+    }
 }
 
 struct LibraryIndex: Codable, Sendable {

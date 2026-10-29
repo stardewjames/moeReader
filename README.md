@@ -13,7 +13,7 @@ Liquid Glass.
   manga, and choose **Add to Library**; the entry stores a display snapshot and
   its source identity. Opening it resolves the installed extension and the
   active runtime, so extension updates and backend switches need no migration.
-  The shelf sorts by newest, oldest, or title.
+  The shelf sort (newest, oldest, or title) is configured in Settings.
 - Browses **Mihon/Tachiyomi extension repositories**: parses `index.pb`, verifies
   and installs extension APKs against the repository signing key, and exposes the
   declared sources. The extension screen only installs and enables packages;

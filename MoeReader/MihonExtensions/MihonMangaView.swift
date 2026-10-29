@@ -96,7 +96,29 @@ struct MihonMangaView: View {
                         .buttonStyle(.plain)
                     }
                 } header: {
-                    Text("Chapters · \(visibleChapters.count)")
+                    HStack(spacing: 8) {
+                        Text("Chapters · \(visibleChapters.count)")
+                        Spacer()
+                        Menu {
+                            ForEach(ChapterOrder.allCases) { order in
+                                Button {
+                                    chapterOrder = order
+                                } label: {
+                                    menuLabel(order.title, selected: chapterOrder == order)
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(chapterOrder.shortTitle)
+                                Image(systemName: "arrow.up.arrow.down")
+                            }
+                            .font(.caption.weight(.semibold))
+                            .textCase(nil)
+                            .foregroundStyle(Palette.amber)
+                        }
+                        .accessibilityIdentifier("manga.chapterOrder")
+                        .accessibilityLabel("Sort chapters")
+                    }
                 }
             }
         }
@@ -110,12 +132,12 @@ struct MihonMangaView: View {
             if !chapters.isEmpty {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        filterSortMenu
+                        scanlatorMenu
                     } label: {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                     }
                     .accessibilityIdentifier("manga.chapterFilter")
-                    .accessibilityLabel("Filter and sort chapters")
+                    .accessibilityLabel("Filter chapters by scanlator")
                 }
             }
         }
@@ -257,7 +279,7 @@ struct MihonMangaView: View {
     }
 
     @ViewBuilder
-    private var filterSortMenu: some View {
+    private var scanlatorMenu: some View {
         Section("Scanlator") {
             Button {
                 scanlatorFilter = nil
@@ -269,15 +291,6 @@ struct MihonMangaView: View {
                     scanlatorFilter = group
                 } label: {
                     menuLabel(group, selected: scanlatorFilter == group)
-                }
-            }
-        }
-        Section("Order") {
-            ForEach(ChapterOrder.allCases) { order in
-                Button {
-                    chapterOrder = order
-                } label: {
-                    menuLabel(order.title, selected: chapterOrder == order)
                 }
             }
         }
@@ -329,6 +342,13 @@ private enum ChapterOrder: String, CaseIterable, Identifiable {
         switch self {
         case .newest: "Newest first"
         case .oldest: "Oldest first"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .newest: "Newest"
+        case .oldest: "Oldest"
         }
     }
 }

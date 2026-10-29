@@ -47,25 +47,6 @@ struct LibraryView: View {
                     .accessibilityLabel("Manage extensions")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        ForEach(LibrarySort.allCases) { order in
-                            Button {
-                                library.updateSortOrder(order)
-                            } label: {
-                                if order == library.sortOrder {
-                                    Label(order.title, systemImage: "checkmark")
-                                } else {
-                                    Text(order.title)
-                                }
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "arrow.up.arrow.down")
-                    }
-                    .accessibilityIdentifier("library.sort")
-                    .accessibilityLabel("Sort library")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         isSettingsPresented = true
                     } label: {
