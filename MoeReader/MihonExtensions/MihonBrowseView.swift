@@ -4,6 +4,7 @@ struct MihonBrowseView: View {
     let source: MihonSource
     let packageName: String
     private let runtime: any MihonSourceRuntime
+    private let library: LibraryModel
     private let filterStore: MihonFilterSelectionStore
 
     @State private var mode: FeedMode = .popular
@@ -22,12 +23,18 @@ struct MihonBrowseView: View {
     /// Mihon API defaults until the source reports its own flags.
     @State private var capabilities = MihonSourceCapabilities()
 
-    init(source: MihonSource, packageName: String, runtime: any MihonSourceRuntime) {
+    init(
+        source: MihonSource,
+        packageName: String,
+        runtime: any MihonSourceRuntime,
+        library: LibraryModel
+    ) {
         let store = MihonFilterSelectionStore()
         let savedSelections = store.selections(forSourceIdentity: source.identity)
         self.source = source
         self.packageName = packageName
         self.runtime = runtime
+        self.library = library
         self.filterStore = store
         _filterSelections = State(initialValue: savedSelections)
         _mode = State(initialValue: savedSelections.isEmpty ? .popular : .search)
@@ -179,7 +186,8 @@ struct MihonBrowseView: View {
                                     initialManga: manga,
                                     source: source,
                                     packageName: packageName,
-                                    runtime: runtime
+                                    runtime: runtime,
+                                    library: library
                                 )
                             } label: {
                                 MihonMangaCard(manga: manga)
@@ -198,6 +206,14 @@ struct MihonBrowseView: View {
                         ProgressView()
                             .tint(.white)
                             .padding(.bottom, 16)
+                    } else if !hasMore {
+                        Text("No more results from this source.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 24)
                     }
                 }
                 .scrollIndicators(.hidden)

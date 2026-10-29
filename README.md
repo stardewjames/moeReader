@@ -8,6 +8,11 @@ Liquid Glass.
 ## Features
 
 - Imports **CBZ**, uncompressed **CBT**, and image folders into an on-device library.
+- Keeps one home library for local files and manga saved from extension
+  sources. Open a source, pick a manga, and choose **Add to Library**; the entry
+  stores a display snapshot and its source identity. Opening it resolves the
+  installed extension and the active runtime, so extension updates and backend
+  switches need no migration.
 - Browses **Mihon/Tachiyomi extension repositories**: parses `index.pb`, verifies
   and installs extension APKs against the repository signing key, and exposes the
   declared sources.
@@ -189,7 +194,7 @@ MoeReader/
     Source/     PageSource, ZIP, TAR, folder, page ordering
     Image/      ImageIO decoding, cache, JPEG covers
     Diagnostics Signposts
-  Library/      Book model, persistence, import, covers, library UI, settings
+  Library/      Book and remote-entry models, persistence, import, covers, library UI, settings
   MihonExtensions/  Mihon repositories, APK verification, backend seam, browse/reader UI
   MihonCompat/  Swift engine backend: Dalvik interpreter, platform hosts, Mihon source API
   Reader/       Reader model, scroll modes, zoom, chrome

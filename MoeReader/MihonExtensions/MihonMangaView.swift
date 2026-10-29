@@ -4,6 +4,7 @@ struct MihonMangaView: View {
     let source: MihonSource
     let packageName: String
     private let runtime: any MihonSourceRuntime
+    private let library: LibraryModel
 
     @State private var manga: MihonManga
     @State private var chapters: [MihonChapter] = []
@@ -16,11 +17,13 @@ struct MihonMangaView: View {
         initialManga: MihonManga,
         source: MihonSource,
         packageName: String,
-        runtime: any MihonSourceRuntime
+        runtime: any MihonSourceRuntime,
+        library: LibraryModel
     ) {
         self.source = source
         self.packageName = packageName
         self.runtime = runtime
+        self.library = library
         _manga = State(initialValue: initialManga)
     }
 
@@ -53,6 +56,13 @@ struct MihonMangaView: View {
                 Section {
                     ForEach(chapters) { chapter in
                         Button {
+                            library.recordRemoteRead(
+                                packageName: packageName,
+                                sourceID: source.id,
+                                sourceLanguage: source.language,
+                                mangaID: manga.id,
+                                chapterTitle: chapter.displayTitle
+                            )
                             selectedChapter = chapter
                         } label: {
                             HStack(spacing: 10) {
@@ -150,8 +160,37 @@ struct MihonMangaView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(8)
             }
+            if libraryEntry == nil {
+                Button {
+                    library.addRemoteManga(
+                        RemoteMangaEntry(
+                            packageName: packageName,
+                            source: source,
+                            manga: manga
+                        )
+                    )
+                } label: {
+                    Label("Add to Library", systemImage: "plus.circle")
+                        .font(.callout.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(Palette.amber)
+            } else {
+                Label("In Library", systemImage: "checkmark.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Palette.amber)
+            }
         }
         .padding(.vertical, 6)
+    }
+
+    private var libraryEntry: RemoteMangaEntry? {
+        library.remoteMangaEntry(
+            packageName: packageName,
+            sourceID: source.id,
+            sourceLanguage: source.language,
+            mangaID: manga.id
+        )
     }
 
     private func load() async {
@@ -164,6 +203,13 @@ struct MihonMangaView: View {
             let (loadedManga, loadedChapters) = try await (details, chapterList)
             manga = loadedManga
             chapters = loadedChapters
+            library.refreshRemoteManga(
+                RemoteMangaEntry(
+                    packageName: packageName,
+                    source: source,
+                    manga: loadedManga
+                )
+            )
         } catch is CancellationError {
             return
         } catch {

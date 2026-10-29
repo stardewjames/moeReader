@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct MihonCompatView: View {
+    let library: LibraryModel
     @State private var model = MihonCompatModel()
     @State private var isAddingRepository = false
     @State private var pendingRepositoryRemoval: MihonRepository?
@@ -152,7 +153,8 @@ struct MihonCompatView: View {
                         MihonBrowseView(
                             source: entry.source,
                             packageName: entry.installed.packageName,
-                            runtime: entry.runtime
+                            runtime: entry.runtime,
+                            library: library
                         )
                         .id(entry.runtime.descriptor.id)
                     } label: {

@@ -35,6 +35,35 @@ actor CoverStore {
         return image
     }
 
+    func cover(for entry: RemoteMangaEntry, caches: URL) async -> DecodedImage? {
+        let cacheKey = NSString(string: "remote:\(entry.id.uuidString):\(entry.coverURL?.absoluteString ?? "")")
+        if let cached = cache.object(forKey: cacheKey) { return cached }
+
+        let coverURL = LibraryPaths.cover(caches: caches, id: entry.id)
+        if let data = try? Data(contentsOf: coverURL, options: [.mappedIfSafe]),
+           let image = try? ImageDecoder.decode(
+               MappedPayload(cfData: data as CFData, byteCount: data.count),
+               maxPixelSize: 1200
+           ) {
+            cache.setObject(image, forKey: cacheKey, cost: image.cost)
+            return image
+        }
+
+        guard let sourceURL = entry.coverURL,
+              let image = try? await MihonRemoteImageLoader.shared.image(
+                  for: sourceURL,
+                  headers: entry.coverHeaders,
+                  maxPixelSize: 1200
+              ) else {
+            return nil
+        }
+        if let data = ImageFileWriter.jpegData(image.cgImage) {
+            try? data.write(to: coverURL, options: .atomic)
+        }
+        cache.setObject(image, forKey: cacheKey, cost: image.cost)
+        return image
+    }
+
     func invalidate(bookID: UUID, caches: URL) {
         cache.removeObject(forKey: NSString(string: bookID.uuidString))
         try? FileManager.default.removeItem(

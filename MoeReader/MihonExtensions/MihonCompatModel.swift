@@ -26,7 +26,7 @@ final class MihonCompatModel {
     let store: MihonCompatStore
     let selection: MihonRuntimeSelection
     init(
-        store: MihonCompatStore = MihonCompatStore(),
+        store: MihonCompatStore = .shared,
         selection: MihonRuntimeSelection = .shared
     ) {
         self.store = store

@@ -1,6 +1,10 @@
 import Foundation
 
 actor MihonCompatStore {
+    /// One store per process: the extension manager writes it, and the home
+    /// library resolves saved manga from the same installed-extension state.
+    static let shared = MihonCompatStore()
+
     struct Snapshot: Sendable {
         var repositories: [MihonRepository]
         var installed: [MihonInstalledExtension]

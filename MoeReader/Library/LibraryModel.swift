@@ -8,6 +8,7 @@ final class LibraryModel {
     let documents: URL
     let caches: URL
     private(set) var books: [Book]
+    private(set) var remoteManga: [RemoteMangaEntry]
     private(set) var defaultReadingMode: ReadingMode
     private(set) var tapZoneLayout: TapZoneLayout
     var isImporting = false
@@ -54,17 +55,20 @@ final class LibraryModel {
         #if DEBUG
         if isUITesting {
             self.books = []
+            self.remoteManga = []
             self.defaultReadingMode = .pagedRightToLeft
             self.tapZoneLayout = .sides
         } else {
             let index = Self.loadIndex(documents: documents)
             self.books = index.books
+            self.remoteManga = index.remoteManga
             self.defaultReadingMode = index.defaultReadingMode
             self.tapZoneLayout = index.tapZoneLayout
         }
         #else
         let index = Self.loadIndex(documents: documents)
         self.books = index.books
+        self.remoteManga = index.remoteManga
         self.defaultReadingMode = index.defaultReadingMode
         self.tapZoneLayout = index.tapZoneLayout
         #endif
@@ -135,8 +139,100 @@ final class LibraryModel {
         await flush()
     }
 
+    var isEmpty: Bool {
+        books.isEmpty && remoteManga.isEmpty
+    }
+
     func book(id: UUID) -> Book? {
         books.first { $0.id == id }
+    }
+
+    // MARK: Remote manga
+
+    func remoteMangaEntry(
+        packageName: String,
+        sourceID: Int64,
+        sourceLanguage: String,
+        mangaID: String
+    ) -> RemoteMangaEntry? {
+        remoteManga.first {
+            $0.matches(
+                packageName: packageName,
+                sourceID: sourceID,
+                sourceLanguage: sourceLanguage,
+                mangaID: mangaID
+            )
+        }
+    }
+
+    /// Returns false when the same source entry is already in the library.
+    @discardableResult
+    func addRemoteManga(_ entry: RemoteMangaEntry) -> Bool {
+        guard remoteMangaEntry(
+            packageName: entry.packageName,
+            sourceID: entry.sourceID,
+            sourceLanguage: entry.sourceLanguage,
+            mangaID: entry.mangaID
+        ) == nil else { return false }
+        remoteManga.append(entry)
+        scheduleSave()
+        return true
+    }
+
+    /// Replaces the source-provided fields after a details refresh. The user's
+    /// place in the entry and its library identity are preserved.
+    func refreshRemoteManga(_ snapshot: RemoteMangaEntry) {
+        guard let index = remoteManga.firstIndex(where: {
+            $0.matches(
+                packageName: snapshot.packageName,
+                sourceID: snapshot.sourceID,
+                sourceLanguage: snapshot.sourceLanguage,
+                mangaID: snapshot.mangaID
+            )
+        }) else { return }
+        let previousCover = remoteManga[index].coverURL
+        remoteManga[index].refreshDisplay(from: snapshot)
+        if previousCover != snapshot.coverURL {
+            try? FileManager.default.removeItem(
+                at: LibraryPaths.cover(caches: caches, id: remoteManga[index].id)
+            )
+        }
+        scheduleSave()
+    }
+
+    func markRemoteOpened(_ entry: RemoteMangaEntry) {
+        guard let index = remoteManga.firstIndex(where: { $0.id == entry.id }) else { return }
+        remoteManga[index].lastOpenedAt = .now
+        scheduleSave()
+    }
+
+    func recordRemoteRead(
+        packageName: String,
+        sourceID: Int64,
+        sourceLanguage: String,
+        mangaID: String,
+        chapterTitle: String
+    ) {
+        guard let index = remoteManga.firstIndex(where: {
+            $0.matches(
+                packageName: packageName,
+                sourceID: sourceID,
+                sourceLanguage: sourceLanguage,
+                mangaID: mangaID
+            )
+        }) else { return }
+        remoteManga[index].lastChapterTitle = chapterTitle
+        remoteManga[index].lastReadAt = .now
+        remoteManga[index].lastOpenedAt = .now
+        scheduleSave()
+    }
+
+    func deleteRemoteManga(_ entry: RemoteMangaEntry) async {
+        remoteManga.removeAll { $0.id == entry.id }
+        try? FileManager.default.removeItem(
+            at: LibraryPaths.cover(caches: caches, id: entry.id)
+        )
+        await flush()
     }
 
     func markOpened(_ book: Book) {
@@ -198,6 +294,7 @@ final class LibraryModel {
             withIntermediateDirectories: true
         )
         books = []
+        remoteManga = []
         defaultReadingMode = .pagedRightToLeft
         tapZoneLayout = .sides
         errorMessage = nil
@@ -229,6 +326,7 @@ final class LibraryModel {
     private func writeIndex() async {
         var index = LibraryIndex()
         index.books = books
+        index.remoteManga = remoteManga
         index.defaultReadingMode = defaultReadingMode
         index.tapZoneLayout = tapZoneLayout
         let encoder = JSONEncoder()

@@ -14,8 +14,9 @@ the user picks one in Settings:
 | Swift engine (`swift`, default) | [`../MihonCompat`](../MihonCompat/README.md) | Interprets the Dalvik bytecode in Swift, with native Android/Kotlin/OkHttp/Jsoup hosts |
 | Suwayomi runtime (`suwayomi`) | [`../SuwayomiCompat`](../SuwayomiCompat/README.md) | Runs Suwayomi's Android compatibility layer and the real libraries on an embedded JVM |
 
-The only hooks into the rest of the app are the `MihonCompatView` destination
-and the runtime picker in `SettingsView`, and the backend list in
+The layer's hooks into the rest of the app are the `MihonCompatView`
+destination (from Settings and the home Library), the runtime picker in
+`SettingsView`, the home library's remote entries, and the backend list in
 `App/MihonRuntimeBackends.swift`.
 
 ## What it does
@@ -48,8 +49,11 @@ and the runtime picker in `SettingsView`, and the backend list in
   toggle, and multi-select controls; only changed keys are written. Covers use
   the source's request headers over the shared cookie jar; reader pages come
   from the runtime's `pageImage`, so the extension's interceptors apply.
-  Reading progress is stored in `UserDefaults`; it does not touch the local
-  library model.
+- **One home library.** A manga can be added from a source, which stores a
+  display snapshot and source identity in the library index. It then appears
+  beside imported local books; opening it re-resolves the installed extension
+  and the active backend. The last chapter opened is recorded on the entry.
+  `MihonReaderView` still keeps per-chapter page progress in `UserDefaults`.
 
 ## Runtime backends
 
@@ -121,6 +125,7 @@ needs). Nothing in this layer names a backend.
 | `MihonRemoteImageView.swift` | Page bytes from the runtime, cover fetch over URLSession, decode cache, prefetch. Page keys include the backend's descriptor id, so a page decoded by one runtime is not served to, or waited on by, another after a backend switch |
 | `MihonCompatView.swift` | Repository/extension manager |
 | `MihonBrowseView.swift`, `MihonMangaView.swift`, `MihonReaderView.swift` | Source browser and reader |
+| `MihonLibraryMangaView.swift`, `MihonLibraryManga.swift` | Resolve a saved home-library entry against the installed extension and active backend |
 | `MihonFilterView.swift` | FilterList sheet for source searches |
 | `MihonSourceSettingsView.swift` | Source preference sheet |
 
@@ -161,6 +166,8 @@ Portable tests live in `MoeReaderTests/`:
 - `MihonRuntimeSelectionTests` — default backend, persisted choice, fallback
   for unavailable or removed backends, deactivation on switch, eviction across
   backends.
+- `LibraryModelTests` — mixed local/remote index persistence, duplicate source
+  entries, last-read chapter updates, and remote cover cleanup.
 
 Fixtures include a synthetic APK signed with a generated test key; it contains
 no third-party code.

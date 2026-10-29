@@ -109,6 +109,7 @@ final class LibraryModelTests: XCTestCase {
         let index = try JSONDecoder().decode(LibraryIndex.self, from: data)
         XCTAssertEqual(index.defaultReadingMode, .pagedRightToLeft)
         XCTAssertEqual(index.tapZoneLayout, .sides)
+        XCTAssertTrue(index.remoteManga.isEmpty)
     }
 
     @MainActor
@@ -124,6 +125,105 @@ final class LibraryModelTests: XCTestCase {
         await library.delete(book)
         XCTAssertTrue(library.books.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    private func remoteEntry(
+        title: String = "Remote",
+        mangaID: String = "/manga/one"
+    ) -> RemoteMangaEntry {
+        RemoteMangaEntry(
+            packageName: "test.package",
+            sourceID: 42,
+            sourceName: "Test Source",
+            sourceLanguage: "en",
+            mangaID: mangaID,
+            title: title,
+            coverURL: URL(string: "https://example.invalid/cover.jpg")
+        )
+    }
+
+    @MainActor
+    func testRemoteMangaPersistsAlongsideLocalBooks() async throws {
+        let (library, documents, caches) = try makeLibrary()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        await library.importURLs([TestFixtures.url("mini", "cbz")])
+        let entry = remoteEntry()
+        XCTAssertTrue(library.addRemoteManga(entry))
+        await library.flush()
+
+        let reloaded = LibraryModel(documents: documents, caches: caches)
+        XCTAssertEqual(reloaded.books.count, 1)
+        XCTAssertEqual(reloaded.remoteManga.count, 1)
+        XCTAssertEqual(reloaded.remoteManga.first?.id, entry.id)
+        XCTAssertEqual(reloaded.remoteManga.first?.mangaID, entry.mangaID)
+        XCTAssertEqual(reloaded.remoteManga.first?.sourceName, entry.sourceName)
+    }
+
+    @MainActor
+    func testDuplicateRemoteMangaIsIgnored() throws {
+        let (library, documents, caches) = try makeLibrary()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        XCTAssertTrue(library.addRemoteManga(remoteEntry()))
+        XCTAssertFalse(library.addRemoteManga(remoteEntry(title: "Same source entry")))
+        XCTAssertEqual(library.remoteManga.count, 1)
+        XCTAssertEqual(library.remoteManga.first?.title, "Remote")
+    }
+
+    @MainActor
+    func testRemoteReadingActivityAndRefreshPersist() async throws {
+        let (library, documents, caches) = try makeLibrary()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        let entry = remoteEntry()
+        library.addRemoteManga(entry)
+        library.recordRemoteRead(
+            packageName: entry.packageName,
+            sourceID: entry.sourceID,
+            sourceLanguage: entry.sourceLanguage,
+            mangaID: entry.mangaID,
+            chapterTitle: "Ch. 2"
+        )
+
+        var refreshed = entry
+        refreshed.title = "Updated title"
+        library.refreshRemoteManga(refreshed)
+        await library.flush()
+
+        let reloaded = LibraryModel(documents: documents, caches: caches)
+        let saved = try XCTUnwrap(reloaded.remoteManga.first)
+        XCTAssertEqual(saved.title, "Updated title")
+        XCTAssertEqual(saved.lastChapterTitle, "Ch. 2")
+        XCTAssertNotNil(saved.lastReadAt)
+        XCTAssertNotNil(saved.lastOpenedAt)
+    }
+
+    @MainActor
+    func testDeleteRemoteMangaRemovesEntryAndCover() async throws {
+        let (library, documents, caches) = try makeLibrary()
+        defer {
+            try? FileManager.default.removeItem(at: documents)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        let entry = remoteEntry()
+        library.addRemoteManga(entry)
+        let cover = LibraryPaths.cover(caches: caches, id: entry.id)
+        try FileManager.default.createDirectory(
+            at: cover.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: cover.path, contents: Data([0xFF])))
+
+        await library.deleteRemoteManga(entry)
+        XCTAssertTrue(library.remoteManga.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cover.path))
     }
 
     @MainActor
