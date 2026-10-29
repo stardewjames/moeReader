@@ -11,7 +11,7 @@ struct LibraryView: View {
     @State private var openRemoteManga: RemoteMangaEntry?
     @State private var isImporterPresented = false
     @State private var isSettingsPresented = false
-    @State private var isSourcesPresented = false
+
     @State private var isGlobalSearchPresented = false
     @State private var isSourcePickerPresented = false
     @State private var pendingDeletion: ShelfItem?
@@ -39,15 +39,6 @@ struct LibraryView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        isSourcesPresented = true
-                    } label: {
-                        Image(systemName: "puzzlepiece.extension")
-                    }
-                    .accessibilityIdentifier("library.extensions")
-                    .accessibilityLabel("Manage extensions")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
                         isSettingsPresented = true
                     } label: {
                         Image(systemName: "gearshape")
@@ -60,11 +51,7 @@ struct LibraryView: View {
                         if sourceCatalog.isLoading {
                             Text("Loading sources…")
                         } else if sourceCatalog.sources.isEmpty {
-                            Button {
-                                isSourcesPresented = true
-                            } label: {
-                                Label("Install extensions", systemImage: "puzzlepiece.extension")
-                            }
+                            Text("No sources installed — add extensions in Settings")
                         } else {
                             Section("Search") {
                                 Button {
@@ -131,9 +118,6 @@ struct LibraryView: View {
             .navigationDestination(item: $openRemoteManga) { entry in
                 MihonLibraryMangaView(entry: entry, library: library)
             }
-            .navigationDestination(isPresented: $isSourcesPresented) {
-                MihonCompatView()
-            }
             .navigationDestination(isPresented: $isSettingsPresented) {
                 SettingsView(library: library)
             }
@@ -177,8 +161,8 @@ struct LibraryView: View {
                 #endif
                 await sourceCatalog.reload()
             }
-            .onChange(of: isSourcesPresented) {
-                if !isSourcesPresented {
+            .onChange(of: isSettingsPresented) {
+                if !isSettingsPresented {
                     Task { await sourceCatalog.reload() }
                 }
             }
