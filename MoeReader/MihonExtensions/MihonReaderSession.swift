@@ -41,7 +41,6 @@ actor MihonReaderPageSource: ReaderImageProviding {
 
         let page = pages[index]
         let session = session
-        let cache = cache
         let task = Task<DecodedImage?, Never> {
             do {
                 let data = try await session.runtime.pageImage(
@@ -56,7 +55,6 @@ actor MihonReaderPageSource: ReaderImageProviding {
                       ) else {
                     return nil
                 }
-                cache.setObject(image, forKey: NSString(string: key), cost: image.cost)
                 return image
             } catch {
                 return nil
@@ -65,6 +63,9 @@ actor MihonReaderPageSource: ReaderImageProviding {
         inFlight[key] = task
         let image = await task.value
         inFlight[key] = nil
+        if let image {
+            cache.setObject(image, forKey: NSString(string: key), cost: image.cost)
+        }
         return image
     }
 }
