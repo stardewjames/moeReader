@@ -3,9 +3,10 @@
 //  MihonCompat
 //
 //  `android.webkit`: CookieManager over the host transport's cookie storage,
-//  URLUtil, and the WebView surface. The WebView is backed by `WKWebView` on
-//  Apple platforms; a platform without WebKit throws a typed Java exception
-//  when one is constructed (there is no WebView provider to talk to).
+//  URLUtil, and the WebView surface. A WebView drives a `VMWebViewPlatform`:
+//  `WKWebView` on Apple platforms, or whatever browser the host supplies
+//  through `VMHost.makeWebViewPlatform`. Without one, constructing a WebView
+//  throws a typed Java exception (there is no WebView provider to talk to).
 //
 //  The interpreter is single-threaded, so every platform callback is funnelled
 //  through `VMRuntime.hostEvents` and executed on the engine thread. Calls in
@@ -21,14 +22,28 @@ import FoundationNetworking
 #if canImport(WebKit)
 import WebKit
 #endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Host callbacks (WebView navigation, JavaScript bridge calls, console
-/// messages) produced on other threads that must run on the engine thread.
+/// messages) produced on other threads that must run on the engine thread,
+/// plus work the engine scheduled for later (`Handler.postDelayed`).
 /// The coroutine driver drains it whenever the engine would otherwise sleep,
 /// so a suspended `await` sees completions posted by those callbacks.
 final class VMHostEventQueue: @unchecked Sendable {
+    private struct Timer {
+        let id: Int
+        let due: Date
+        let work: () -> Void
+    }
+
     private let condition = NSCondition()
     private var pending: [() -> Void] = []
+    private var timers: [Timer] = []
+    private var scheduledTimerIDs: Set<Int> = []
+    private var generation = 0
+    private var nextTimerID = 1
 
     /// Enqueues `work` to run on the engine thread. Safe from any thread.
     func post(_ work: @escaping () -> Void) {
@@ -38,21 +53,83 @@ final class VMHostEventQueue: @unchecked Sendable {
         condition.unlock()
     }
 
-    /// Runs every queued event on the calling (engine) thread. When nothing is
-    /// queued it blocks up to `seconds` for the first event. Returns whether
-    /// any event ran.
+    /// Runs `work` on the engine thread once `delay` has passed and the engine
+    /// next drains the queue. Returns an id for `cancel`.
+    @discardableResult
+    func post(after delay: TimeInterval, _ work: @escaping () -> Void) -> Int {
+        condition.lock()
+        defer { condition.unlock() }
+        let id = nextTimerID
+        nextTimerID += 1
+        let timer = Timer(id: id, due: Date(timeIntervalSinceNow: max(0, delay)), work: work)
+        // Keep due order; equal due times run in posting order.
+        let index = timers.firstIndex { $0.due > timer.due } ?? timers.endIndex
+        timers.insert(timer, at: index)
+        scheduledTimerIDs.insert(id)
+        condition.signal()
+        return id
+    }
+
+    /// Drops a scheduled item that has not run yet.
+    func cancel(_ id: Int) {
+        condition.lock()
+        timers.removeAll { $0.id == id }
+        scheduledTimerIDs.remove(id)
+        condition.unlock()
+    }
+
+    /// Drops everything queued or scheduled: it refers to an arena that is
+    /// being reset.
+    func discardAll() {
+        condition.lock()
+        generation += 1
+        scheduledTimerIDs.removeAll()
+        pending.removeAll()
+        timers.removeAll()
+        condition.unlock()
+    }
+
+    /// Runs every queued event and every scheduled item that is due, on the
+    /// calling (engine) thread. When nothing is ready it blocks up to
+    /// `seconds` for the first one. Returns whether anything ran.
     @discardableResult
     func drain(waitingUpTo seconds: TimeInterval) -> Bool {
         condition.lock()
         if pending.isEmpty, seconds > 0 {
             let deadline = Date(timeIntervalSinceNow: seconds)
-            while pending.isEmpty, condition.wait(until: deadline) {}
+            while pending.isEmpty {
+                let now = Date()
+                if let first = timers.first, first.due <= now { break }
+                if now >= deadline { break }
+                _ = condition.wait(until: min(deadline, timers.first?.due ?? deadline))
+            }
         }
         let work = pending
         pending.removeAll()
+        let now = Date()
+        let dueCount = timers.firstIndex { $0.due > now } ?? timers.endIndex
+        let due = Array(timers[..<dueCount])
+        timers.removeFirst(dueCount)
+        let batchGeneration = generation
         condition.unlock()
-        for item in work { item() }
-        return !work.isEmpty
+        var ran = false
+        for item in work {
+            condition.lock()
+            let live = generation == batchGeneration
+            condition.unlock()
+            guard live else { break }
+            item()
+            ran = true
+        }
+        for timer in due {
+            condition.lock()
+            let live = generation == batchGeneration && scheduledTimerIDs.remove(timer.id) != nil
+            condition.unlock()
+            guard live else { continue }
+            timer.work()
+            ran = true
+        }
+        return ran
     }
 }
 
@@ -78,8 +155,8 @@ class VMViewPayload: @unchecked Sendable {
     var paddingBottom: Int32 = 0
     var contentDescription: VMValue = .null
     var clickListener: VMValue = .null
-    /// `setOnHierarchyChangeListener` state; the listener is never fired
-    /// because no child list is ever presented.
+    /// `setOnHierarchyChangeListener` state, told about every child this
+    /// group gains or loses.
     var hierarchyListener: VMValue = .null
     /// The context the view was constructed with, so `getContext` returns the
     /// same instance the extension passed in.
@@ -112,9 +189,9 @@ final class VMWebSettingsPayload: @unchecked Sendable {
     var defaultTextEncodingName = "UTF-8"
 }
 
-/// `ImageReader` state: the geometry the extension asked for and the listener
-/// it installed. No image is ever produced, so `acquireLatestImage` and
-/// `getSurface` fail closed.
+/// `ImageReader` state: the geometry the extension asked for, the listener it
+/// installed and the surface it hands to a virtual display. No image is ever
+/// produced, so `acquireLatestImage` fails closed and the listener never runs.
 final class VMImageReaderState: @unchecked Sendable {
     let width: Int32
     let height: Int32
@@ -122,6 +199,7 @@ final class VMImageReaderState: @unchecked Sendable {
     let maxImages: Int32
     var listener: VMValue = .null
     var handler: VMValue = .null
+    var surface: VMValue = .null
     var closed = false
 
     init(width: Int32, height: Int32, format: Int32, maxImages: Int32) {
@@ -129,6 +207,24 @@ final class VMImageReaderState: @unchecked Sendable {
         self.height = height
         self.format = format
         self.maxImages = maxImages
+    }
+}
+
+/// A virtual display (and its `Display`): the size and density a
+/// `Presentation` lays its content out at.
+final class VMVirtualDisplayPayload: @unchecked Sendable {
+    let name: String
+    let width: Int32
+    let height: Int32
+    let densityDpi: Int32
+    var display: VMValue = .null
+    var released = false
+
+    init(name: String, width: Int32, height: Int32, densityDpi: Int32) {
+        self.name = name
+        self.width = width
+        self.height = height
+        self.densityDpi = densityDpi
     }
 }
 
@@ -204,10 +300,143 @@ final class VMWebViewPayload: VMViewPayload {
     /// does not report it as a page-initiated navigation.
     var expectedNavigation: String?
     weak var runtime: VMRuntime?
-    /// `WKWebView` on Apple platforms; touched on the main queue only.
-    var platformView: AnyObject?
-    /// Retained delegate/script-message handler for the platform view.
-    var platformDelegate: AnyObject?
+    /// The browser showing this WebView's pages.
+    var platform: VMWebViewPlatform?
+    /// Where the platform reports this WebView's activity.
+    var events: VMWebViewEvents?
+    /// Device pixels per CSS pixel, for converting `MotionEvent` coordinates.
+    /// A presentation adopts its display's density.
+    var density: Float = VMDisplayMetricsPayload().density
+}
+
+/// The browser behind one `android.webkit.WebView`. The engine calls it on the
+/// engine thread; an implementation moves to its own UI thread itself and
+/// reports page activity through the `VMWebViewEvents` it was created with.
+///
+/// Page scripts reach the engine by posting `{name, method, args}` to
+/// `window.webkit.messageHandlers.mihonBridge`; a platform that is not WebKit
+/// provides that object itself and forwards each message to
+/// `VMWebViewEvents.bridgeMessage`. `onPageStarted` fires when a main-frame
+/// document commits, as in Android's WebView, so script evaluated from it
+/// runs in the new document.
+protocol VMWebViewPlatform: AnyObject {
+    /// Scripts that run at document start in every frame of later documents.
+    func setUserScripts(_ scripts: [String])
+    func load(url: URL, headers: [(String, String)], userAgent: String?, cookies: [HTTPCookie])
+    func loadHTML(_ html: String, baseURL: URL?, mimeType: String, encoding: String, userAgent: String?, cookies: [HTTPCookie])
+    /// Runs `script` in the current document; `completion` (any thread)
+    /// receives the result as JSON text, the way `evaluateJavascript` reports it.
+    func evaluate(_ script: String, completion: (@Sendable (String) -> Void)?)
+    func stopLoading()
+    func reload()
+    /// Sizes the page's viewport: `width`x`height` device pixels at `density`
+    /// (CSS pixels are device pixels / density). A new WebView is laid out at
+    /// the display size, so page geometry (`elementFromPoint`, viewport
+    /// checks) works before anything presents it.
+    func layout(width: Int, height: Int, density: Double)
+    /// Puts the page on a live display, where it is rendered and runs at
+    /// full rate: the WebView is the content of a `Presentation`.
+    func present()
+    /// Takes the page off that display again.
+    func dismissPresentation()
+    func destroy()
+}
+
+/// Page activity a `VMWebViewPlatform` reports, from any thread. Each event
+/// runs on the engine thread, where it reaches the extension's
+/// `WebViewClient`/`WebChromeClient`/JavaScript interface like the platform
+/// callbacks do. Events that arrive after the WebView's arena was reset are
+/// dropped: the Java objects they would call into are gone.
+final class VMWebViewEvents: @unchecked Sendable {
+    /// `window.webkit.messageHandlers` entry the bridge scripts post to.
+    static let bridgeHandler = "mihonBridge"
+
+    private weak var runtime: VMRuntime?
+    private weak var payload: VMWebViewPayload?
+    private let generation: Int
+
+    init(runtime: VMRuntime, payload: VMWebViewPayload) {
+        self.runtime = runtime
+        self.payload = payload
+        self.generation = runtime.arenaGeneration
+    }
+
+    /// Runs `work` on the engine thread while this WebView's arena is live.
+    private func onEngine(_ work: @escaping (VMRuntime, VMWebViewPayload) -> Void) {
+        guard let runtime, let payload else { return }
+        let generation = self.generation
+        WebKitRuntime.postToEngine(runtime) {
+            guard runtime.arenaGeneration == generation, payload.platform != nil else { return }
+            work(runtime, payload)
+        }
+    }
+
+    private func post(_ event: WebKitRuntime.PageEvent) {
+        onEngine { WebKitRuntime.dispatch($0, payload: $1, event: event) }
+    }
+
+    /// A main-frame document committed (Android's `onPageStarted`).
+    func pageStarted(_ url: String) { post(.started(url)) }
+
+    func pageFinished(_ url: String, title: String?) {
+        onEngine { runtime, payload in
+            if let title { payload.title = title }
+            WebKitRuntime.dispatch(runtime, payload: payload, event: .finished(url))
+        }
+    }
+
+    func pageFailed(code: Int32, description: String, url: String) {
+        post(.failed(code: code, description: description, url: url))
+    }
+
+    func renderProcessGone(didCrash: Bool) { post(.renderProcessGone(didCrash: didCrash)) }
+
+    /// A main-frame navigation is about to start. The load the engine itself
+    /// started through `loadUrl` is not a page-initiated navigation.
+    func navigationRequested(_ url: String) {
+        onEngine { runtime, payload in
+            if payload.expectedNavigation == url {
+                payload.expectedNavigation = nil
+                return
+            }
+            WebKitRuntime.dispatch(runtime, payload: payload, event: .navigation(url: url))
+        }
+    }
+
+    /// One `{name, method, args}` message from a bridge script.
+    func bridgeMessage(_ body: Any) {
+        guard let message = body as? [String: Any],
+              let name = message["name"] as? String,
+              let method = message["method"] as? String else { return }
+        let arguments = message["args"] as? [Any] ?? []
+        onEngine { runtime, payload in
+            WebKitRuntime.dispatchBridgeCall(
+                runtime: runtime,
+                payload: payload,
+                interfaceName: name,
+                method: method,
+                arguments: arguments
+            )
+        }
+    }
+
+    func console(level: String, message: String, source: String, line: Int32) {
+        post(.console(level: level, message: message, sourceId: source, line: line))
+    }
+
+    /// Engine work that answers a platform call made for this WebView (an
+    /// `evaluateJavascript` result).
+    func reply(_ work: @escaping (VMRuntime) -> Void) {
+        onEngine { runtime, _ in work(runtime) }
+    }
+
+    /// Cookies the page holds now; they join the transport's jar, which is
+    /// the same jar from the extension's point of view.
+    func storeCookies(_ cookies: [HTTPCookie]) {
+        guard let runtime else { return }
+        let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
+        for cookie in cookies { storage.setCookie(cookie) }
+    }
 }
 
 final class VMConsoleMessagePayload: @unchecked Sendable {
@@ -599,6 +828,38 @@ enum WebKitRuntime {
         runtime.payload(value, as: VMViewGroupPayload.self)
     }
 
+    /// `ViewGroup.addView`: the child joins the list, the group becomes its
+    /// parent, and the group's hierarchy listener hears about it.
+    static func addChild(_ runtime: VMRuntime, group: VMValue, child: VMValue, params: VMValue?) {
+        guard let container = groupScope(runtime, group) else { return }
+        container.children.append(child)
+        let view = buildScope(runtime, child)
+        view?.parent = group
+        if let params { view?.layoutParams = params }
+        if container.hierarchyListener.object != nil {
+            _ = runtime.callVirtual(
+                container.hierarchyListener,
+                "onChildViewAdded(Landroid/view/View;Landroid/view/View;)V",
+                [group, child]
+            )
+        }
+    }
+
+    /// `ViewGroup.removeView`; a view that is not a child is left alone.
+    static func removeChild(_ runtime: VMRuntime, group: VMValue, child: VMValue) {
+        guard let container = groupScope(runtime, group),
+              let index = container.children.firstIndex(where: { $0.bits == child.bits }) else { return }
+        container.children.remove(at: index)
+        buildScope(runtime, child)?.parent = .null
+        if container.hierarchyListener.object != nil {
+            _ = runtime.callVirtual(
+                container.hierarchyListener,
+                "onChildViewRemoved(Landroid/view/View;Landroid/view/View;)V",
+                [group, child]
+            )
+        }
+    }
+
     private static func viewClasses() -> [NativeClass] {
         var result: [NativeClass] = []
         let view = NativeClass("Landroid/view/View;", superclass: "Ljava/lang/Object;")
@@ -781,30 +1042,21 @@ enum WebKitRuntime {
 
         let group = NativeClass("Landroid/view/ViewGroup;", superclass: "Landroid/view/View;")
         group.method("addView", "(Landroid/view/View;)V") { runtime, args, _ in
-            groupScope(runtime, args[0])?.children.append(args[1])
-            buildScope(runtime, args[1])?.parent = args[0]
+            addChild(runtime, group: args[0], child: args[1], params: nil)
             return .zero
         }
         group.method("addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V") { runtime, args, _ in
-            groupScope(runtime, args[0])?.children.append(args[1])
-            let child = buildScope(runtime, args[1])
-            child?.parent = args[0]
-            child?.layoutParams = args[2]
+            addChild(runtime, group: args[0], child: args[1], params: args[2])
             return .zero
         }
         group.method("removeView", "(Landroid/view/View;)V") { runtime, args, _ in
-            if let group = groupScope(runtime, args[0]),
-               let index = group.children.firstIndex(where: { $0.bits == args[1].bits }) {
-                group.children.remove(at: index)
-            }
-            buildScope(runtime, args[1])?.parent = .null
+            removeChild(runtime, group: args[0], child: args[1])
             return .zero
         }
         group.method("removeAllViews", "()V") { runtime, args, _ in
             for child in groupScope(runtime, args[0])?.children ?? [] {
-                buildScope(runtime, child)?.parent = .null
+                removeChild(runtime, group: args[0], child: child)
             }
-            groupScope(runtime, args[0])?.children.removeAll()
             return .zero
         }
         group.method("getChildCount", "()I") { runtime, args, _ in
@@ -817,7 +1069,7 @@ enum WebKitRuntime {
                   index >= 0, index < children.count else { return .null }
             return children[index]
         }
-        // No child is ever presented, so the callback is stored and never fired.
+        // The listener hears about every `addView`/`removeView` on this group.
         group.method("setOnHierarchyChangeListener", "(Landroid/view/ViewGroup$OnHierarchyChangeListener;)V") { runtime, args, _ in
             buildScope(runtime, args[0])?.hierarchyListener = args[1]
             return .zero
@@ -963,7 +1215,14 @@ enum WebKitRuntime {
         }
         result.append(level)
 
-        let request = NativeClass("Landroid/webkit/WebResourceRequest;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        // The engine hands out instances of this interface, so like a dex
+        // interface it sits under `Object` and inherits `getClass`/`equals`.
+        let request = NativeClass(
+            "Landroid/webkit/WebResourceRequest;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        )
         request.method("getUrl", "()Landroid/net/Uri;") { runtime, args, _ in
             runtime.makeNative("Landroid/net/Uri;", payload: VMUriPayload(runtime.payload(args[0], as: VMWebResourceRequestPayload.self)?.url ?? ""))
         }
@@ -1275,27 +1534,82 @@ enum WebKitRuntime {
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36"
     }
 
+    /// `Presentation.setContentView`: the view becomes the only child of the
+    /// presentation's content frame, so it has a parent as on a device.
+    private static func setPresentationContent(_ runtime: VMRuntime, _ dialog: VMValue, view: VMValue, params: VMValue?) {
+        guard let state = runtime.payload(dialog, as: VMDialogPayload.self) else { return }
+        if state.decor.bits == 0 {
+            let frame = VMViewGroupPayload()
+            frame.context = state.context
+            state.decor = runtime.makeNative("Landroid/widget/FrameLayout;", payload: frame)
+        }
+        for child in groupScope(runtime, state.decor)?.children ?? [] where child.bits != view.bits {
+            removeChild(runtime, group: state.decor, child: child)
+        }
+        if buildScope(runtime, view)?.parent.bits == state.decor.bits {
+            if let params { buildScope(runtime, view)?.layoutParams = params }
+        } else {
+            addChild(runtime, group: state.decor, child: view, params: params)
+        }
+        state.contentView = view
+    }
+
     // MARK: - Display and pointer capture
 
-    /// `Presentation`, `DisplayManager`, `VirtualDisplay`, `ImageReader` and
-    /// `Image` are registered so extensions that render a page off-screen can
-    /// link and construct them. The host owns neither pixels nor a second
-    /// display, so every operation that would need one throws the engine's
-    /// typed `UnsupportedOperationException` instead of returning made-up data.
+    /// `Presentation`, `DisplayManager`, `VirtualDisplay`, `Display`,
+    /// `Surface`, `ImageReader` and `Image`. A virtual display is geometry: it
+    /// gives a `Presentation` a size and density. A presentation whose content
+    /// is a WebView puts that page on a live, rendered viewport of the display's
+    /// size (`VMWebViewPlatform.present`), which is what extensions use one for.
+    /// Frames are never captured, so reading pixels back (`acquireLatestImage`)
+    /// and presenting any other content throw the engine's typed
+    /// `UnsupportedOperationException` instead of returning made-up data.
     private static func displayCaptureClasses() -> [NativeClass] {
         var result: [NativeClass] = []
 
-        // A presentation is a dialog bound to a display; only the display side
-        // is missing, so its dialog state is the real `Dialog` state.
+        // A presentation is a dialog bound to a display, so its dialog state
+        // is the real `Dialog` state.
         let presentation = NativeClass("Landroid/app/Presentation;", superclass: "Landroid/app/Dialog;")
-        presentation.method("<init>", "(Landroid/content/Context;Landroid/view/Display;)V") { runtime, args, _ in
-            let state = VMDialogPayload()
-            state.context = args[1]
-            runtime.setPayload(args[0], state)
+        for signature in ["(Landroid/content/Context;Landroid/view/Display;)V", "(Landroid/content/Context;Landroid/view/Display;I)V"] {
+            presentation.method("<init>", signature) { runtime, args, _ in
+                let state = VMDialogPayload()
+                state.context = args[1]
+                state.display = args[2]
+                runtime.setPayload(args[0], state)
+                return .zero
+            }
+        }
+        presentation.method("getDisplay", "()Landroid/view/Display;") { runtime, args, _ in
+            runtime.payload(args[0], as: VMDialogPayload.self)?.display ?? .null
+        }
+        presentation.method("setContentView", "(Landroid/view/View;)V") { runtime, args, _ in
+            setPresentationContent(runtime, args[0], view: args[1], params: nil)
             return .zero
         }
-        presentation.method("show", "()V") { _, _, _ in
-            throw VMBitmapStore.unsupported("android.app.Presentation.show")
+        presentation.method("setContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V") { runtime, args, _ in
+            setPresentationContent(runtime, args[0], view: args[1], params: args[2])
+            return .zero
+        }
+        presentation.method("show", "()V") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMDialogPayload.self) else { return .zero }
+            guard !state.showing else { return .zero }
+            guard let display = runtime.payload(state.display, as: VMVirtualDisplayPayload.self), !display.released,
+                  let page = runtime.payload(state.contentView, as: VMWebViewPayload.self),
+                  let platform = page.platform else {
+                throw VMBitmapStore.unsupported("android.app.Presentation.show")
+            }
+            page.density = Float(display.densityDpi) / 160
+            platform.layout(width: Int(display.width), height: Int(display.height), density: Double(page.density))
+            platform.present()
+            state.showing = true
+            return .zero
+        }
+        presentation.method("dismiss", "()V") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMDialogPayload.self), state.showing else { return .zero }
+            runtime.payload(state.contentView, as: VMWebViewPayload.self)?.platform?.dismissPresentation()
+            state.showing = false
+            PlatformRuntime.notifyDialogListener(runtime, state.onDismiss, "onDismiss", args[0])
+            return .zero
         }
         result.append(presentation)
 
@@ -1303,17 +1617,61 @@ enum WebKitRuntime {
         displayManager.method(
             "createVirtualDisplay",
             "(Ljava/lang/String;IIILandroid/view/Surface;I)Landroid/hardware/display/VirtualDisplay;"
-        ) { _, _, _ in
-            throw VMBitmapStore.unsupported("android.hardware.display.DisplayManager.createVirtualDisplay")
+        ) { runtime, args, _ in
+            let width = args[2].asInt32
+            let height = args[3].asInt32
+            let densityDpi = args[4].asInt32
+            guard width > 0, height > 0, densityDpi > 0 else {
+                throw VMJavaException(
+                    "Ljava/lang/IllegalArgumentException;",
+                    "width, height and densityDpi must be greater than 0"
+                )
+            }
+            return runtime.makeNative(
+                "Landroid/hardware/display/VirtualDisplay;",
+                payload: VMVirtualDisplayPayload(
+                    name: runtime.stringValue(args[1]) ?? "",
+                    width: width,
+                    height: height,
+                    densityDpi: densityDpi
+                )
+            )
         }
         result.append(displayManager)
 
         let virtualDisplay = NativeClass("Landroid/hardware/display/VirtualDisplay;", superclass: "Ljava/lang/Object;")
-        virtualDisplay.method("getDisplay", "()Landroid/view/Display;") { _, _, _ in
-            throw VMBitmapStore.unsupported("android.hardware.display.VirtualDisplay.getDisplay")
+        virtualDisplay.method("getDisplay", "()Landroid/view/Display;") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMVirtualDisplayPayload.self) else { return .null }
+            if state.display.bits == 0 {
+                state.display = runtime.makeNative("Landroid/view/Display;", payload: state)
+            }
+            return state.display
         }
-        virtualDisplay.method("release", "()V") { _, _, _ in .zero }
+        virtualDisplay.method("release", "()V") { runtime, args, _ in
+            runtime.payload(args[0], as: VMVirtualDisplayPayload.self)?.released = true
+            return .zero
+        }
         result.append(virtualDisplay)
+
+        let display = NativeClass("Landroid/view/Display;", superclass: "Ljava/lang/Object;")
+        display.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.payload(args[0], as: VMVirtualDisplayPayload.self)?.name ?? "")
+        }
+        display.method("getWidth", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMVirtualDisplayPayload.self)?.width ?? 0)
+        }
+        display.method("getHeight", "()I") { runtime, args, _ in
+            .int32(runtime.payload(args[0], as: VMVirtualDisplayPayload.self)?.height ?? 0)
+        }
+        result.append(display)
+
+        // The surface a virtual display renders into. Nothing reads it back.
+        let surface = NativeClass("Landroid/view/Surface;", superclass: "Ljava/lang/Object;")
+        surface.method("isValid", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMImageReaderState.self)?.closed == false)
+        }
+        surface.method("release", "()V") { _, _, _ in .zero }
+        result.append(surface)
 
         // `Image` is only ever handed out by an `ImageReader`; close is the
         // teardown of a buffer that does not exist.
@@ -1342,8 +1700,12 @@ enum WebKitRuntime {
                 )
             )
         }
-        imageReader.method("getSurface", "()Landroid/view/Surface;") { _, _, _ in
-            throw VMBitmapStore.unsupported("android.media.ImageReader.getSurface")
+        imageReader.method("getSurface", "()Landroid/view/Surface;") { runtime, args, _ in
+            guard let state = runtime.payload(args[0], as: VMImageReaderState.self) else { return .null }
+            if state.surface.bits == 0 {
+                state.surface = runtime.makeNative("Landroid/view/Surface;", payload: state)
+            }
+            return state.surface
         }
         imageReader.method("acquireLatestImage", "()Landroid/media/Image;") { _, _, _ in
             throw VMBitmapStore.unsupported("android.media.ImageReader.acquireLatestImage")
@@ -1599,9 +1961,11 @@ enum WebKitRuntime {
         webView.method("getWebChromeClient", "()Landroid/webkit/WebChromeClient;") { runtime, args, _ in
             runtime.payload(args[0], as: VMWebViewPayload.self)?.chromeValue ?? .null
         }
+        // addJavascriptInterface(Object object, String name)
         webView.method("addJavascriptInterface", "(Ljava/lang/Object;Ljava/lang/String;)V") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self),
-                  let name = runtime.stringValue(args[1]), !name.isEmpty else { return .zero }
+                  args[1].object != nil,
+                  let name = runtime.stringValue(args[2]), !name.isEmpty else { return .zero }
             payload.interfaces.removeAll { $0.name == name }
             payload.interfaces.append((name, args[1]))
             attachJavascriptInterface(runtime, payload, name: name, value: args[1])
@@ -1667,20 +2031,45 @@ enum WebKitRuntime {
         webView.method("stopLoading", "()V") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self) else { return .zero }
             payload.loading = false
-            stopLoading(runtime, payload)
+            stopLoading(payload)
             return .zero
         }
         webView.method("reload", "()V") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self) else { return .zero }
             payload.loading = true
-            reload(runtime, payload)
+            reload(payload)
             return .zero
         }
         webView.method("destroy", "()V") { runtime, args, _ in
             guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self) else { return .zero }
             payload.loading = false
-            destroy(runtime, payload)
+            destroy(payload)
             return .zero
+        }
+        // `View.layout` sizes the page's viewport too.
+        webView.method("layout", "(IIII)V") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self) else { return .zero }
+            let width = max(0, Int(args[3].asInt32) - Int(args[1].asInt32))
+            let height = max(0, Int(args[4].asInt32) - Int(args[2].asInt32))
+            payload.width = width
+            payload.height = height
+            if width > 0, height > 0 {
+                payload.platform?.layout(width: width, height: height, density: Double(payload.density))
+            }
+            return .zero
+        }
+        // Pointer coordinates are device pixels; the page works in CSS pixels.
+        webView.method("dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z") { runtime, args, _ in
+            guard let payload = runtime.payload(args[0], as: VMWebViewPayload.self),
+                  let platform = payload.platform,
+                  let event = runtime.payload(args[1], as: VMMotionEventPayload.self),
+                  let pointer = event.pointers.first else { return .boolean(false) }
+            let density = Double(payload.density > 0 ? payload.density : 1)
+            platform.evaluate(
+                touchScript(action: event.action & 0xFF, x: Double(pointer.x) / density, y: Double(pointer.y) / density),
+                completion: nil
+            )
+            return .boolean(true)
         }
         // The platform posts the visual state back once the frame is committed;
         // there is no compositor here, so the callback runs on the engine
@@ -1740,61 +2129,105 @@ enum WebKitRuntime {
 
     // MARK: - WebView lifecycle
 
-    private static func createWebView(_ runtime: VMRuntime, into value: VMValue, context: VMValue) throws {
+    /// The browser the engine uses when the host supplies none: `WKWebView`
+    /// on Apple platforms, nothing elsewhere.
+    static func defaultWebViewPlatform(
+        runtime: VMRuntime,
+        payload: VMWebViewPayload,
+        events: VMWebViewEvents
+    ) -> VMWebViewPlatform? {
         #if canImport(WebKit)
-        let payload = VMWebViewPayload()
-        payload.runtime = runtime
-        payload.context = context
-        runtime.setPayload(value, payload)
-        payload.selfValue = value
-        let settingsValue = runtime.makeNative("Landroid/webkit/WebSettings;", payload: payload.settings)
-        payload.settingsValue = settingsValue
-        let scripts = payload.interfaces.map { bridgeScript(name: $0.name, value: $0.value, runtime: runtime) }
-        runOnMain(runtime) { attachWebView(runtime, payload, scripts: scripts) }
+        return VMWKWebViewPlatform(runtime: runtime, payload: payload, events: events)
         #else
         _ = runtime
-        _ = value
-        throw VMJavaException(
-            "Ljava/lang/UnsupportedOperationException;",
-            "android.webkit.WebView requires a WebKit host"
-        )
+        _ = payload
+        _ = events
+        return nil
         #endif
     }
 
-    #if canImport(WebKit)
-    private static func attachWebView(_ runtime: VMRuntime, _ payload: VMWebViewPayload, scripts: [String]) {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        let controller = WKUserContentController()
-        let delegate = VMWebViewDelegate(runtime: runtime, payload: payload)
-        payload.platformDelegate = delegate
-        controller.add(delegate, name: VMWebViewDelegate.bridgeHandler)
-        controller.add(delegate, name: VMWebViewDelegate.consoleHandler)
-        controller.addUserScript(WKUserScript(
-            source: VMWebViewDelegate.consoleShim,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
-        ))
-        for script in scripts {
-            controller.addUserScript(WKUserScript(
-                source: script,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false
-            ))
+    private static func createWebView(_ runtime: VMRuntime, into value: VMValue, context: VMValue) throws {
+        let payload = VMWebViewPayload()
+        payload.runtime = runtime
+        payload.context = context
+        let events = VMWebViewEvents(runtime: runtime, payload: payload)
+        let platform = runtime.host.map { $0.makeWebViewPlatform(runtime: runtime, payload: payload, events: events) }
+            ?? defaultWebViewPlatform(runtime: runtime, payload: payload, events: events)
+        guard let platform else {
+            throw VMJavaException(
+                "Ljava/lang/UnsupportedOperationException;",
+                "android.webkit.WebView requires a WebKit host"
+            )
         }
-        configuration.userContentController = controller
-        if #available(iOS 14.0, macOS 11.0, *) {
-            configuration.defaultWebpagePreferences.allowsContentJavaScript = payload.settings.javaScriptEnabled
-        } else {
-            configuration.preferences.javaScriptEnabled = payload.settings.javaScriptEnabled
-        }
-        let view = WKWebView(frame: .zero, configuration: configuration)
-        view.navigationDelegate = delegate
-        view.uiDelegate = delegate
-        view.customUserAgent = payload.settings.userAgentString
-        payload.platformView = view
+        payload.platform = platform
+        payload.events = events
+        runtime.webViews[ObjectIdentifier(payload)] = payload
+        runtime.setPayload(value, payload)
+        payload.selfValue = value
+        payload.settingsValue = runtime.makeNative("Landroid/webkit/WebSettings;", payload: payload.settings)
+        platform.setUserScripts([resourceObserverScript])
+        let metrics = VMDisplayMetricsPayload()
+        platform.layout(width: Int(metrics.widthPixels), height: Int(metrics.heightPixels), density: Double(metrics.density))
     }
 
+    /// Reserved bridge name the resource observer reports through.
+    static let resourceObserverInterface = "__mihonResources"
+
+    /// Reports every subresource the page loads (a `PerformanceObserver`
+    /// sees fetch, XHR, script, image and frame loads in its frame) to the
+    /// engine, which shows each one to `WebViewClient.shouldInterceptRequest`.
+    static let resourceObserverScript = """
+    (function(){
+      if (window.__mihonResourceObserver || typeof PerformanceObserver !== 'function') { return; }
+      window.__mihonResourceObserver = true;
+      function report(entries) {
+        var list = [];
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].entryType === 'resource') { list.push([entries[i].name, entries[i].initiatorType || '']); }
+        }
+        if (!list.length) { return; }
+        try {
+          window.webkit.messageHandlers.\(VMWebViewEvents.bridgeHandler).postMessage({
+            name: \(jsStringLiteral(resourceObserverInterface)), method: 'observed', args: [list]
+          });
+        } catch (error) {}
+      }
+      try {
+        new PerformanceObserver(function(list){ report(list.getEntries()); }).observe({ type: 'resource', buffered: true });
+      } catch (error) {}
+    })();
+    """
+
+    /// Subresource loads the page reported. A platform browser view cannot
+    /// hold a request back for `shouldInterceptRequest`, so the client sees
+    /// each one after it was made, and a response it returns cannot replace
+    /// what the page received. Sources that watch traffic (count API calls,
+    /// read a token or an address off a URL) work; substituting content does
+    /// not.
+    static func observeResources(_ runtime: VMRuntime, payload: VMWebViewPayload, arguments: [Any]) {
+        guard payload.clientValue.object != nil, let entries = arguments.first as? [Any] else { return }
+        for case let entry as [Any] in entries {
+            guard let url = entry.first as? String,
+                  let scheme = URL(string: url)?.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { continue }
+            let initiator = entry.count > 1 ? entry[1] as? String ?? "" : ""
+            let accept = initiator == "iframe" || initiator == "frame"
+                ? "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                : "*/*"
+            let request = VMWebResourceRequestPayload(url: url, headers: [("Accept", accept)])
+            request.isForMainFrame = false
+            let requestValue = runtime.makeNative("Landroid/webkit/WebResourceRequest;", payload: request)
+            _ = runtime.callVirtual(
+                payload.clientValue,
+                "shouldInterceptRequest(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Landroid/webkit/WebResourceResponse;",
+                [payload.selfValue, requestValue]
+            )
+        }
+    }
+
+    /// The page-side half of `addJavascriptInterface`: every listed method
+    /// posts `{name, method, args}` to the `mihonBridge` message handler, which
+    /// each platform delivers through `VMWebViewEvents.bridgeMessage`.
     private static func bridgeScript(name: String, value: VMValue, runtime: VMRuntime) -> String {
         let methods = bridgeMethodNames(runtime, value)
         let list = methods.map { jsStringLiteral($0) }.joined(separator: ", ")
@@ -1805,7 +2238,7 @@ enum WebKitRuntime {
             target[method] = function(){
               var args = Array.prototype.slice.call(arguments);
               try {
-                window.webkit.messageHandlers.\(VMWebViewDelegate.bridgeHandler).postMessage({
+                window.webkit.messageHandlers.\(VMWebViewEvents.bridgeHandler).postMessage({
                   name: \(jsStringLiteral(name)), method: method, args: args
                 });
               } catch (error) {}
@@ -1816,7 +2249,7 @@ enum WebKitRuntime {
         """
     }
 
-    private static func jsStringLiteral(_ text: String) -> String {
+    static func jsStringLiteral(_ text: String) -> String {
         let escaped = text
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -1842,57 +2275,20 @@ enum WebKitRuntime {
         return names.sorted()
     }
 
-    private static func applySettings(_ payload: VMWebViewPayload, to view: WKWebView) {
-        view.customUserAgent = payload.settings.userAgentString
-    }
-
-    /// The transport cookie jar and the WebView cookie store are the same store
-    /// from the extension's point of view: push before loading, pull after.
-    private static func syncCookiesToWebView(_ runtime: VMRuntime, _ view: WKWebView, url: URL) {
-        let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
-        let store = view.configuration.websiteDataStore.httpCookieStore
-        for cookie in WebKitRuntime.cookies(storage, for: url) {
-            store.setCookie(cookie)
-        }
-    }
-    #endif
-
     private static func attachJavascriptInterface(
         _ runtime: VMRuntime,
         _ payload: VMWebViewPayload,
         name: String,
         value: VMValue
     ) {
-        #if canImport(WebKit)
+        guard let platform = payload.platform else { return }
         // Reflect over the interpreted class on the engine thread; the platform
-        // side only receives ready-to-run scripts.
-        let scripts = payload.interfaces.map { bridgeScript(name: $0.name, value: $0.value, runtime: runtime) }
-        let script = bridgeScript(name: name, value: value, runtime: runtime)
-        runOnMain(runtime) {
-            guard let view = payload.platformView as? WKWebView else { return }
-            let controller = view.configuration.userContentController
-            controller.removeAllUserScripts()
-            controller.addUserScript(WKUserScript(
-                source: VMWebViewDelegate.consoleShim,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false
-            ))
-            for source in scripts {
-                controller.addUserScript(WKUserScript(
-                    source: source,
-                    injectionTime: .atDocumentStart,
-                    forMainFrameOnly: false
-                ))
-            }
-            view.evaluateJavaScript(script, completionHandler: nil)
-        }
-        #else
-        // No page exists without a WebView provider; the registration is still
-        // recorded so `removeJavascriptInterface` behaves consistently.
-        _ = runtime
-        _ = name
-        _ = value
-        #endif
+        // only receives ready-to-run scripts. Later documents get every
+        // interface at document start; the current one gets the new one now.
+        platform.setUserScripts(
+            [resourceObserverScript] + payload.interfaces.map { bridgeScript(name: $0.name, value: $0.value, runtime: runtime) }
+        )
+        platform.evaluate(bridgeScript(name: name, value: value, runtime: runtime), completion: nil)
     }
 
     private static func load(
@@ -1905,7 +2301,6 @@ enum WebKitRuntime {
         payload.originalUrl = payload.originalUrl ?? text
         payload.loading = true
         payload.expectedNavigation = text
-        #if canImport(WebKit)
         guard let url = URL(string: text) else { return }
 
         // Android asks the client about the main-frame request before the
@@ -1926,20 +2321,14 @@ enum WebKitRuntime {
             return
         }
 
-        runOnMain(runtime) {
-            guard let view = payload.platformView as? WKWebView else { return }
-            applySettings(payload, to: view)
-            syncCookiesToWebView(runtime, view, url: url)
-            var request = URLRequest(url: url)
-            for (name, value) in headers where !name.isEmpty {
-                request.addValue(value, forHTTPHeaderField: name)
-            }
-            view.load(request)
-        }
-        #else
-        _ = runtime
-        _ = headers
-        #endif
+        // The transport cookie jar and the WebView cookie store are the same
+        // store from the extension's point of view: push before loading.
+        payload.platform?.load(
+            url: url,
+            headers: headers.filter { !$0.0.isEmpty },
+            userAgent: payload.settings.userAgentString,
+            cookies: cookies(cookieStorage(runtime), for: url)
+        )
     }
 
     private static func loadHTML(
@@ -1950,72 +2339,29 @@ enum WebKitRuntime {
         mimeType: String,
         encoding: String
     ) {
-        #if canImport(WebKit)
-        runOnMain(runtime) {
-            guard let view = payload.platformView as? WKWebView else { return }
-            applySettings(payload, to: view)
-            if let baseURL {
-                syncCookiesToWebView(runtime, view, url: baseURL)
-                view.loadHTMLString(html, baseURL: baseURL)
-            } else if let encoded = html.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-                      let dataURL = URL(string: "data:\(mimeType.isEmpty ? "text/html" : mimeType);charset=\(encoding.isEmpty ? "utf-8" : encoding),\(encoded)") {
-                view.load(URLRequest(url: dataURL))
-            }
-        }
-        #else
-        _ = runtime
-        _ = payload
-        _ = html
-        _ = baseURL
-        _ = mimeType
-        _ = encoding
-        #endif
+        payload.platform?.loadHTML(
+            html,
+            baseURL: baseURL,
+            mimeType: mimeType.isEmpty ? "text/html" : mimeType,
+            encoding: encoding.isEmpty ? "utf-8" : encoding,
+            userAgent: payload.settings.userAgentString,
+            cookies: baseURL.map { cookies(cookieStorage(runtime), for: $0) } ?? []
+        )
     }
 
-    private static func stopLoading(_ runtime: VMRuntime, _ payload: VMWebViewPayload) {
-        #if canImport(WebKit)
-        runOnMain(runtime) {
-            (payload.platformView as? WKWebView)?.stopLoading()
-        }
-        #else
-        _ = runtime
-        _ = payload
-        #endif
+    private static func stopLoading(_ payload: VMWebViewPayload) {
+        payload.platform?.stopLoading()
     }
 
-    private static func reload(_ runtime: VMRuntime, _ payload: VMWebViewPayload) {
-        #if canImport(WebKit)
-        runOnMain(runtime) {
-            (payload.platformView as? WKWebView)?.reload()
-        }
-        #else
-        _ = runtime
-        _ = payload
-        #endif
+    private static func reload(_ payload: VMWebViewPayload) {
+        payload.platform?.reload()
     }
 
-    private static func destroy(_ runtime: VMRuntime, _ payload: VMWebViewPayload) {
+    private static func destroy(_ payload: VMWebViewPayload) {
+        payload.runtime?.webViews[ObjectIdentifier(payload)] = nil
         payload.runtime = nil
-        #if canImport(WebKit)
-        runOnMain(runtime) {
-            guard let view = payload.platformView as? WKWebView else { return }
-            view.stopLoading()
-            view.navigationDelegate = nil
-            view.uiDelegate = nil
-            let controller = view.configuration.userContentController
-            for entry in payload.interfaces {
-                controller.removeScriptMessageHandler(forName: entry.name)
-            }
-            controller.removeScriptMessageHandler(forName: VMWebViewDelegate.bridgeHandler)
-            controller.removeScriptMessageHandler(forName: VMWebViewDelegate.consoleHandler)
-            controller.removeAllUserScripts()
-            view.removeFromSuperview()
-            payload.platformView = nil
-            payload.platformDelegate = nil
-        }
-        #else
-        _ = runtime
-        #endif
+        payload.platform?.destroy()
+        payload.platform = nil
     }
 
     private static func evaluate(
@@ -2024,33 +2370,74 @@ enum WebKitRuntime {
         script: String,
         callback: VMValue
     ) {
-        #if canImport(WebKit)
-        guard let view = payload.platformView as? WKWebView else { return }
-        runOnMain(runtime) {
-            view.evaluateJavaScript(script) { result, error in
-                let text: String
-                if let error {
-                    let message = error.localizedDescription.replacingOccurrences(of: "\"", with: "'")
-                    text = "\"\(message)\""
-                } else if let result,
-                          let data = try? JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed]),
-                          let encoded = String(data: data, encoding: .utf8) {
-                    text = encoded
-                } else {
-                    text = "null"
-                }
-                guard callback.object != nil else { return }
-                postToEngine(runtime) {
-                    _ = runtime.callVirtual(callback, "onReceiveValue(Ljava/lang/Object;)V", [runtime.newString(text)])
-                }
+        guard let platform = payload.platform else { return }
+        guard callback.object != nil, let events = payload.events else {
+            platform.evaluate(script, completion: nil)
+            return
+        }
+        platform.evaluate(script) { text in
+            events.reply { runtime in
+                _ = runtime.callVirtual(callback, "onReceiveValue(Ljava/lang/Object;)V", [runtime.newString(text)])
             }
         }
-        #else
-        _ = runtime
-        _ = payload
-        _ = script
-        _ = callback
-        #endif
+    }
+
+    /// `WebView.dispatchTouchEvent`: the page receives the touch as DOM events
+    /// (pointer, touch, mouse and, on release over the pressed element, an
+    /// activation click) at the pointer's CSS position. They are synthesised,
+    /// so a page that insists on `isTrusted` input ignores them; there is no
+    /// way to inject trusted input into a platform browser view.
+    static func touchScript(action: Int32, x: Double, y: Double) -> String {
+        func number(_ value: Double) -> String { value.isFinite ? String(format: "%.2f", value) : "0" }
+        return """
+        (function(action, x, y){
+          var state = window.__mihonTouch || (window.__mihonTouch = {});
+          var target = action === 0 || !state.target ? document.elementFromPoint(x, y) : state.target;
+          if (!target) { return false; }
+          if (action === 0) { state.target = target; }
+          var base = { bubbles: true, cancelable: true, composed: true, view: window,
+                       clientX: x, clientY: y, screenX: x, screenY: y };
+          var pointer = { pointerId: 1, pointerType: 'touch', isPrimary: true };
+          function fire(type, Kind, extra) {
+            try { target.dispatchEvent(new Kind(type, Object.assign({}, base, extra || {}))); } catch (error) {}
+          }
+          function touch(type) {
+            if (typeof Touch !== 'function' || typeof TouchEvent !== 'function') { return; }
+            try {
+              var point = new Touch({ identifier: 1, target: target, clientX: x, clientY: y, screenX: x, screenY: y,
+                                      pageX: x + window.scrollX, pageY: y + window.scrollY });
+              var active = type === 'touchend' || type === 'touchcancel' ? [] : [point];
+              target.dispatchEvent(new TouchEvent(type, { bubbles: true, cancelable: true, composed: true,
+                touches: active, targetTouches: active, changedTouches: [point] }));
+            } catch (error) {}
+          }
+          var Pointer = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+          if (action === 0) {
+            fire('pointerdown', Pointer, Object.assign({ buttons: 1 }, pointer));
+            touch('touchstart');
+            fire('mousedown', MouseEvent, { buttons: 1 });
+          } else if (action === 2) {
+            fire('pointermove', Pointer, Object.assign({ buttons: 1 }, pointer));
+            touch('touchmove');
+            fire('mousemove', MouseEvent, { buttons: 1 });
+          } else if (action === 1) {
+            fire('pointerup', Pointer, pointer);
+            touch('touchend');
+            fire('mouseup', MouseEvent, {});
+            var released = document.elementFromPoint(x, y);
+            state.target = null;
+            if (released && (released === target || target.contains(released) || released.contains(target))) {
+              var activated = target.contains(released) ? released : target;
+              if (typeof activated.click === 'function') { activated.click(); } else { fire('click', MouseEvent, {}); }
+            }
+          } else if (action === 3) {
+            fire('pointercancel', Pointer, pointer);
+            touch('touchcancel');
+            state.target = null;
+          }
+          return true;
+        })(\(action), \(number(x)), \(number(y)));
+        """
     }
 
     // MARK: - Platform callbacks (engine thread)
@@ -2064,6 +2451,10 @@ enum WebKitRuntime {
         method: String,
         arguments: [Any]
     ) {
+        if interfaceName == resourceObserverInterface {
+            observeResources(runtime, payload: payload, arguments: arguments)
+            return
+        }
         guard let entry = payload.interfaces.first(where: { $0.name == interfaceName }) else { return }
         var values: [VMValue] = []
         for argument in arguments {
@@ -2221,11 +2612,12 @@ enum WebKitRuntime {
 }
 
 #if canImport(WebKit)
-/// Bridges `WKWebView` callbacks into the interpreter. Every callback that
-/// needs the VM is posted to `runtime.hostEvents`; nothing re-enters the
-/// interpreter from the platform thread.
-final class VMWebViewDelegate: NSObject, WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate, @unchecked Sendable {
-    static let bridgeHandler = "mihonBridge"
+/// `WKWebView` as the WebView platform. WebKit is only touched on the main
+/// queue (`WebKitRuntime.runOnMain` keeps the engine draining its events while
+/// it waits), and every callback reaches the interpreter through
+/// `VMWebViewEvents`; nothing re-enters the interpreter from the main thread.
+final class VMWKWebViewPlatform: NSObject, VMWebViewPlatform, WKNavigationDelegate, WKScriptMessageHandler,
+    WKUIDelegate, @unchecked Sendable {
     static let consoleHandler = "mihonConsole"
 
     /// Overrides `console.*` so page messages reach `onConsoleMessage`.
@@ -2241,7 +2633,7 @@ final class VMWebViewDelegate: NSObject, WKNavigationDelegate, WKScriptMessageHa
               if (typeof value === 'string') { return value; }
               try { return JSON.stringify(value); } catch (error) { return String(value); }
             });
-            window.webkit.messageHandlers.\(VMWebViewDelegate.consoleHandler).postMessage({
+            window.webkit.messageHandlers.\(VMWKWebViewPlatform.consoleHandler).postMessage({
               level: level, message: parts.join(' '), source: location.href, line: 0
             });
           } catch (error) {}
@@ -2252,40 +2644,225 @@ final class VMWebViewDelegate: NSObject, WKNavigationDelegate, WKScriptMessageHa
     """
 
     private weak var runtime: VMRuntime?
-    private let payload: VMWebViewPayload
+    private weak var payload: VMWebViewPayload?
+    private let events: VMWebViewEvents
+    /// Main queue only.
+    private var view: WKWebView?
 
-    init(runtime: VMRuntime, payload: VMWebViewPayload) {
+    init(runtime: VMRuntime, payload: VMWebViewPayload, events: VMWebViewEvents) {
         self.runtime = runtime
         self.payload = payload
+        self.events = events
+        super.init()
+        onMain { self.attach() }
     }
 
-    private func post(_ event: WebKitRuntime.PageEvent) {
+    private func onMain(_ work: @escaping @Sendable () -> Void) {
         guard let runtime else { return }
-        WebKitRuntime.postToEngine(runtime) {
-            WebKitRuntime.dispatch(runtime, payload: self.payload, event: event)
+        WebKitRuntime.runOnMain(runtime, work)
+    }
+
+    private func attach() {
+        guard let payload else { return }
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        let controller = WKUserContentController()
+        controller.add(self, name: VMWebViewEvents.bridgeHandler)
+        controller.add(self, name: Self.consoleHandler)
+        install([], on: controller)
+        configuration.userContentController = controller
+        if #available(iOS 14.0, macOS 11.0, *) {
+            configuration.defaultWebpagePreferences.allowsContentJavaScript = payload.settings.javaScriptEnabled
+        } else {
+            configuration.preferences.javaScriptEnabled = payload.settings.javaScriptEnabled
+        }
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.navigationDelegate = self
+        view.uiDelegate = self
+        view.customUserAgent = payload.settings.userAgentString
+        self.view = view
+    }
+
+    private func install(_ scripts: [String], on controller: WKUserContentController) {
+        controller.removeAllUserScripts()
+        for source in [Self.consoleShim] + scripts {
+            controller.addUserScript(WKUserScript(
+                source: source,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            ))
         }
     }
 
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        post(.started(webView.url?.absoluteString ?? payload.url))
+    // MARK: VMWebViewPlatform
+
+    func setUserScripts(_ scripts: [String]) {
+        onMain {
+            guard let view = self.view else { return }
+            self.install(scripts, on: view.configuration.userContentController)
+        }
+    }
+
+    func load(url: URL, headers: [(String, String)], userAgent: String?, cookies: [HTTPCookie]) {
+        nonisolated(unsafe) let cookies = cookies
+        onMain {
+            guard let view = self.view else { return }
+            view.customUserAgent = userAgent
+            let store = view.configuration.websiteDataStore.httpCookieStore
+            for cookie in cookies { store.setCookie(cookie) }
+            var request = URLRequest(url: url)
+            for (name, value) in headers {
+                request.addValue(value, forHTTPHeaderField: name)
+            }
+            view.load(request)
+        }
+    }
+
+    func loadHTML(_ html: String, baseURL: URL?, mimeType: String, encoding: String, userAgent: String?, cookies: [HTTPCookie]) {
+        nonisolated(unsafe) let cookies = cookies
+        onMain {
+            guard let view = self.view else { return }
+            view.customUserAgent = userAgent
+            if let baseURL {
+                let store = view.configuration.websiteDataStore.httpCookieStore
+                for cookie in cookies { store.setCookie(cookie) }
+                view.loadHTMLString(html, baseURL: baseURL)
+            } else if let encoded = html.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                      let dataURL = URL(string: "data:\(mimeType);charset=\(encoding),\(encoded)") {
+                view.load(URLRequest(url: dataURL))
+            }
+        }
+    }
+
+    func evaluate(_ script: String, completion: (@Sendable (String) -> Void)?) {
+        onMain {
+            guard let view = self.view else { return }
+            view.evaluateJavaScript(script) { result, error in
+                completion?(Self.json(result: result, error: error))
+            }
+        }
+    }
+
+    /// `evaluateJavascript` reports results as JSON text.
+    private static func json(result: Any?, error: Error?) -> String {
+        if let error {
+            let message = error.localizedDescription.replacingOccurrences(of: "\"", with: "'")
+            return "\"\(message)\""
+        }
+        if let result,
+           let data = try? JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed]),
+           let encoded = String(data: data, encoding: .utf8) {
+            return encoded
+        }
+        return "null"
+    }
+
+    func stopLoading() {
+        onMain { self.view?.stopLoading() }
+    }
+
+    func reload() {
+        onMain { _ = self.view?.reload() }
+    }
+
+    /// The view's frame is the page's viewport. It is not in a window, so
+    /// WebKit lays the page out at this size without drawing it.
+    func layout(width: Int, height: Int, density: Double) {
+        onMain {
+            MainActor.assumeIsolated {
+                guard let view = self.view else { return }
+                let scale = density > 0 ? density : 1
+                view.frame = CGRect(x: 0, y: 0, width: Double(width) / scale, height: Double(height) / scale)
+            }
+        }
+    }
+
+    /// A presentation renders its content on a live display. WebKit only
+    /// draws a page, runs its timers at full rate and loads lazy images while
+    /// the view is in a window, so the view joins the app's window beneath
+    /// everything, effectively transparent and ignoring touches.
+    func present() {
+        onMain {
+            MainActor.assumeIsolated {
+                #if canImport(UIKit)
+                guard let view = self.view, view.window == nil, let window = Self.hostWindow() else { return }
+                view.isUserInteractionEnabled = false
+                view.alpha = 0.01
+                window.insertSubview(view, at: 0)
+                #endif
+            }
+        }
+    }
+
+    func dismissPresentation() {
+        onMain {
+            MainActor.assumeIsolated {
+                self.view?.removeFromSuperview()
+            }
+        }
+    }
+
+    #if canImport(UIKit)
+    @MainActor
+    private static func hostWindow() -> UIWindow? {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+        return windows.first(where: \.isKeyWindow) ?? windows.first
+    }
+    #endif
+
+    func destroy() {
+        onMain {
+            guard let view = self.view else { return }
+            view.stopLoading()
+            view.navigationDelegate = nil
+            view.uiDelegate = nil
+            let controller = view.configuration.userContentController
+            controller.removeScriptMessageHandler(forName: VMWebViewEvents.bridgeHandler)
+            controller.removeScriptMessageHandler(forName: Self.consoleHandler)
+            controller.removeAllUserScripts()
+            view.removeFromSuperview()
+            self.view = nil
+        }
+    }
+
+    // MARK: WKNavigationDelegate
+
+    /// Android's WebView reports `onPageStarted` once the main-frame document
+    /// commits, so script the client evaluates from it lands in the new page.
+    /// `didStartProvisionalNavigation` is too early: the old document is still
+    /// the one script would run in.
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        events.pageStarted(webView.url?.absoluteString ?? payload?.url ?? "")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        payload.title = webView.title ?? payload.title
-        syncCookiesToStorage(webView)
-        post(.finished(webView.url?.absoluteString ?? payload.url))
+        let events = self.events
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+            events.storeCookies(cookies)
+        }
+        events.pageFinished(webView.url?.absoluteString ?? payload?.url ?? "", title: webView.title)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        post(.failed(code: Int32((error as NSError).code), description: error.localizedDescription, url: webView.url?.absoluteString ?? payload.url))
+        events.pageFailed(
+            code: Int32((error as NSError).code),
+            description: error.localizedDescription,
+            url: webView.url?.absoluteString ?? payload?.url ?? ""
+        )
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        post(.failed(code: Int32((error as NSError).code), description: error.localizedDescription, url: webView.url?.absoluteString ?? payload.url))
+        events.pageFailed(
+            code: Int32((error as NSError).code),
+            description: error.localizedDescription,
+            url: webView.url?.absoluteString ?? payload?.url ?? ""
+        )
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        post(.renderProcessGone(didCrash: true))
+        events.renderProcessGone(didCrash: true)
     }
 
     /// Page-initiated main-frame navigations reach `shouldOverrideUrlLoading`
@@ -2299,7 +2876,7 @@ final class VMWebViewDelegate: NSObject, WKNavigationDelegate, WKScriptMessageHa
     ) {
         if navigationAction.targetFrame?.isMainFrame == true,
            let url = navigationAction.request.url?.absoluteString {
-            reportNavigation(url)
+            events.navigationRequested(url)
         }
         decisionHandler(.allow)
     }
@@ -2313,53 +2890,24 @@ final class VMWebViewDelegate: NSObject, WKNavigationDelegate, WKScriptMessageHa
         preferences.allowsContentJavaScript = payload.settings.javaScriptEnabled
         if navigationAction.targetFrame?.isMainFrame == true,
            let url = navigationAction.request.url?.absoluteString {
-            reportNavigation(url)
+            events.navigationRequested(url)
         }
         decisionHandler(.allow, preferences)
     }
 
-    /// Skips the navigation the engine itself started through `loadUrl`.
-    private func reportNavigation(_ url: String) {
-        if payload.expectedNavigation == url {
-            payload.expectedNavigation = nil
-            return
-        }
-        post(.navigation(url: url))
-    }
+    // MARK: WKScriptMessageHandler
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let runtime else { return }
-        if message.name == VMWebViewDelegate.bridgeHandler {
-            guard let body = message.body as? [String: Any],
-                  let name = body["name"] as? String,
-                  let method = body["method"] as? String else { return }
-            let arguments = body["args"] as? [Any] ?? []
-            WebKitRuntime.postToEngine(runtime) {
-                WebKitRuntime.dispatchBridgeCall(
-                    runtime: runtime,
-                    payload: self.payload,
-                    interfaceName: name,
-                    method: method,
-                    arguments: arguments
-                )
-            }
-        } else if message.name == VMWebViewDelegate.consoleHandler {
+        if message.name == VMWebViewEvents.bridgeHandler {
+            events.bridgeMessage(message.body)
+        } else if message.name == Self.consoleHandler {
             let body = message.body as? [String: Any] ?? [:]
-            let level = body["level"] as? String ?? "log"
-            let text = body["message"] as? String ?? ""
-            let source = body["source"] as? String ?? ""
-            let line = Int32((body["line"] as? NSNumber)?.intValue ?? 0)
-            WebKitRuntime.postToEngine(runtime) {
-                WebKitRuntime.dispatch(runtime, payload: self.payload, event: .console(level: level, message: text, sourceId: source, line: line))
-            }
-        }
-    }
-
-    private func syncCookiesToStorage(_ webView: WKWebView) {
-        guard let runtime else { return }
-        let storage = runtime.host?.cookieStorage() ?? HTTPCookieStorage.shared
-        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-            for cookie in cookies { storage.setCookie(cookie) }
+            events.console(
+                level: body["level"] as? String ?? "log",
+                message: body["message"] as? String ?? "",
+                source: body["source"] as? String ?? "",
+                line: Int32((body["line"] as? NSNumber)?.intValue ?? 0)
+            )
         }
     }
 }

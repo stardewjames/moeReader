@@ -80,7 +80,7 @@ enum PinnedHTTPHeaders {
     }
 }
 
-enum PinnedHTTPError: Error, Equatable, Sendable, CustomStringConvertible {
+enum PinnedHTTPError: Error, Equatable, Sendable, CustomStringConvertible, LocalizedError {
     case invalidRequest(String)
     case resolutionFailed(host: String, reason: String)
     case unresolvedHost(host: String, attempts: String)
@@ -134,6 +134,10 @@ enum PinnedHTTPError: Error, Equatable, Sendable, CustomStringConvertible {
             return "redirect loop at \(url)"
         }
     }
+
+    /// `localizedDescription` (what bridging to a Java exception message uses)
+    /// reports the same text instead of Foundation's generic "error N".
+    var errorDescription: String? { description }
 }
 
 // MARK: - Request writer

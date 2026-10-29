@@ -990,6 +990,12 @@ enum OkHttpRuntime {
         }
 
         let builder = NativeClass("Lokhttp3/HttpUrl$Builder;", superclass: "Ljava/lang/Object;")
+        builder.method("<init>", "()V") { runtime, args, _ in
+            var components = URLComponents()
+            components.path = "/"
+            runtime.setPayload(args[0], VMHttpUrlPayload(components: components))
+            return .zero
+        }
         builder.method("addPathSegment", "(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;") { runtime, args, _ in
             let payload: VMHttpUrlPayload = try runtime.payloadBox(args[0])
             var path = payload.components.path
@@ -1724,18 +1730,11 @@ enum OkHttpRuntime {
     }
 
     private static func bodyClasses() -> [NativeClass] {
-        /// `ResponseBody.Companion.create(source, contentType, contentLength)`:
-        /// `flags` follows Kotlin default-argument masks (bit 1 = source,
-        /// bit 2 = contentType, bit 4 = contentLength), and a defaulted or
-        /// negative contentLength reads the source to its end.
-        func makeBody(_ runtime: VMRuntime, source: VMValue, mediaType: VMValue, length: Int64, flags: Int32) throws -> VMValue {
+        /// `ResponseBody.Companion.create(source, contentType, contentLength)`.
+        /// A negative contentLength reads the source to its end.
+        func makeBody(_ runtime: VMRuntime, source: VMValue, mediaType: VMValue, length: Int64) throws -> VMValue {
             let contentType = runtime.payload(mediaType, as: VMMediaTypePayload.self)?.text
-            let limit: Int
-            if flags & 4 != 0 || length < 0 {
-                limit = Int.max
-            } else {
-                limit = Int(length)
-            }
+            let limit = length < 0 ? Int.max : Int(length)
             if let buffered = runtime.payload(source, as: VMBufferedSourcePayload.self) {
                 return runtime.makeNative(
                     "Lokhttp3/ResponseBody;",
@@ -1810,10 +1809,10 @@ enum OkHttpRuntime {
             return runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: data, contentType: runtime.payload(args[2], as: VMMediaTypePayload.self)?.text))
         }
         bodyCompanion.method("create", "(Lokio/BufferedSource;Lokhttp3/MediaType;J)Lokhttp3/ResponseBody;") { runtime, args, _ in
-            try makeBody(runtime, source: args[1], mediaType: args[2], length: args[3].asInt64, flags: 0)
+            try makeBody(runtime, source: args[1], mediaType: args[2], length: args[3].asInt64)
         }
         bodyCompanion.method("create", "(Lokio/BufferedSource;Lokhttp3/MediaType;)Lokhttp3/ResponseBody;") { runtime, args, _ in
-            try makeBody(runtime, source: args[1], mediaType: args[2], length: -1, flags: 0)
+            try makeBody(runtime, source: args[1], mediaType: args[2], length: -1)
         }
         bodyCompanion.staticMethod("create$default", "(Lokhttp3/ResponseBody$Companion;[BLokhttp3/MediaType;ILjava/lang/Object;)Lokhttp3/ResponseBody;") { runtime, args, _ in
             var data = Data()
@@ -1826,9 +1825,13 @@ enum OkHttpRuntime {
             )
         }
         // Kotlin emits default-argument synthetics for companion methods as
-        // statics that take the companion as their first parameter.
+        // statics that take the companion as their first parameter. Mask bit 2
+        // defaults `contentLength`, which the caller passes as 0; the body then
+        // reads its source to the end rather than stopping at zero bytes.
         bodyCompanion.staticMethod("create$default", "(Lokhttp3/ResponseBody$Companion;Lokio/BufferedSource;Lokhttp3/MediaType;JILjava/lang/Object;)Lokhttp3/ResponseBody;") { runtime, args, _ in
-            try makeBody(runtime, source: args[1], mediaType: args[2], length: args[3].asInt64, flags: args[4].asInt32)
+            let defaults = args[4].asInt32
+            let length = defaults & 2 != 0 ? Int64(-1) : args[3].asInt64
+            return try makeBody(runtime, source: args[1], mediaType: args[2], length: length)
         }
         bodyCompanion.method("create", "(Lokhttp3/MediaType;Ljava/io/File;)Lokhttp3/ResponseBody;") { runtime, args, _ in
             runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: Data(), contentType: runtime.payload(args[1], as: VMMediaTypePayload.self)?.text))
@@ -2765,8 +2768,18 @@ extension VMRuntime {
             throw VMJavaException("Ljava/io/IOException;", error.localizedDescription)
         }
         let contentType = response.headers.first { $0.0.caseInsensitiveCompare("Content-Type") == .orderedSame }?.1
+        // OkHttp's `Response.request` is the request that produced this
+        // response: after the host followed redirects that is the last hop, and
+        // sources read its URL to learn where they landed (a login wall, an
+        // interstitial, a query parameter the server added).
+        var finalRequest = request
+        if !response.url.isEmpty, response.url != payload.url {
+            let followed = payload.copy()
+            followed.url = response.url
+            finalRequest = makeNative("Lokhttp3/Request;", payload: followed)
+        }
         let responsePayload = VMResponsePayload(
-            request: request,
+            request: finalRequest,
             code: response.code,
             message: response.message,
             headers: VMHeadersPayload(response.headers),

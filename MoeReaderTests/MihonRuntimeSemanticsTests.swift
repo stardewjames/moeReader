@@ -24,6 +24,105 @@ final class MihonRuntimeSemanticsTests: XCTestCase {
         return VMValue.reference(runtime.allocateObject(cls))
     }
 
+    /// A delayed runnable waits for the engine's event loop instead of running
+    /// inside `postDelayed`: a runnable that re-posts itself with a delay (a
+    /// poller) must yield between rounds, not recurse. `removeCallbacks`
+    /// cancels it before it is due; `post` still runs immediately.
+    func testHandlerDelayedWorkRunsFromTheEventLoopAndCanBeCancelled() throws {
+        let runtime = VMRuntime()
+        var runs = 0
+        let runnableClass = NativeClass(
+            "Lmihoncompat/test/CountingRunnable;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Ljava/lang/Runnable;"]
+        )
+        runnableClass.method("run", "()V") { _, _, _ in
+            runs += 1
+            return .zero
+        }
+        runtime.nativeClasses[runnableClass.descriptor] = runnableClass
+        let runnable = runtime.makeNative(runnableClass.descriptor, payload: NSNull())
+        let handler = try allocate(runtime, "Landroid/os/Handler;")
+        _ = try invoke(runtime, handler, "<init>()V")
+
+        XCTAssertTrue(try invoke(runtime, handler, "postDelayed(Ljava/lang/Runnable;J)Z", [runnable, .int64(40), .zero]).asBoolean)
+        XCTAssertEqual(runs, 0, "a delayed runnable does not run inside postDelayed")
+        runtime.hostEvents.drain(waitingUpTo: 2)
+        XCTAssertEqual(runs, 1)
+
+        _ = try invoke(runtime, handler, "postDelayed(Ljava/lang/Runnable;J)Z", [runnable, .int64(40), .zero])
+        _ = try invoke(runtime, handler, "removeCallbacks(Ljava/lang/Runnable;)V", [runnable])
+        runtime.hostEvents.drain(waitingUpTo: 0.2)
+        XCTAssertEqual(runs, 1, "a cancelled runnable never runs")
+
+        _ = try invoke(runtime, handler, "post(Ljava/lang/Runnable;)Z", [runnable])
+        XCTAssertEqual(runs, 2)
+    }
+
+    /// `withTimeout(timeout, block)` runs the block; the caller's continuation
+    /// (the last argument) must not be resumed in its place.
+    func testWithTimeoutRunsTheBlockNotTheContinuation() throws {
+        let runtime = VMRuntime()
+        let block = NativeClass(
+            "Lmihoncompat/test/TimeoutBlock;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/jvm/functions/Function2;"]
+        )
+        block.method("invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, _, _ in
+            runtime.newString("block")
+        }
+        let continuation = NativeClass(
+            "Lmihoncompat/test/CallerContinuation;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/coroutines/Continuation;"]
+        )
+        continuation.method("invokeSuspend", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, _, _ in
+            runtime.newString("continuation")
+        }
+        runtime.nativeClasses[block.descriptor] = block
+        runtime.nativeClasses[continuation.descriptor] = continuation
+
+        let cls = try runtime.linkClass("Lkotlinx/coroutines/TimeoutKt;")
+        let method = try XCTUnwrap(cls.lookupStatic(
+            "withTimeout-KLykuaI",
+            "(JLkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"
+        ))
+        let result = try runtime.invoke(method, [
+            .int64(1_000), .zero,
+            runtime.makeNative(block.descriptor, payload: NSNull()),
+            runtime.makeNative(continuation.descriptor, payload: NSNull()),
+        ])
+        XCTAssertEqual(runtime.stringValue(result), "block")
+    }
+
+    func testInlineLaunchReturnsACompletedInactiveJob() throws {
+        let runtime = VMRuntime()
+        var runs = 0
+        let block = NativeClass(
+            "Lmihoncompat/test/LaunchBlock;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlin/jvm/functions/Function2;"]
+        )
+        block.method("invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") { runtime, _, _ in
+            runs += 1
+            return runtime.unitValue
+        }
+        runtime.nativeClasses[block.descriptor] = block
+        let builders = try runtime.linkClass("Lkotlinx/coroutines/BuildersKt;")
+        let launch = try XCTUnwrap(builders.lookupStatic(
+            "launch$default",
+            "(Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lkotlinx/coroutines/CoroutineStart;Lkotlin/jvm/functions/Function2;ILjava/lang/Object;)Lkotlinx/coroutines/Job;"
+        ))
+        let job = try runtime.invoke(launch, [
+            .null, .null, .null, runtime.makeNative(block.descriptor, payload: NSNull()), .int32(3), .null,
+        ])
+        XCTAssertEqual(runs, 1)
+        XCTAssertFalse(try invoke(runtime, job, "isActive()Z").asBoolean)
+        XCTAssertTrue(try invoke(runtime, job, "isCompleted()Z").asBoolean)
+        _ = try invoke(runtime, job, "cancel(Ljava/util/concurrent/CancellationException;)V", [.null])
+        XCTAssertFalse(try invoke(runtime, job, "isCancelled()Z").asBoolean, "cancelling a completed job does not change its outcome")
+    }
+
     func testStringCodePointsAndSurrogateSafeReplacement() throws {
         let runtime = VMRuntime()
         let stringClass = try runtime.linkClass("Ljava/lang/String;")

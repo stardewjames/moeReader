@@ -2368,7 +2368,7 @@ enum JsoupRuntime {
             return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(values))
         }
 
-        let attributes = NativeClass("Lorg/jsoup/nodes/Attributes;", superclass: "Ljava/lang/Object;")
+        let attributes = NativeClass("Lorg/jsoup/nodes/Attributes;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Iterable;"])
         attributes.method("get", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
             return runtime.newString(payload.node.attribute(runtime.stringValue(args[1]) ?? "") ?? "")
@@ -2399,6 +2399,13 @@ enum JsoupRuntime {
                 runtime.makeNative("Lorg/jsoup/nodes/Attribute;", payload: JAttributePayload(node: payload.node, name: name))
             }
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(values))
+        }
+        attributes.method("iterator", "()Ljava/util/Iterator;") { runtime, args, _ in
+            guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }
+            let values = payload.node.attributes.map { (name, _) in
+                runtime.makeNative("Lorg/jsoup/nodes/Attribute;", payload: JAttributePayload(node: payload.node, name: name))
+            }
+            return runtime.makeNative("Ljava/util/ListItr;", payload: VMListIteratorPayload(values))
         }
         attributes.method("keys", "()Ljava/util/Set;") { runtime, args, _ in
             guard let payload: JElementPayload = runtime.payload(args[0], as: JElementPayload.self) else { return .null }

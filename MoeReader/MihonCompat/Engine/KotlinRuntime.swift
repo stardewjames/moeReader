@@ -188,6 +188,16 @@ final class VMIntRangePayload {
         self.last = last
         self.step = step
     }
+
+    /// `IntProgression.fromClosedRange`: `last` is the final element the
+    /// progression reaches, so `0 until 16 step 2` ends at 14, not 15.
+    static func progression(first: Int32, endInclusive: Int32, step: Int32) -> VMIntRangePayload {
+        VMIntRangePayload(
+            first: Int(first),
+            last: Int(progressionLastElement(start: first, end: endInclusive, step: step)),
+            step: Int(step)
+        )
+    }
 }
 
 final class VMLongRangePayload {
@@ -254,10 +264,13 @@ final class VMCompletableDeferredPayload {
     }
 
     /// Waits for completion, running host events posted from platform threads
-    /// on the engine thread while parked. A deferred that never completes is a
-    /// programming error in the extension, so bail out instead of hanging.
+    /// (and delayed `Handler` work) on the engine thread while parked. Inside a
+    /// source operation the operation's own deadline bounds the wait, so a
+    /// WebView-driven source can take as long as the operation allows; outside
+    /// one, a deferred that never completes is a programming error in the
+    /// extension, so bail out after `timeout` instead of hanging.
     func awaitResult(_ runtime: VMRuntime, timeout: TimeInterval = 30) throws -> VMValue {
-        let deadline = Date(timeIntervalSinceNow: timeout)
+        let deadline = runtime.operationDeadline == nil ? Date(timeIntervalSinceNow: timeout) : nil
         while true {
             lock.lock()
             let done = completed
@@ -273,9 +286,10 @@ final class VMCompletableDeferredPayload {
                 }
                 return result
             }
-            if Date() >= deadline {
+            if let deadline, Date() >= deadline {
                 throw VMJavaException("Ljava/lang/IllegalStateException;", "await timed out after \(Int(timeout))s")
             }
+            try runtime.checkOperationDeadline()
             _ = runtime.hostEvents.drain(waitingUpTo: 0.05)
         }
     }
@@ -741,6 +755,16 @@ enum KotlinRuntime {
         result.append(NSNullClassFactory.coroutineScope())
         result.append(NSNullClassFactory.job())
         result.append(NSNullClassFactory.deferred())
+        // `launch` runs inline, so its returned job has already completed.
+        let completedJob = NativeClass(
+            "Lkotlinx/coroutines/JobImpl;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Lkotlinx/coroutines/Job;"]
+        )
+        completedJob.method("isActive", "()Z") { _, _, _ in .boolean(false) }
+        completedJob.method("isCompleted", "()Z") { _, _, _ in .boolean(true) }
+        completedJob.method("isCancelled", "()Z") { _, _, _ in .boolean(false) }
+        result.append(completedJob)
 
         let buildScope = NativeClass("Lkotlinx/coroutines/BuildersKt;")
         buildScope.staticMethod("coroutineScope", "(Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
@@ -903,14 +927,16 @@ enum KotlinRuntime {
         }
         result.append(delayKt)
 
+        // Native arguments hold a `long` in one slot: (timeout, block,
+        // continuation). The block runs to completion inside the call.
         let timeoutKt = NativeClass("Lkotlinx/coroutines/TimeoutKt;")
         timeoutKt.staticMethod("withTimeout-KLykuaI", "(JLkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
-            return try runtime.callSuspend(args[2], scope)
+            return try runtime.callSuspend(args[1], scope)
         }
         timeoutKt.staticMethod("withTimeout", "(JLkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
-            return try runtime.callSuspend(args[2], scope)
+            return try runtime.callSuspend(args[1], scope)
         }
         result.append(timeoutKt)
 
@@ -2297,27 +2323,28 @@ enum KotlinRuntime {
             guard requested > 0 else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Step must be positive, was: \(requested).")
             }
+            // Kotlin replaces the step (keeping its direction) rather than
+            // scaling it, and recomputes the last reachable element.
             let range = runtime.payload(args[0], as: VMIntRangePayload.self)
-            let baseStep = Int32(truncatingIfNeeded: range?.step ?? 1)
-            let step = baseStep.multipliedReportingOverflow(by: requested).partialValue
+            let descending = (range?.step ?? 1) < 0
             return runtime.makeNative(
                 "Lkotlin/ranges/IntProgression;",
-                payload: VMIntRangePayload(
-                    first: range?.first ?? 0,
-                    last: range?.last ?? 0,
-                    step: Int(step == 0 ? 1 : step)
+                payload: VMIntRangePayload.progression(
+                    first: Int32(truncatingIfNeeded: range?.first ?? 0),
+                    endInclusive: Int32(truncatingIfNeeded: range?.last ?? -1),
+                    step: descending ? -requested : requested
                 )
             )
         }
         ranges.staticMethod("reversed", "(Lkotlin/ranges/IntProgression;)Lkotlin/ranges/IntProgression;") { runtime, args, _ in
             let range = runtime.payload(args[0], as: VMIntRangePayload.self)
-            let step = range?.step ?? 1
+            let step = Int32(truncatingIfNeeded: range?.step ?? 1)
             return runtime.makeNative(
                 "Lkotlin/ranges/IntProgression;",
-                payload: VMIntRangePayload(
-                    first: range?.last ?? 0,
-                    last: range?.first ?? 0,
-                    step: -(step > 0 ? step : -step)
+                payload: VMIntRangePayload.progression(
+                    first: Int32(truncatingIfNeeded: range?.last ?? 0),
+                    endInclusive: Int32(truncatingIfNeeded: range?.first ?? 0),
+                    step: -step
                 )
             )
         }

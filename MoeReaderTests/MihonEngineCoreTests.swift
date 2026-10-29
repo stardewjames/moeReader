@@ -109,6 +109,29 @@ final class MihonEngineCoreTests: XCTestCase {
         XCTAssertEqual(runtime.stringValue(formatted), "7-x")
     }
 
+    /// Java formats a boxed `Byte` with `%x` as two unsigned hex digits; a
+    /// sign-extended value would corrupt MD5-derived request tokens. Precision,
+    /// zero-padding and the radix prefix must still apply.
+    func testStringFormatHexUsesUnsignedBoxedWidths() throws {
+        let runtime = VMRuntime()
+        let stringClass = try runtime.linkClass("Ljava/lang/String;")
+        let format = try XCTUnwrap(stringClass.lookupStatic("format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"))
+        func render(_ template: String, _ boxed: VMValue) throws -> String? {
+            let values = runtime.newArray(component: "Ljava/lang/Object;", count: 1)
+            runtime.setArrayElement(values, index: 0, value: boxed)
+            return runtime.stringValue(try runtime.invoke(format, [runtime.newString(template), values]))
+        }
+        XCTAssertEqual(try render("%02x", runtime.boxByte(-113)), "8f")
+        XCTAssertEqual(try render("%02x", runtime.boxByte(15)), "0f")
+        XCTAssertEqual(try render("%04x", runtime.boxShort(-1)), "ffff")
+        XCTAssertEqual(try render("%x", runtime.boxInt(-1)), "ffffffff")
+        XCTAssertEqual(try render("%X", runtime.boxLong(-1)), "FFFFFFFFFFFFFFFF")
+        XCTAssertEqual(try render("%#06x", runtime.boxByte(10)), "0x000a")
+        XCTAssertEqual(try render("%.4x", runtime.boxByte(5)), "0005")
+        XCTAssertEqual(try render("%-4x|", runtime.boxByte(5)), "5   |")
+        XCTAssertEqual(try render("%d", runtime.boxByte(-113)), "-113")
+    }
+
     func testEngineRecyclesItsArena() throws {
         let runtime = VMRuntime(dexFiles: [try probeDex()])
         let cls = try runtime.linkClass("Ltest/Probe;")

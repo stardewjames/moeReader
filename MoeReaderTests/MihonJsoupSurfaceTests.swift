@@ -19,6 +19,12 @@ final class MihonJsoupSurfaceTests: XCTestCase {
         return try runtime.invoke(method, [receiver ?? .null] + args)
     }
 
+    private func invoke(_ runtime: VMRuntime, _ receiver: VMValue, _ key: String) throws -> VMValue {
+        let cls = try XCTUnwrap(runtime.classOf(receiver))
+        let method = try XCTUnwrap(cls.lookupVirtual(key: key), "missing \(key)")
+        return try runtime.invoke(method, [receiver])
+    }
+
     private func parseDocument(_ runtime: VMRuntime, _ html: String, baseUri: String = "https://example.test/page") throws -> VMValue {
         let parse = try static_(runtime, "Lorg/jsoup/Jsoup;", "parse", "(Ljava/lang/String;Ljava/lang/String;)Lorg/jsoup/nodes/Document;")
         return try runtime.invoke(parse, [runtime.newString(html), runtime.newString(baseUri)])
@@ -156,6 +162,53 @@ final class MihonJsoupSurfaceTests: XCTestCase {
         let attribute = try XCTUnwrap(runtime.listPayload(list)?.items.first)
         XCTAssertEqual(try string(runtime, "Lorg/jsoup/nodes/Attribute;", "getKey", "()Ljava/lang/String;", receiver: attribute), "class")
         XCTAssertEqual(try string(runtime, "Lorg/jsoup/nodes/Attribute;", "getValue", "()Ljava/lang/String;", receiver: attribute), "lead")
+    }
+
+    func testParsedAttributesIteratorFindsDataAttribute() throws {
+        let runtime = VMRuntime()
+        let document = try parseDocument(runtime, """
+        <section id="panel" data-other="skip" data-snapshot='{"revision":7}' class="ready"></section>
+        """)
+        let section = try first(runtime, of: try elements(runtime, in: document, selector: "section"))
+        let attributes = try native(runtime, "Lorg/jsoup/nodes/Element;", "attributes", "()Lorg/jsoup/nodes/Attributes;", [], receiver: section)
+        XCTAssertTrue(runtime.isInstance(attributes, of: try runtime.linkClass("Ljava/lang/Iterable;")))
+
+        let iterator = try native(runtime, "Lorg/jsoup/nodes/Attributes;", "iterator", "()Ljava/util/Iterator;", [], receiver: attributes)
+        XCTAssertTrue(runtime.isInstance(iterator, of: try runtime.linkClass("Ljava/util/Iterator;")))
+        var keys: [String] = []
+        var values: [String] = []
+        var snapshot: String?
+        while try invoke(runtime, iterator, "hasNext()Z").asBoolean {
+            let attribute = try invoke(runtime, iterator, "next()Ljava/lang/Object;")
+            XCTAssertTrue(runtime.isInstance(attribute, of: try runtime.linkClass("Lorg/jsoup/nodes/Attribute;")))
+            let key = try XCTUnwrap(string(runtime, "Lorg/jsoup/nodes/Attribute;", "getKey", "()Ljava/lang/String;", receiver: attribute))
+            let value = try XCTUnwrap(string(runtime, "Lorg/jsoup/nodes/Attribute;", "getValue", "()Ljava/lang/String;", receiver: attribute))
+            keys.append(key)
+            values.append(value)
+            if key == "data-snapshot" { snapshot = value }
+        }
+        XCTAssertEqual(keys, ["id", "data-other", "data-snapshot", "class"])
+        XCTAssertEqual(values, ["panel", "skip", #"{"revision":7}"#, "ready"])
+        XCTAssertEqual(snapshot, #"{"revision":7}"#)
+        XCTAssertFalse(try invoke(runtime, iterator, "hasNext()Z").asBoolean)
+        XCTAssertThrowsError(try invoke(runtime, iterator, "next()Ljava/lang/Object;")) { error in
+            XCTAssertEqual((error as? VMJavaException)?.classDescriptor, "Ljava/util/NoSuchElementException;")
+        }
+        XCTAssertFalse(try invoke(runtime, iterator, "hasNext()Z").asBoolean)
+    }
+
+    func testParsedEmptyAttributesIteratorIsExhausted() throws {
+        let runtime = VMRuntime()
+        let document = try parseDocument(runtime, "<section></section>")
+        let section = try first(runtime, of: try elements(runtime, in: document, selector: "section"))
+        let attributes = try native(runtime, "Lorg/jsoup/nodes/Element;", "attributes", "()Lorg/jsoup/nodes/Attributes;", [], receiver: section)
+        let iterator = try native(runtime, "Lorg/jsoup/nodes/Attributes;", "iterator", "()Ljava/util/Iterator;", [], receiver: attributes)
+
+        XCTAssertFalse(try invoke(runtime, iterator, "hasNext()Z").asBoolean)
+        XCTAssertThrowsError(try invoke(runtime, iterator, "next()Ljava/lang/Object;")) { error in
+            XCTAssertEqual((error as? VMJavaException)?.classDescriptor, "Ljava/util/NoSuchElementException;")
+        }
+        XCTAssertFalse(try invoke(runtime, iterator, "hasNext()Z").asBoolean)
     }
 
     func testElementsCollectionMembers() throws {

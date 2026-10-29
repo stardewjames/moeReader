@@ -241,6 +241,130 @@ final class OkioOkHttpSurfaceTests: XCTestCase {
         XCTAssertEqual(try byteValues(runtime, invoke(runtime, buffer, "readByteArray()[B")), [0xAA, 0xBB])
     }
 
+    /// Kotlin's `create$default` synthetic passes the defaulted
+    /// `contentLength` as zero; mask bit 2 means "read to end", not "zero
+    /// bytes". Sources that rewrite an image response body this way keep every
+    /// byte, while an explicit length is still honoured.
+    func testResponseBodyCreateSyntheticHonoursDefaultedLength() throws {
+        let runtime = VMRuntime()
+        let mediaType = try staticCall(
+            runtime,
+            "Lokhttp3/MediaType;",
+            "get",
+            "(Ljava/lang/String;)Lokhttp3/MediaType;",
+            [runtime.newString("image/jpeg")]
+        )
+        let createDefault = try XCTUnwrap(runtime.linkClass("Lokhttp3/ResponseBody$Companion;").lookupStatic(
+            "create$default",
+            "(Lokhttp3/ResponseBody$Companion;Lokio/BufferedSource;Lokhttp3/MediaType;JILjava/lang/Object;)Lokhttp3/ResponseBody;"
+        ))
+        let payload = Array("image-bytes".utf8)
+
+        let source = runtime.makeNative(
+            "Lokio/BufferedSource;",
+            payload: VMBufferedSourcePayload(data: Data(payload))
+        )
+        let full = try call(runtime, createDefault, nil, [
+            .null, source, mediaType, .int64(0), .int32(2), .null,
+        ])
+        XCTAssertEqual(try invoke(runtime, full, "contentLength()J").asInt64, Int64(payload.count))
+        XCTAssertEqual(byteValues(runtime, try invoke(runtime, full, "bytes()[B")), payload)
+        XCTAssertTrue(try invoke(runtime, source, "exhausted()Z").asBoolean, "the body owns the source's bytes")
+
+        let limitedSource = runtime.makeNative(
+            "Lokio/BufferedSource;",
+            payload: VMBufferedSourcePayload(data: Data(payload))
+        )
+        let limited = try call(runtime, createDefault, nil, [
+            .null, limitedSource, mediaType, .int64(3), .int32(0), .null,
+        ])
+        XCTAssertEqual(byteValues(runtime, try invoke(runtime, limited, "bytes()[B")), Array(payload.prefix(3)))
+    }
+
+    func testCipherSourceDecryptsKnownCTRVectorThroughBufferedReads() throws {
+        // NIST SP 800-38A F.5.1: AES-128 CTR, including counter carry.
+        let runtime = VMRuntime()
+        let keyBytes: [UInt8] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+            0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+        ]
+        let ivBytes: [UInt8] = [
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+            0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+        ]
+        let ciphertext: [UInt8] = [
+            0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26, 0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d, 0xb6, 0xce,
+            0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff, 0x86, 0x17, 0x18, 0x7b, 0xb9, 0xff, 0xfd, 0xff,
+            0x5a, 0xe4, 0xdf, 0x3e, 0xdb, 0xd5, 0xd3, 0x5e, 0x5b, 0x4f, 0x09, 0x02, 0x0d, 0xb0, 0x3e, 0xab,
+            0x1e, 0x03, 0x1d, 0xda, 0x2f, 0xbe, 0x03, 0xd1, 0x79, 0x21, 0x70, 0xa0, 0xf3, 0x00, 0x9c, 0xee,
+        ]
+        let plaintext: [UInt8] = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+            0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+            0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef,
+            0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17, 0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10,
+        ]
+        let cipher = try staticCall(
+            runtime, "Ljavax/crypto/Cipher;", "getInstance",
+            "(Ljava/lang/String;)Ljavax/crypto/Cipher;", [runtime.newString("AES/CTR/NoPadding")]
+        )
+        let key = try allocate(runtime, "Ljavax/crypto/spec/SecretKeySpec;")
+        _ = try invoke(
+            runtime, key, "<init>([BLjava/lang/String;)V",
+            [array(runtime, keyBytes), runtime.newString("AES")]
+        )
+        let iv = try allocate(runtime, "Ljavax/crypto/spec/IvParameterSpec;")
+        _ = try invoke(runtime, iv, "<init>([B)V", [array(runtime, ivBytes)])
+        try runtime.ensureInitialized(try runtime.linkClass("Ljavax/crypto/Cipher;"))
+        let decryptMode = try staticValue(runtime, "Ljavax/crypto/Cipher;", "DECRYPT_MODE")
+        _ = try invoke(
+            runtime, cipher, "init(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+            [decryptMode, key, iv]
+        )
+        let source = try newBuffer(runtime)
+        _ = try invoke(runtime, source, "write([B)Lokio/Buffer;", [array(runtime, ciphertext)])
+        let decrypted = try staticCall(
+            runtime, "Lokio/Okio;", "cipherSource",
+            "(Lokio/Source;Ljavax/crypto/Cipher;)Lokio/CipherSource;", [source, cipher]
+        )
+        let sink = try newBuffer(runtime)
+        XCTAssertEqual(try invoke(runtime, decrypted, "read(Lokio/Buffer;J)J", [sink, .int64(7)]).asInt64, 7)
+        XCTAssertEqual(try byteValues(runtime, invoke(runtime, sink, "readByteArray()[B")), Array(plaintext.prefix(7)))
+
+        let buffered = try staticCall(
+            runtime, "Lokio/Okio;", "buffer", "(Lokio/Source;)Lokio/BufferedSource;", [decrypted]
+        )
+        XCTAssertEqual(
+            try byteValues(runtime, invoke(runtime, buffered, "readByteArray(J)[B", [.int64(19)])),
+            Array(plaintext[7..<26])
+        )
+        XCTAssertEqual(
+            try byteValues(runtime, invoke(runtime, buffered, "readByteArray()[B")),
+            Array(plaintext.dropFirst(26))
+        )
+        XCTAssertTrue(try invoke(runtime, buffered, "exhausted()Z").asBoolean)
+        XCTAssertEqual(try invoke(runtime, decrypted, "read(Lokio/Buffer;J)J", [sink, .int64(1)]).asInt64, -1)
+        XCTAssertEqual(try invoke(runtime, sink, "size()J").asInt64, 0)
+    }
+
+    func testCipherSourceRejectsNullSourceOrCipher() throws {
+        let runtime = VMRuntime()
+        let source = try newBuffer(runtime)
+        let cipher = try staticCall(
+            runtime, "Ljavax/crypto/Cipher;", "getInstance",
+            "(Ljava/lang/String;)Ljavax/crypto/Cipher;", [runtime.newString("AES/CTR/NoPadding")]
+        )
+        let nullArguments: [[VMValue]] = [[.null, cipher], [source, .null], [.null, .null]]
+        for arguments in nullArguments {
+            XCTAssertThrowsError(try staticCall(
+                runtime, "Lokio/Okio;", "cipherSource",
+                "(Lokio/Source;Ljavax/crypto/Cipher;)Lokio/CipherSource;", arguments
+            )) { error in
+                XCTAssertEqual((error as? VMJavaException)?.classDescriptor, "Ljava/lang/NullPointerException;")
+            }
+        }
+    }
+
     // MARK: - ResponseBody / MediaType
 
     func testResponseBodyCompanionCreateRespectsContentLength() throws {
@@ -273,7 +397,7 @@ final class OkioOkHttpSurfaceTests: XCTestCase {
             "create$default",
             "(Lokhttp3/ResponseBody$Companion;Lokio/BufferedSource;Lokhttp3/MediaType;JILjava/lang/Object;)Lokhttp3/ResponseBody;"
         ))
-        let body = try call(runtime, create, nil, [.null, source, .null, .int64(0), .int32(4), .null])
+        let body = try call(runtime, create, nil, [.null, source, .null, .int64(0), .int32(2), .null])
         XCTAssertEqual(try invoke(runtime, body, "contentLength()J").asInt64, 6)
         XCTAssertEqual(runtime.stringValue(try invoke(runtime, body, "string()Ljava/lang/String;")), "abcdef")
         XCTAssertEqual(byteValues(runtime, try invoke(runtime, body, "bytes()[B")), Array("abcdef".utf8))
@@ -289,6 +413,21 @@ final class OkioOkHttpSurfaceTests: XCTestCase {
         XCTAssertEqual(try invoke(runtime, stream, "read()I").asInt32, Int32(0x68))
         let reader = try invoke(runtime, body, "charStream()Ljava/io/Reader;")
         XCTAssertEqual(try invoke(runtime, reader, "read()I").asInt32, Int32(0x68))
+    }
+
+    func testFreshHttpUrlBuilderCreatesIndependentURLs() throws {
+        let runtime = VMRuntime()
+        let builder = try allocate(runtime, "Lokhttp3/HttpUrl$Builder;")
+        _ = try invoke(runtime, builder, "<init>()V")
+        _ = try invoke(runtime, builder, "scheme(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;", [runtime.newString("https")])
+        _ = try invoke(runtime, builder, "host(Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;", [runtime.newString("reader.example.test")])
+        let root = try invoke(runtime, builder, "build()Lokhttp3/HttpUrl;")
+        _ = try invoke(runtime, builder, "addQueryParameter(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/HttpUrl$Builder;", [
+            runtime.newString("q"), runtime.newString("one two"),
+        ])
+        let queried = try invoke(runtime, builder, "build()Lokhttp3/HttpUrl;")
+        XCTAssertEqual(runtime.stringValue(try invoke(runtime, root, "toString()Ljava/lang/String;")), "https://reader.example.test/")
+        XCTAssertEqual(runtime.stringValue(try invoke(runtime, queried, "toString()Ljava/lang/String;")), "https://reader.example.test/?q=one%20two")
     }
 
     // MARK: - Headers, CacheControl, RequestBody

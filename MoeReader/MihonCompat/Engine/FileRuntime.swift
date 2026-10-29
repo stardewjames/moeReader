@@ -1456,10 +1456,10 @@ enum FileRuntime {
         result.append(utf8)
 
         okio.staticMethod("cipherSource", "(Lokio/Source;Ljavax/crypto/Cipher;)Lokio/CipherSource;") { runtime, args, _ in
-            guard args[1].bits != 0, args[2].bits != 0 else {
+            guard args[0].bits != 0, args[1].bits != 0 else {
                 throw VMJavaException("Ljava/lang/NullPointerException;", "source == null || cipher == null")
             }
-            return runtime.makeNative("Lokio/CipherSource;", payload: VMCipherSourcePayload(source: args[1], cipher: args[2]))
+            return runtime.makeNative("Lokio/CipherSource;", payload: VMCipherSourcePayload(source: args[0], cipher: args[1]))
         }
         result.append(okio)
 

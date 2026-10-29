@@ -29,10 +29,12 @@ final class MihonCookieTransportTests: XCTestCase {
     private final class Host: VMHost {
         let preferencesStore = Preferences()
         var requests: [VMHTTPRequest] = []
+        /// When set, the transport reports that redirects ended at this URL.
+        var landedURL: String?
 
         func performRequest(_ request: VMHTTPRequest) throws -> VMHTTPResponse {
             requests.append(request)
-            return VMHTTPResponse(url: request.url, code: 200, headers: [], body: Data())
+            return VMHTTPResponse(url: landedURL ?? request.url, code: 200, headers: [], body: Data())
         }
         func preferences() -> VMPreferences { preferencesStore }
         func log(_ message: String) {}
@@ -158,6 +160,29 @@ final class MihonCookieTransportTests: XCTestCase {
                 return XCTFail("unexpected error \(error)")
             }
         }
+    }
+
+    /// Like OkHttp, `Response.request()` is the request of the last hop: a
+    /// source that checks where a redirect landed (an interstitial, a login
+    /// wall, a query parameter the server added) must see the final URL.
+    func testResponseRequestIsTheFinalHopAfterRedirects() throws {
+        let host = Host()
+        let landed = "https://\(Self.hostName)/interstitial.html?id=7"
+        host.landedURL = landed
+        let runtime = VMRuntime(host: host)
+        let original = "https://\(Self.hostName)/product/7"
+        let request = runtime.makeRequest(url: original, headers: .null, method: "GET", body: .null)
+
+        let response = try runtime.performHttp(request: request)
+        let finalRequest = try invoke(runtime, response, "request()Lokhttp3/Request;")
+
+        XCTAssertEqual(runtime.payload(finalRequest, as: VMRequestPayload.self)?.url, landed)
+        XCTAssertEqual(runtime.payload(request, as: VMRequestPayload.self)?.url, original, "the caller's request is not mutated")
+
+        host.landedURL = nil
+        let direct = try runtime.performHttp(request: request)
+        let sameRequest = try invoke(runtime, direct, "request()Lokhttp3/Request;")
+        XCTAssertEqual(runtime.payload(sameRequest, as: VMRequestPayload.self)?.url, original)
     }
 
     // MARK: - Set-Cookie parsing

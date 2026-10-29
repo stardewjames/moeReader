@@ -304,10 +304,8 @@ extension VMRuntime {
                     let pad = String(repeating: flags.contains("0") ? "0" : " ", count: widthValue - rendered.count)
                     rendered = flags.contains("-") ? rendered + pad : pad + rendered
                 }
-            case "x":
-                rendered = String(UInt64(bitPattern: formatInteger(value)), radix: 16)
-            case "X":
-                rendered = String(UInt64(bitPattern: formatInteger(value)), radix: 16).uppercased()
+            case "x", "X":
+                rendered = formatHex(value, uppercase: specifier == "X", flags: flags, width: width, precision: precision)
             case "f":
                 let digits = Int(precision) ?? 6
                 rendered = String(format: "%.\(digits)f", formatDouble(value))
@@ -329,6 +327,53 @@ extension VMRuntime {
             output += rendered
         }
         return newString(output)
+    }
+
+    /// Java's `%x`/`%X` treat a boxed `Byte`/`Short`/`Integer` as unsigned at
+    /// that width (8/16/32 bits), unlike `%d`, which sign-extends. Precision is
+    /// a minimum digit count, `#` adds the radix prefix, and width pads after
+    /// the prefix when the zero flag is set.
+    private func formatHex(
+        _ value: VMValue,
+        uppercase: Bool,
+        flags: String,
+        width: String,
+        precision: String
+    ) -> String {
+        var bits: UInt64
+        if let pointer = value.object, let cls = classOf(value) {
+            switch cls.descriptor {
+            case "Ljava/lang/Byte;":
+                bits = UInt64(UInt8(bitPattern: Int8(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.asInt32)))
+            case "Ljava/lang/Short;":
+                bits = UInt64(UInt16(bitPattern: Int16(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.asInt32)))
+            case "Ljava/lang/Integer;":
+                bits = UInt64(UInt32(bitPattern: VMObjectLayout.slot(pointer, 0).pointee.asInt32))
+            case "Ljava/lang/Long;":
+                bits = UInt64(bitPattern: VMObjectLayout.slot(pointer, 0).pointee.asInt64)
+            default:
+                bits = UInt64(bitPattern: formatInteger(value))
+            }
+        } else {
+            bits = UInt64(bitPattern: formatInteger(value))
+        }
+        var digits = String(bits, radix: 16, uppercase: uppercase)
+        if let precisionValue = Int(precision), digits.count < precisionValue {
+            digits = String(repeating: "0", count: precisionValue - digits.count) + digits
+        }
+        let prefix = flags.contains("#") && bits != 0 ? (uppercase ? "0X" : "0x") : ""
+        var rendered = prefix + digits
+        if let widthValue = Int(width), rendered.count < widthValue {
+            let padCount = widthValue - rendered.count
+            if flags.contains("-") {
+                rendered += String(repeating: " ", count: padCount)
+            } else if flags.contains("0"), Int(precision) == nil {
+                rendered = prefix + String(repeating: "0", count: padCount) + digits
+            } else {
+                rendered = String(repeating: " ", count: padCount) + rendered
+            }
+        }
+        return rendered
     }
 
     private func formatInteger(_ value: VMValue) -> Int64 {

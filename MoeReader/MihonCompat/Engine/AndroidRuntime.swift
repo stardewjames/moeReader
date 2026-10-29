@@ -134,7 +134,8 @@ final class VMHandlerThreadPayload {
 
 final class VMHandlerPayload {
     let looper: VMValue
-    var pending: [(token: VMValue, runnable: VMValue)] = []
+    /// Work scheduled for later, with the id `VMHostEventQueue` assigned it.
+    var pending: [(token: VMValue, runnable: VMValue, timer: Int)] = []
     init(looper: VMValue) { self.looper = looper }
 }
 
@@ -179,6 +180,22 @@ enum AndroidRuntime {
         result += osClasses()
         result += resourceClasses()
         return result
+    }
+
+    /// `Context.DISPLAY_SERVICE` and its class.
+    private static let displayServiceName = "display"
+    private static let displayManagerDescriptor = "Landroid/hardware/display/DisplayManager;"
+
+    /// `Context.getSystemService`: the display service exists; every other
+    /// service is absent.
+    static func systemService(_ runtime: VMRuntime, named name: String?) -> VMValue {
+        guard name == displayServiceName else { return .null }
+        return runtime.makeNative(displayManagerDescriptor, payload: NSNull())
+    }
+
+    static func systemService(_ runtime: VMRuntime, ofClass value: VMValue) -> VMValue {
+        guard runtime.payload(value, as: VMClass.self)?.descriptor == displayManagerDescriptor else { return .null }
+        return systemService(runtime, named: displayServiceName)
     }
 
     /// `android.util.LruCache`: Android's per-entry-size (1) LRU policy.
@@ -427,21 +444,58 @@ enum AndroidRuntime {
             runtime.setPayload(args[0], VMHandlerPayload(looper: args[1]))
             return .zero
         }
-        /// Runs pending work immediately; see the enum comment.
+        /// Immediate work runs before `post` returns: the engine thread is the
+        /// main looper, and it is never busy with other work when code posts.
         func run(_ runtime: VMRuntime, _ runnable: VMValue) {
             guard runnable.bits != 0 else { return }
             _ = try? runtime.callVirtual(runnable, "run()V", [])
+        }
+        /// Delayed work goes on the engine's event queue and runs when the
+        /// engine next waits (an `await`, a WebView round trip) or ticks, so a
+        /// runnable that re-posts itself with a delay polls instead of
+        /// recursing. A delay of zero or less still runs immediately.
+        func schedule(_ runtime: VMRuntime, _ handler: VMValue, _ runnable: VMValue, delayMillis: Int64, token: VMValue = .null) {
+            guard runnable.bits != 0 else { return }
+            guard delayMillis > 0, let payload = runtime.payload(handler, as: VMHandlerPayload.self) else {
+                run(runtime, runnable)
+                return
+            }
+            var timer = 0
+            timer = runtime.hostEvents.post(after: TimeInterval(delayMillis) / 1000) { [weak runtime, weak payload] in
+                guard let runtime else { return }
+                payload?.pending.removeAll { $0.timer == timer }
+                run(runtime, runnable)
+            }
+            payload.pending.append((token, runnable, timer))
+        }
+        func cancel(_ runtime: VMRuntime, _ handler: VMValue, where matches: ((token: VMValue, runnable: VMValue, timer: Int)) -> Bool) {
+            guard let payload = runtime.payload(handler, as: VMHandlerPayload.self) else { return }
+            for entry in payload.pending where matches(entry) {
+                runtime.hostEvents.cancel(entry.timer)
+            }
+            payload.pending.removeAll(where: matches)
+        }
+        /// `SystemClock.uptimeMillis` time base for `postAtTime`.
+        func uptimeMillis() -> Int64 {
+            Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
+        }
+        func messageCallback(_ runtime: VMRuntime, _ message: VMValue) -> VMValue {
+            runtime.payload(message, as: VMMessagePayload.self)?.callback ?? .null
         }
         handler.method("post", "(Ljava/lang/Runnable;)Z") { runtime, args, _ in
             run(runtime, args[1])
             return .boolean(true)
         }
         handler.method("postDelayed", "(Ljava/lang/Runnable;J)Z") { runtime, args, _ in
-            run(runtime, args[1])
+            schedule(runtime, args[0], args[1], delayMillis: args[2].asInt64)
+            return .boolean(true)
+        }
+        handler.method("postDelayed", "(Ljava/lang/Runnable;Ljava/lang/Object;J)Z") { runtime, args, _ in
+            schedule(runtime, args[0], args[1], delayMillis: args[3].asInt64, token: args[2])
             return .boolean(true)
         }
         handler.method("postAtTime", "(Ljava/lang/Runnable;J)Z") { runtime, args, _ in
-            run(runtime, args[1])
+            schedule(runtime, args[0], args[1], delayMillis: args[2].asInt64 - uptimeMillis())
             return .boolean(true)
         }
         handler.method("postAtFrontOfQueue", "(Ljava/lang/Runnable;)Z") { runtime, args, _ in
@@ -449,37 +503,33 @@ enum AndroidRuntime {
             return .boolean(true)
         }
         handler.method("removeCallbacks", "(Ljava/lang/Runnable;)V") { runtime, args, _ in
-            runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll { runtime.javaEquals($0.runnable, args[1]) }
+            cancel(runtime, args[0]) { runtime.javaEquals($0.runnable, args[1]) }
             return .zero
         }
         handler.method("removeCallbacks", "(Ljava/lang/Runnable;Ljava/lang/Object;)V") { runtime, args, _ in
-            runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll { runtime.javaEquals($0.runnable, args[1]) }
+            cancel(runtime, args[0]) {
+                runtime.javaEquals($0.runnable, args[1]) && (args[2].bits == 0 || runtime.javaEquals($0.token, args[2]))
+            }
             return .zero
         }
         handler.method("removeCallbacksAndMessages", "(Ljava/lang/Object;)V") { runtime, args, _ in
             if args[1].bits == 0 {
-                runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll()
+                cancel(runtime, args[0]) { _ in true }
             } else {
-                runtime.payload(args[0], as: VMHandlerPayload.self)?.pending.removeAll { runtime.javaEquals($0.token, args[1]) }
+                cancel(runtime, args[0]) { runtime.javaEquals($0.token, args[1]) }
             }
             return .zero
         }
         handler.method("sendMessage", "(Landroid/os/Message;)Z") { runtime, args, _ in
-            if let payload = runtime.payload(args[1], as: VMMessagePayload.self), payload.callback.bits != 0 {
-                run(runtime, payload.callback)
-            }
+            run(runtime, messageCallback(runtime, args[1]))
             return .boolean(true)
         }
         handler.method("sendMessageDelayed", "(Landroid/os/Message;J)Z") { runtime, args, _ in
-            if let payload = runtime.payload(args[1], as: VMMessagePayload.self), payload.callback.bits != 0 {
-                run(runtime, payload.callback)
-            }
+            schedule(runtime, args[0], messageCallback(runtime, args[1]), delayMillis: args[2].asInt64)
             return .boolean(true)
         }
         handler.method("sendMessageAtTime", "(Landroid/os/Message;J)Z") { runtime, args, _ in
-            if let payload = runtime.payload(args[1], as: VMMessagePayload.self), payload.callback.bits != 0 {
-                run(runtime, payload.callback)
-            }
+            schedule(runtime, args[0], messageCallback(runtime, args[1]), delayMillis: args[2].asInt64 - uptimeMillis())
             return .boolean(true)
         }
         handler.method("sendEmptyMessage", "(I)Z") { _, _, _ in .boolean(true) }
@@ -852,10 +902,15 @@ enum AndroidRuntime {
         context.method("getResources", "()Landroid/content/res/Resources;") { runtime, _, _ in
             runtime.makeNative("Landroid/content/res/Resources;", payload: VMResourcesPayload())
         }
-        // No Android system services are backed by the host; an unknown service
-        // name returns null, as it does on a device without that service.
-        context.method("getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") { _, _, _ in .null }
-        context.method("getSystemService", "(Ljava/lang/Class;)Ljava/lang/Object;") { _, _, _ in .null }
+        // Only the display service is backed (virtual displays for WebView
+        // presentations); any other service returns null, as it does on a
+        // device without that service.
+        context.method("getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") { runtime, args, _ in
+            AndroidRuntime.systemService(runtime, named: runtime.stringValue(args[1]))
+        }
+        context.method("getSystemService", "(Ljava/lang/Class;)Ljava/lang/Object;") { runtime, args, _ in
+            AndroidRuntime.systemService(runtime, ofClass: args[1])
+        }
         context.method("getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;") { runtime, _, _ in
             AndroidRuntime.applicationInfo(runtime)
         }
@@ -1030,8 +1085,12 @@ enum AndroidRuntime {
         wrapper.method("getResources", "()Landroid/content/res/Resources;") { runtime, _, _ in
             runtime.makeNative("Landroid/content/res/Resources;", payload: VMResourcesPayload())
         }
-        wrapper.method("getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") { _, _, _ in .null }
-        wrapper.method("getSystemService", "(Ljava/lang/Class;)Ljava/lang/Object;") { _, _, _ in .null }
+        wrapper.method("getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") { runtime, args, _ in
+            AndroidRuntime.systemService(runtime, named: runtime.stringValue(args[1]))
+        }
+        wrapper.method("getSystemService", "(Ljava/lang/Class;)Ljava/lang/Object;") { runtime, args, _ in
+            AndroidRuntime.systemService(runtime, ofClass: args[1])
+        }
         wrapper.method("getExternalCacheDir", "()Ljava/io/File;") { runtime, _, _ in
             runtime.makeNative(
                 "Ljava/io/File;",

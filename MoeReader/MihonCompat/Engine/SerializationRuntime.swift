@@ -284,6 +284,15 @@ final class VMSerializersModulePayload {
     }
 }
 
+final class VMSealedSerializerPayload {
+    let descriptor: VMValue
+    let serializers: [String: VMValue]
+    init(descriptor: VMValue, serializers: [String: VMValue]) {
+        self.descriptor = descriptor
+        self.serializers = serializers
+    }
+}
+
 final class VMPairSerializerPayload {
     let first: VMValue
     let second: VMValue
@@ -867,16 +876,77 @@ struct SerializationRuntime {
             superclass: "Ljava/lang/Object;",
             interfaces: ["Lkotlinx/serialization/KSerializer;"]
         )
-        sealedSerializer.method(
-            "<init>",
-            "(Ljava/lang/String;Lkotlin/reflect/KClass;[Lkotlin/reflect/KClass;[Lkotlinx/serialization/KSerializer;[Ljava/lang/annotation/Annotation;)V"
-        ) { _, _, _ in .zero }
-        sealedSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, _, _ in runtime.genericDescriptor() }
+        for signature in [
+            "(Ljava/lang/String;Lkotlin/reflect/KClass;[Lkotlin/reflect/KClass;[Lkotlinx/serialization/KSerializer;)V",
+            "(Ljava/lang/String;Lkotlin/reflect/KClass;[Lkotlin/reflect/KClass;[Lkotlinx/serialization/KSerializer;[Ljava/lang/annotation/Annotation;)V",
+        ] {
+            sealedSerializer.method("<init>", signature) { runtime, args, _ in
+                let count = runtime.arrayLength(args[4])
+                guard runtime.arrayLength(args[3]) == count else {
+                    throw VMJavaException("Ljava/lang/IllegalArgumentException;", "sealed subtype and serializer counts differ")
+                }
+                var serializers: [String: VMValue] = [:]
+                for index in 0..<count {
+                    let serializer = runtime.arrayElement(args[4], index)
+                    guard let descriptorMethod = runtime.classOf(serializer)?.lookupVirtual(
+                        key: "getDescriptor()Lkotlinx/serialization/descriptors/SerialDescriptor;"
+                    ) else {
+                        throw VMJavaException(SerializationRuntime.serializationException, "invalid sealed subtype serializer")
+                    }
+                    let descriptor = try runtime.invoke(descriptorMethod, [serializer])
+                    guard let nameMethod = runtime.classOf(descriptor)?.lookupVirtual(key: "getSerialName()Ljava/lang/String;") else {
+                        throw VMJavaException(SerializationRuntime.serializationException, "invalid sealed subtype descriptor")
+                    }
+                    let serialName = try runtime.invoke(nameMethod, [descriptor])
+                    let name = runtime.stringValue(serialName) ?? ""
+                    guard serializers.updateValue(serializer, forKey: name) == nil else {
+                        throw VMJavaException("Ljava/lang/IllegalArgumentException;", "duplicate sealed serial name \(name)")
+                    }
+                }
+                let descriptor = runtime.makeNative(
+                    "Lkotlinx/serialization/internal/PluginGeneratedSerialDescriptor;",
+                    payload: VMSerialDescriptorPayload(serialName: runtime.stringValue(args[1]) ?? "")
+                )
+                runtime.setPayload(args[0], VMSealedSerializerPayload(descriptor: descriptor, serializers: serializers))
+                return .zero
+            }
+        }
+        sealedSerializer.method("getDescriptor", "()Lkotlinx/serialization/descriptors/SerialDescriptor;") { runtime, args, _ in
+            let payload: VMSealedSerializerPayload = try runtime.payloadBox(args[0])
+            return payload.descriptor
+        }
         sealedSerializer.method("serialize", "(Lkotlinx/serialization/encoding/Encoder;Ljava/lang/Object;)V") { _, _, _ in
             throw VMJavaException(SerializationRuntime.serializationException, "sealed serialization is unsupported")
         }
-        sealedSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { _, _, _ in
-            throw VMJavaException(SerializationRuntime.serializationException, "sealed serialization is unsupported")
+        sealedSerializer.method("deserialize", "(Lkotlinx/serialization/encoding/Decoder;)Ljava/lang/Object;") { runtime, args, _ in
+            let sealed: VMSealedSerializerPayload = try runtime.payloadBox(args[0])
+            let decoder: VMJsonDecoderPayload = try runtime.payloadBox(args[1])
+            let type: String
+            let tree: VMJsonTree
+            switch decoder.tree.kind {
+            case .object(var fields):
+                guard let discriminator = fields.removeValue(forKey: "type"), discriminator.isStringElement,
+                      let name = discriminator.stringValue else {
+                    throw VMJavaException(SerializationRuntime.serializationException, "sealed value has no string type discriminator")
+                }
+                type = name
+                tree = VMJsonTree(.object(fields))
+            case .array(let items) where items.count == 2 && items[0].isStringElement:
+                type = items[0].stringValue ?? ""
+                tree = items[1]
+            default:
+                throw VMJavaException(SerializationRuntime.serializationException, "invalid sealed JSON value")
+            }
+            guard let serializer = sealed.serializers[type]
+                ?? decoder.module?.map[type]
+                ?? runtime.polymorphicDefaultSerializer(decoder.module, type: type) else {
+                throw VMJavaException(SerializationRuntime.serializationException, "no sealed serializer for \(type)")
+            }
+            let child = runtime.makeNative(
+                "Lkotlinx/serialization/json/JsonDecoder;",
+                payload: VMJsonDecoderPayload(tree: tree, module: decoder.module)
+            )
+            return try runtime.deserializeWith(serializer, decoder: child)
         }
         result.append(sealedSerializer)
 

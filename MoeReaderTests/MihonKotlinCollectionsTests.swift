@@ -361,4 +361,36 @@ final class MihonKotlinCollectionsTests: XCTestCase {
             )
         }
     }
+
+    /// Compiled `for (i in 0 until 16 step 2)` loops stop when the index equals
+    /// `getLast()`; a bound that the step never lands on overruns the array.
+    func testProgressionLastIsTheLastReachableElement() throws {
+        let runtime = VMRuntime()
+        let range = try invokeStatic(runtime, "Lkotlin/ranges/RangesKt;", "until", "(II)Lkotlin/ranges/IntRange;", [.int32(0), .int32(16)])
+        let stepped = try invokeStatic(
+            runtime, "Lkotlin/ranges/RangesKt;",
+            "step", "(Lkotlin/ranges/IntProgression;I)Lkotlin/ranges/IntProgression;", [range, .int32(2)]
+        )
+        let payload = runtime.payload(stepped, as: VMIntRangePayload.self)
+        XCTAssertEqual(payload?.first, 0)
+        XCTAssertEqual(payload?.last, 14)
+        XCTAssertEqual(payload?.step, 2)
+
+        // A second `step` replaces the step instead of multiplying it.
+        let restepped = try invokeStatic(
+            runtime, "Lkotlin/ranges/RangesKt;",
+            "step", "(Lkotlin/ranges/IntProgression;I)Lkotlin/ranges/IntProgression;", [stepped, .int32(3)]
+        )
+        XCTAssertEqual(runtime.payload(restepped, as: VMIntRangePayload.self)?.step, 3)
+        XCTAssertEqual(runtime.payload(restepped, as: VMIntRangePayload.self)?.last, 12)
+
+        let reversed = try invokeStatic(
+            runtime, "Lkotlin/ranges/RangesKt;",
+            "reversed", "(Lkotlin/ranges/IntProgression;)Lkotlin/ranges/IntProgression;", [stepped]
+        )
+        let back = runtime.payload(reversed, as: VMIntRangePayload.self)
+        XCTAssertEqual(back?.first, 14)
+        XCTAssertEqual(back?.last, 0)
+        XCTAssertEqual(back?.step, -2)
+    }
 }

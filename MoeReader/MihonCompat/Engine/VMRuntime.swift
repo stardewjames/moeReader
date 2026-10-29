@@ -24,6 +24,13 @@ protocol VMHost: AnyObject {
     func extensionFileRoot() -> String
     /// Cookie jar shared with the host transport (`CookieManager`, WebView).
     func cookieStorage() -> HTTPCookieStorage
+    /// The browser behind a new `android.webkit.WebView`, or nil when the
+    /// host has none (constructing the WebView then throws).
+    func makeWebViewPlatform(
+        runtime: VMRuntime,
+        payload: VMWebViewPayload,
+        events: VMWebViewEvents
+    ) -> VMWebViewPlatform?
 }
 
 extension VMHost {
@@ -33,6 +40,14 @@ extension VMHost {
         (NSTemporaryDirectory() as NSString).appendingPathComponent("mihoncompat")
     }
     func cookieStorage() -> HTTPCookieStorage { HTTPCookieStorage.shared }
+    /// `WKWebView` where WebKit exists.
+    func makeWebViewPlatform(
+        runtime: VMRuntime,
+        payload: VMWebViewPayload,
+        events: VMWebViewEvents
+    ) -> VMWebViewPlatform? {
+        WebKitRuntime.defaultWebViewPlatform(runtime: runtime, payload: payload, events: events)
+    }
 }
 
 struct VMHTTPRequest {
@@ -417,7 +432,24 @@ final class VMRuntime: @unchecked Sendable {
         cls.initialized = true
     }
 
+    /// Incremented by every `resetArena`. Host work created against one arena
+    /// (a WebView callback, a posted event) checks it before touching values
+    /// that the reset freed.
+    private(set) var arenaGeneration = 0
+    /// WebViews created in the current arena; a reset destroys any the
+    /// extension left behind, since their Java objects die with it.
+    var webViews: [ObjectIdentifier: VMWebViewPayload] = [:]
+
     func resetArena() {
+        arenaGeneration += 1
+        hostEvents.discardAll()
+        let leftover = webViews.values
+        webViews.removeAll()
+        for payload in leftover {
+            payload.platform?.destroy()
+            payload.platform = nil
+        }
+        hostEvents.discardAll()
         heap.reset()
         nativeObjects.removeAll(keepingCapacity: false)
         sharedPreferenceListenerHubs.removeAll(keepingCapacity: false)

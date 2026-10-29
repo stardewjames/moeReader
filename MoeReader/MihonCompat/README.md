@@ -59,7 +59,7 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/ConcurrencyRuntime.swift` | Atomic*, ConcurrentHashMap, `ReentrantLock`/`ReentrantReadWriteLock` |
 | `Engine/PlatformRuntime.swift` | `java.net` URL codecs, `TimeUnit`, `okhttp3.Cookie`/`CookieJar` over the shared jar, the Brotli interceptor, Android logging/bundle/build helpers |
 | `Engine/GraphicsRuntime.swift` | `android.graphics` (Bitmap, BitmapFactory, Canvas, Paint, Rect, Typeface) and `android.text` layout (StaticLayout, Layout, TextPaint) over CoreGraphics/ImageIO/CoreText |
-| `Engine/WebKitRuntime.swift` | `android.webkit`: CookieManager over the host transport's cookie storage, URLUtil, WebView over WKWebView with a JavaScript bridge and client/chrome callbacks, plus the `android.view` pieces a WebView needs |
+| `Engine/WebKitRuntime.swift` | `android.webkit`: CookieManager over the host transport's cookie storage, URLUtil, WebView over a `VMWebViewPlatform` (`WKWebView` on Apple hosts) with a JavaScript bridge, client/chrome callbacks and observed subresources, the virtual-display/`Presentation` surface, the `android.view` pieces a WebView needs, and the engine's host-event queue (platform callbacks and delayed `Handler` work) |
 | `Engine/NativeLibrary.swift` | Registration point: collects every runtime's `NativeClass` list into the VM's native registry |
 | `Engine/MihonEngine.swift` | APK → dex → factory → sources; typed source calls |
 | `Engine/DoHResolver.swift` | DNS over HTTPS (JSON API): `A`/`AAAA` answers, TTL cache, single flight, hostname and address-literal validation, persisted resolver choice |
@@ -105,10 +105,10 @@ error instead of quietly falling back to the system resolver.
 3. The metadata class is instantiated. If it is a `SourceFactory`,
    `createSources()` is called; if it is itself a `Source`, it is used directly.
 4. Source calls run on the engine's serial queue. Suspend entry points are
-   driven synchronously: every native suspension point (HTTP, delay, context
-   switch) completes inline, so Kotlin state machines never return
-   `COROUTINE_SUSPENDED`. A real asynchronous suspension is reported as an
-   error instead of hanging.
+   driven synchronously: native HTTP, delay and context switches complete
+   inline; deferred waits drain platform events and scheduled `Handler` work
+   until completion or the operation deadline. An unsupported asynchronous
+   suspension is reported as an error instead of hanging.
 5. When a source does not override a suspend call, `HttpSource` supplies the
    deprecated helper pipeline itself: build `*Request`, execute it with the
    source client, then run `*Parse`. `ParsedHttpSource` supplies the selector
@@ -124,6 +124,8 @@ error instead of quietly falling back to the system resolver.
    Source capability flags (`supportsLatest`, `isNsfw`) are read through
    virtual dispatch so the UI can hide feeds the source does not serve and mark
    NSFW sources.
+   Resetting the arena destroys remaining WebViews and invalidates queued
+   callbacks, including work already selected by the current event-loop drain.
 
 ## Native surface
 
@@ -141,7 +143,9 @@ and the suspend lib-1.6 API in practice:
   moves the wall clock forward, an overlap keeps the earlier offset, as
   `ZonedDateTime.of` does), `java.util.Date`,
   `java.util.Calendar`/`GregorianCalendar` and `TimeZone`,
-  `java.text` `SimpleDateFormat`/`DecimalFormat`, `java.util.regex.Pattern`/
+  `java.text` `SimpleDateFormat`/`DecimalFormat`,
+  `String.format` (including the unsigned width of boxed `Byte`/`Short`/
+  `Integer` under `%x`/`%X`, precision and zero padding), `java.util.regex.Pattern`/
   `Matcher` over `NSRegularExpression`, field and method reflection
   including `Method.invoke`, `Class.forName` and dynamic `Proxy` instances,
   atomics, `ReentrantLock`/`ReentrantReadWriteLock`, `ConcurrentHashMap`,
@@ -188,17 +192,20 @@ and the suspend lib-1.6 API in practice:
   `kotlin.coroutines` internals, and the `kotlinx.coroutines` builders needed
   by sources (`coroutineScope`, `async`/`await`, `withContext`, `launch`,
   `delay`, `GlobalScope`). A launched coroutine runs to completion before
-  `launch` returns. When `getFilterList` launches work (sources that fetch
-  filter data in the background and return a placeholder list), the engine
-  reads the list again so the filter sheet and the search call see the fetched
-  filters.
+  `launch` returns a completed, inactive job. When `getFilterList` launches
+  work (sources that fetch filter data in the background and return a
+  placeholder list), the engine reads the list again so the filter sheet
+  and the search call see the fetched filters.
 - **kotlinx.serialization**: `Json` encode/decode over generated
   `GeneratedSerializer` classes and plugin serializers, nullable/default
-  fields, lists/sets/maps, enums, sealed and polymorphic DTOs with
+  fields, lists/sets/maps, enums, sealed and polymorphic DTO decoding with
   `SerializersModule` fallbacks, JSON element trees (`JsonObject`/`JsonArray`/
   `JsonPrimitive`), `buildJsonObject`/`buildJsonArray` and
   `JsonElementBuildersKt`, `JsonTransformingSerializer`, and
-  `decodeFromJsonElement`/`encodeToJsonElement`/`encodeToString`. The JSON
+  `decodeFromJsonElement`/`encodeToJsonElement`/`encodeToString`. Sealed
+  decoding resolves declared subtype serial names from the `type` discriminator
+  or a two-element tagged array; unknown types fail unless the module resolves
+  them. Sealed and polymorphic encoding remain unsupported. The JSON
   parser reads UTF-8 bytes directly, so CRLF documents, `\u` surrogate pairs
   and a BOM are handled the way kotlinx handles them. The protobuf format is
   present as well: `ProtoBuf` (byte and hex entry points), `ProtoBufBuilder`,
@@ -216,10 +223,14 @@ and the suspend lib-1.6 API in practice:
   normalisation and collation (with `java.text.StringCharacterIterator`) for
   text search and sorting,
   `android.os` (`Bundle`, `Build`/`Build.VERSION`, `SystemClock`, `Handler`,
-  `HandlerThread`, `Looper`, `Message`), `android.view` (`View` with the
+  `HandlerThread`, `Looper`, `Message`; delayed `Handler` work waits on the
+  engine's event queue and runs when the engine next waits or ticks, so a
+  runnable that re-posts itself polls instead of recursing, and
+  `removeCallbacks` cancels it), `android.view` (`View` with the
   padding, content-description, click-listener, context and resource members a
   headless widget reads, `ViewGroup`/`LayoutParams` with the child list behind
-  `addView`/`getChildAt`, `View.MeasureSpec`), `android.content` shared
+  `addView`/`getChildAt` and hierarchy listeners told about every add/remove,
+  `View.MeasureSpec`), `android.content` shared
   preferences (including string sets and change listeners), `Intent`/`ComponentName`/`ResultReceiver`
   parcel plumbing, and `androidx.preference` controls for source preference
   screens.
@@ -230,22 +241,41 @@ and the suspend lib-1.6 API in practice:
   data. An encode request for a format the host cannot write (WebP) falls back
   to PNG, which readers accept because they sniff the byte format.
   `android.webkit.CookieManager` reads and writes the same cookie jar as the
-  host transport, and `WebView` is backed by `WKWebView` on Apple hosts with a
-  JavaScript bridge, client and chrome callbacks; a host without WebKit throws
-  a typed exception when one is constructed. `app.cash.quickjs.QuickJs` runs
+  host transport. A `WebView` drives a `VMWebViewPlatform`: `WKWebView` on
+  Apple hosts, or a browser the host supplies through
+  `VMHost.makeWebViewPlatform`; without one, constructing a WebView throws a
+  typed exception. The platform carries the JavaScript bridge
+  (`addJavascriptInterface(object, name)`), client and chrome callbacks, and
+  reports `onPageStarted` when a main-frame document commits, as Android does,
+  so script a client evaluates from it runs in the new page. A new WebView is
+  laid out at the display size (`View.layout` resizes it), so page geometry
+  works before anything shows it. Subresources the page loads are observed
+  (a document-start `PerformanceObserver`) and shown to
+  `WebViewClient.shouldInterceptRequest` after the fact: sources that watch
+  traffic work, but a response the client returns cannot replace what the page
+  received. `dispatchTouchEvent` delivers the touch to the page as synthesised
+  DOM pointer/touch/mouse events and an activation click, which pages that
+  require `isTrusted` input ignore. `app.cash.quickjs.QuickJs` runs
   its scripts on JavaScriptCore on Apple hosts and fails closed with a typed
   `UnsupportedOperationException` elsewhere. The screen-capture and
   pointer-injection surface is registered as well: `android.app.Presentation`,
-  `DisplayManager`/`VirtualDisplay`, `android.media.ImageReader`/`Image`,
+  `DisplayManager` (`Context.getSystemService("display")`)/`VirtualDisplay`/
+  `Display`, `android.media.ImageReader`/`Image`/`Surface`,
   `android.view.MotionEvent` with `PointerCoords`/`PointerProperties`, and
-  `WebView.VisualStateCallback`/`postVisualStateCallback`. `MotionEvent`
-  carries real pointer data (`obtain` copies the arrays, `recycle` clears
-  them), and the visual-state callback is delivered with its token; anything
-  that would need a second display or real captured pixels throws the typed
-  unsupported error instead of returning fabricated images.
+  `WebView.VisualStateCallback`/`postVisualStateCallback`. A virtual display
+  is geometry: a `Presentation` whose content is a WebView lays the page out
+  at the display's size and density and puts it on a live display (on iOS the
+  view joins the app window beneath everything, transparent, so WebKit draws
+  it and loads lazy images); dismissing it takes the page off again.
+  `MotionEvent` carries real pointer data (`obtain` copies the arrays,
+  `recycle` clears them), and the visual-state callback is delivered with its
+  token; reading frames back (`acquireLatestImage`) or presenting anything
+  other than a WebView throws the typed unsupported error instead of
+  returning fabricated images.
 - **okhttp3**: `Request`/`Response`/`Headers`/`HttpUrl` including the
-  `HttpUrl.Builder` surface (path segments, query add/set/remove, host, scheme,
-  port, fragment), calls, client builders, `CacheControl`, interceptor chains,
+  `HttpUrl.Builder` surface (fresh construction with a root path, path segments,
+  query add/set/remove, host, scheme, port, fragment), calls, client builders,
+  `CacheControl`, interceptor chains,
   form bodies (a `FormBody.Builder` renders its pairs into the bytes that
   `contentLength`, `writeTo` and the transport send, percent-encoding `add`
   text with `+` for spaces while `addEncoded` stays verbatim), multipart bodies
@@ -254,15 +284,17 @@ and the suspend lib-1.6 API in practice:
   overloads), compression markers, `Dispatcher`, `Cookie`/`CookieJar` over the
   shared jar, and the `Duration` timeout overloads. `ResponseBody.Companion.create`
   accepts a string, bytes, a file or a `BufferedSource`, with and without an
-  explicit content length.
+  explicit content length; its `$default` synthetic treats a defaulted
+  `contentLength` as "read to end" rather than zero bytes, so a rebuilt image
+  body keeps the response payload.
   `HttpUrl.parse`/`toHttpUrlOrNull` return null (and `get`/`toHttpUrl` throw)
   for anything but an absolute `http`/`https` URL with a host, so sources that
   treat a parseable search query as a deep link only do so for real URLs.
 - **okio**: `okio.ByteString` (from `String` or `byte[]`, base64 and hex
   codecs, `md5`/`sha256` digests, slicing and `substring`), `BufferedSource`,
   `BufferedSink`, `Source`, `Sink`, `Buffer` (`snapshot`, `read`/`writeAll`,
-  `skip`, byte counts, EOF checks) and `Okio` factories over `java.io.File`. A
-  non-appending file sink truncates on
+  `skip`, byte counts, EOF checks), `Okio.cipherSource` over a Java cipher, and
+  `Okio` factories over `java.io.File`. A non-appending file sink truncates on
   its first flush and appends afterwards. `com.squareup.zstd.okio.OkioZstd`
   compresses into spec-compliant zstd frames of raw blocks and decompresses
   raw/RLE-block frames, which covers zstd-framed caches the extension writes
@@ -270,8 +302,9 @@ and the suspend lib-1.6 API in practice:
 - **jsoup**: tolerant HTML parser with `Parser.htmlParser()`/`xmlParser()`
   tree-builder choice (XML documents keep no implied tags), `Document`,
   `Element`, `Elements`, `Attributes`/`Attribute`, `TextNode` and `Node`,
-  `Jsoup.parse`/`parseBodyFragment`, text and attribute access including
-  `hasText`, a CSS selector engine (`>`, `+`, `~`, `:has`, `:is`,
+  `Jsoup.parse`/`parseBodyFragment`, iterable `Attributes` whose entries expose
+  their keys and values, text and attribute access including `hasText`,
+  a CSS selector engine (`>`, `+`, `~`, `:has`, `:is`,
   `:containsOwn`, `:not`, `:nth-child`, attribute operators, and more), typed
   `Evaluator` instances, and the
   `selectText`/`selectInt`/`attrOrText`/`asJsoup` helpers. An `Elements` is a
@@ -306,14 +339,18 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
 
 - `MihonEngineSerializationTests` decodes and re-encodes nested
   nullable/default data classes and lists through a compiled
-  kotlinx.serialization serializer.
+  kotlinx.serialization serializer. It also decodes declared sealed subtypes
+  through generated DEX serializers, including nested data and unknown/missing
+  type failures.
 - `MihonEngineEdgeCaseTests` covers literal operand sources, `String` copy
   construction, array covariance, `clone`, unmodifiable collections, Java
   string/regex splitting, and positional/unknown Jsoup selectors.
 - `MihonRuntimeSemanticsTests` covers UTF-16 string operations, numeric
   parsing failures, boxed boolean identity, list bounds/typed `toArray`,
-  `Map.Entry.setValue`, regex `next`/group ranges, and okio byte-count/buffer
-  semantics.
+  `Map.Entry.setValue`, regex `next`/group ranges, okio byte-count/buffer
+  semantics, delayed `Handler` work running from the event loop (and
+  `removeCallbacks` cancelling it), `withTimeout` running its block, and
+  inline `launch` returning a completed job rather than an active one.
 - `MihonEngineArrayTests` runs directly constructed `DexCode` items through the
   interpreter: byte/char/short/boolean array widening and truncation,
   `filled-new-array`, and sign-extended `const-wide/high16`.
@@ -331,7 +368,9 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   instant formatting, epoch parsing and system default zones.
 - `MihonKotlinCollectionsTests` covers array `copyOfRange`/`plus`/`copyInto`
   bounds, `take` edge counts, `toSortedSet`/`maxOrNull` ordering,
-  collection-to-byte-array unboxing, progression `step` validation,
+  collection-to-byte-array unboxing, progression `step` validation and the
+  Kotlin progression shape (`last` is the last reachable element, `step`
+  replaces rather than scales, `reversed` recomputes the end),
   destructured group order, `ReadWriteProperty` dispatch, `Regex.escape` and
   the UTF-8/char/text helpers.
 - `MihonKotlinReflectionTests` covers Java whitespace, static field reflection,
@@ -354,13 +393,18 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   serializer.
 - `MihonJsoupSurfaceTests` covers `Parser.htmlParser()`/`xmlParser()` tree
   selection, XML parsing, element/attribute mutation and `TextNode`/
-  `Attributes` access, typed evaluator parity with string selectors,
-  fail-closed helper statics, and a 2 MB page select inside the time budget.
+  `Attributes` access and iteration (including empty/exhausted iterators),
+  typed evaluator parity with string selectors, fail-closed helper statics,
+  and a 2 MB page select inside the time budget.
 - `OkioOkHttpSurfaceTests` covers `ByteString` representations, base64/hex
   decoding, digest vectors, equality/slicing, buffer ordering and EOF checks,
   `BufferedSource` reads/skips/ranges, `ResponseBody.Companion.create` with
   known and unknown lengths, `Headers` iteration, `CacheControl` `TimeUnit`
-  overloads, multipart rendering and byte-backed request bodies.
+  overloads, multipart rendering, byte-backed request bodies, fresh
+  `HttpUrl.Builder` construction with independent built URLs, and a
+  `create$default` rebuild that keeps every source byte. Cipher-source
+  coverage decrypts an independent NIST AES-CTR vector through partial and
+  buffered reads, checks EOF, and rejects null source/cipher arguments.
 - `MihonAndroidSurfaceTests` covers `Base64` flag handling, `TextUtils`
   null/empty/join/split/digit semantics, `LruCache` eviction and resize,
   `Configuration` UI mode, `Bundle` parcel round-trips, ICU break iteration/
@@ -452,7 +496,9 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   synthetic hops: every hop carries the cookies stored from the preceding
   response, a merged `Set-Cookie` value lands as separate cookies while an
   `Expires` comma does not split, a `Location` path keeps its trailing slash,
-  and the five-hop cap plus HTTPS-downgrade rejection still hold.
+  and the five-hop cap plus HTTPS-downgrade rejection still hold. After the
+  host followed redirects, `Response.request()` is the last hop's request, as
+  in OkHttp, so a source can tell where it landed.
   `NetworkHelper.getCookieJar()` saves and loads through the shared jar. It
   also pins form bodies: `FormBody.Builder.add` percent-encodes form text
   (space as `+`, UTF-8), `addEncoded` stays verbatim, and `contentLength`,
@@ -484,8 +530,12 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   `androidx.preference` listeners (change/no-op/remove/clear, unregister,
   rejection, defaults applied on first display) and
   `MihonDisplaySurfaceTests` covers the presentation/pointer surface
-  (registration, `obtain`/`recycle` data, the visual-state callback, and the
-  typed failure for pixel/second-display paths).
+  (`obtain`/`recycle` data, the visual-state callback, a WebView presentation
+  laid out at the display's size and torn down through the parent's hierarchy
+  listener, JavaScript interface dispatch, observed subresources reaching
+  `shouldInterceptRequest`, arena-reset cleanup, cancellation during an
+  event-loop drain, and typed failure for frame capture and non-WebView
+  presentations).
 - `MihonMangaUpdatePathTests` pins the `getMangaUpdate` path: a browse list
   item's `SManga` (including `memo`) reaches details and chapter refresh, also
   after an arena recycle; `CollectionsKt.addAll` to a set destination, jsoup
@@ -530,7 +580,8 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 | Gap | Effect |
 |---|---|
 | Browser-check interstitials | Detection matches Cloudflare and DDoS-Guard markers (server header, interstitial markup, clearance-cookie names) on 403/429/503, and the transport retries once: `MihonEngineHost` loads the URL in an off-screen `WKWebView`, waits up to 25 s for a clearance cookie or for a non-interstitial document, copies the host's cookies into `HTTPCookieStorage`, and retries with the rebuilt jar. Detection and the retry bookkeeping are unit-tested; a headless host has no WebKit, so the clearance path itself is exercised only on a device. `CloudflareInterceptor` remains a pass-through. |
-| Apple-only frameworks | `android.graphics`/`android.text` pixel work (CoreGraphics/ImageIO/CoreText), `app.cash.quickjs` (JavaScriptCore) and `android.webkit.WebView` (WebKit) exist only on Apple hosts. Elsewhere each raises a typed `UnsupportedOperationException` naming the operation, so a source that needs them stops instead of receiving fabricated bytes. |
+| Apple-only frameworks | `android.graphics`/`android.text` pixel work (CoreGraphics/ImageIO/CoreText) and `app.cash.quickjs` (JavaScriptCore) exist only on Apple hosts; `android.webkit.WebView` needs WebKit or a host-supplied `VMWebViewPlatform`. Elsewhere each raises a typed `UnsupportedOperationException` naming the operation, so a source that needs them stops instead of receiving fabricated bytes. |
+| WebView request interception | WKWebView cannot hold a subresource request back, so `shouldInterceptRequest` sees subresources after they loaded and cannot substitute a response; only the main-frame request can be replaced. Page-side challenges a source solves by swapping a frame's content (an interactive captcha) therefore need the user, not the engine. |
 | RxJava-only sources | Extensions whose only fetch entry points are the RxJava `fetch*` overrides are not executed. Request/parse-style lib-1.4/1.5 sources and the suspend API run without RxJava. |
 | Zstd response bodies | `OkioZstd` reads only raw/RLE-block frames. Entropy-coded zstd (what servers send) fails closed with an `IOException`. |
 | Duplicate response headers | URLSession merges repeated `Set-Cookie` response headers into one value; the engine splits that value once when it enters from the transport, honouring `Expires` commas, so the jar and `Response.headers` see one cookie per header. Other repeated response headers stay merged. |

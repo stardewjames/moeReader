@@ -225,6 +225,10 @@ final class VMDialogPayload {
     var titleResource: Int32 = 0
     var message: VMValue = .null
     var contentView: VMValue = .null
+    /// `Presentation` only: the display it shows on and the content frame
+    /// that parents its content view.
+    var display: VMValue = .null
+    var decor: VMValue = .null
     var contentResource: Int32 = 0
     var cancelable = true
     var canceledOnTouchOutside = true
@@ -626,7 +630,39 @@ enum PlatformRuntime {
         result += atomicReference()
         result += coroutineExtras()
         result += metadataStubs()
+        result += jsonClasses()
         return result
+    }
+
+    /// `org.json`: `JSONObject.quote`, the JSON string literal extensions use
+    /// to embed a value in a script.
+    private static func jsonClasses() -> [NativeClass] {
+        let object = NativeClass("Lorg/json/JSONObject;", superclass: "Ljava/lang/Object;")
+        object.staticMethod("quote", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(units: jsonQuoted(runtime.stringUnits(args[0]) ?? []))
+        }
+        return [object]
+    }
+
+    /// Android's `JSONStringer` escaping: quotes, backslash and `/` are
+    /// escaped, control characters use their short form or `\uXXXX`.
+    static func jsonQuoted(_ units: [UInt16]) -> [UInt16] {
+        var out: [UInt16] = [0x22]
+        out.reserveCapacity(units.count + 2)
+        for unit in units {
+            switch unit {
+            case 0x22, 0x5C, 0x2F: out += [0x5C, unit]
+            case 0x09: out += [0x5C, 0x74]
+            case 0x08: out += [0x5C, 0x62]
+            case 0x0A: out += [0x5C, 0x6E]
+            case 0x0D: out += [0x5C, 0x72]
+            case 0x0C: out += [0x5C, 0x66]
+            case 0..<0x20: out += Array(String(format: "\\u%04x", Int(unit)).utf16)
+            default: out.append(unit)
+            }
+        }
+        out.append(0x22)
+        return out
     }
 
     private static func metadataStubs() -> [NativeClass] {
@@ -2382,7 +2418,7 @@ enum PlatformRuntime {
         return created
     }
 
-    private static func notifyDialogListener(_ runtime: VMRuntime, _ listener: VMValue, _ name: String, _ dialog: VMValue) {
+    static func notifyDialogListener(_ runtime: VMRuntime, _ listener: VMValue, _ name: String, _ dialog: VMValue) {
         guard listener.bits != 0 else { return }
         _ = runtime.callVirtual(listener, "\(name)(Landroid/content/DialogInterface;)V", [dialog])
     }

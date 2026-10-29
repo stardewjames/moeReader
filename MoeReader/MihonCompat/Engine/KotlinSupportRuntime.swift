@@ -871,10 +871,16 @@ enum KotlinSupportRuntime {
             return .zero
         }
         progression.method("<init>", "(III)V") { runtime, args, _ in
-            runtime.setPayload(args[0], VMIntRangePayload(
-                first: Int(args[1].asInt32),
-                last: Int(args[2].asInt32),
-                step: Int(args[3].asInt32)
+            // Kotlin's constructor stores the last element the progression
+            // actually reaches, not the bound it was given.
+            let step = args[3].asInt32
+            guard step != 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Step must be non-zero.")
+            }
+            runtime.setPayload(args[0], VMIntRangePayload.progression(
+                first: args[1].asInt32,
+                endInclusive: args[2].asInt32,
+                step: step
             ))
             return .zero
         }
@@ -993,16 +999,11 @@ enum KotlinSupportRuntime {
 
         let progressionUtil = NativeClass("Lkotlin/internal/ProgressionUtilKt;")
         progressionUtil.staticMethod("getProgressionLastElement", "(III)I") { _, args, _ in
-            let start = args[0].asInt32
-            let end = args[1].asInt32
             let step = args[2].asInt32
             guard step != 0 else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Step must be non-zero.")
             }
-            if step > 0 {
-                return start >= end ? .int32(end) : .int32(end - differenceModulo(end, start, step))
-            }
-            return start <= end ? .int32(end) : .int32(end + differenceModulo(start, end, -step))
+            return .int32(progressionLastElement(start: args[0].asInt32, end: args[1].asInt32, step: step))
         }
         result.append(progressionUtil)
 
@@ -1607,6 +1608,15 @@ func differenceModulo(_ a: Int32, _ b: Int32, _ c: Int32) -> Int32 {
     let ac = kotlinMod(a, c)
     let bc = kotlinMod(b, c)
     return kotlinMod(ac &- bc, c)
+}
+
+/// `kotlin.internal.getProgressionLastElement`: the last value a progression
+/// from `start` towards `end` (inclusive) with a non-zero `step` reaches.
+func progressionLastElement(start: Int32, end: Int32, step: Int32) -> Int32 {
+    if step > 0 {
+        return start >= end ? end : end &- differenceModulo(end, start, step)
+    }
+    return start <= end ? end : end &+ differenceModulo(start, end, -step)
 }
 
 private func kotlinMod(_ value: Int32, _ modulus: Int32) -> Int32 {
