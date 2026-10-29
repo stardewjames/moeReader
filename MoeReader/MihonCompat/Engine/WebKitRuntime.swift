@@ -2887,7 +2887,7 @@ final class VMWKWebViewPlatform: NSObject, VMWebViewPlatform, WKNavigationDelega
         preferences: WKWebpagePreferences,
         decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
-        preferences.allowsContentJavaScript = payload.settings.javaScriptEnabled
+        preferences.allowsContentJavaScript = payload?.settings.javaScriptEnabled ?? true
         if navigationAction.targetFrame?.isMainFrame == true,
            let url = navigationAction.request.url?.absoluteString {
             events.navigationRequested(url)
