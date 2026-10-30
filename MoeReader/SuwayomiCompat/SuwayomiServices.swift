@@ -160,7 +160,10 @@ final class SuwayomiServices: @unchecked Sendable {
         guard let target = URL(string: url) else { return false }
         challengeLock.lock()
         defer { challengeLock.unlock() }
-        return MihonChallengeSolver().solve(url: target, userAgent: userAgent)
+        // The solver serialises itself; sharing one instance keeps a second
+        // request from spinning a second off-screen browser over the same
+        // cookie store.
+        return MihonChallengeSolver.shared.solve(url: target, userAgent: userAgent)
         #else
         _ = (url, userAgent)
         return false

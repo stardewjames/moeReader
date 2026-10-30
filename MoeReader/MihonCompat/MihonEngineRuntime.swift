@@ -372,8 +372,14 @@ final class MihonEngineHost: VMHost {
         // The retry carries the request's own headers, so the browser has to
         // present the agent those headers resolve to, not the WebView default.
         let userAgent = MihonChallengeUserAgent.forRequest(request, default: Self.defaultUserAgent)
-        let solver = MihonChallengeSolver()
-        return solver.solve(url: url, userAgent: userAgent)
+        // A non-GET challenge is solved on the site root, and the solver needs
+        // the request's own headers to look like the request the source made.
+        return MihonChallengeSolver.shared.solve(
+            url: url,
+            userAgent: userAgent,
+            method: request.method,
+            headers: request.headers
+        )
         #else
         _ = request
         return false
@@ -773,32 +779,114 @@ struct MihonEngineFailure: Error, LocalizedError {
 }
 
 
+/// How the off-screen challenge browser presents one request.
+///
+/// A WebView can only load a page with GET. A POST endpoint often answers GET
+/// without a challenge, so the check is earned on the site root; clearance
+/// covers the whole host afterwards. The browser owns its cookie jar and user
+/// agent, so headers describing a POST body or carrying the request's cookies
+/// are left to the browser; everything else (language, referer, custom accept)
+/// is copied so the page sees the same request shape as the source.
+enum MihonChallengeBrowser {
+    static let timeout: TimeInterval = 30
+
+    /// Headers the browser or the transport must own for the challenge load.
+    /// This is the set Chromium treats as unsafe for a navigation request
+    /// (its renderer can kill the request on a mismatched `Origin`), plus the
+    /// cookie and user-agent headers the solver sets itself.
+    static let browserOwnedHeaders: Set<String> = [
+        "cookie", "cookie2", "user-agent", "host", "content-length",
+        "content-type", "transfer-encoding", "connection", "accept-encoding",
+        "trailer", "te", "upgrade", "keep-alive", "set-cookie", "origin",
+    ]
+
+    static func url(for url: URL, method: String) -> URL {
+        let verb = method.uppercased()
+        guard verb != "GET", verb != "HEAD" else { return url }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.path = "/"
+        components?.query = nil
+        components?.fragment = nil
+        return components?.url ?? url
+    }
+
+    static func request(
+        url: URL,
+        userAgent: String,
+        headers: [(String, String)]
+    ) -> URLRequest {
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: timeout
+        )
+        for (name, value) in headers where !name.isEmpty && !value.isEmpty {
+            let lowered = name.lowercased()
+            guard !lowered.hasPrefix("proxy-"), !browserOwnedHeaders.contains(lowered) else { continue }
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.setValue(userAgent, forHTTPHeaderField: MihonChallengeUserAgent.headerName)
+        return request
+    }
+}
+
 #if canImport(WebKit)
 /// Clears a browser-check interstitial by loading it in an off-screen WKWebView
-/// and waiting until the check is done: either the protection has issued its
-/// clearance cookie, or the loaded document no longer carries interstitial
-/// markers. The engine queue is not the main queue, so the wait polls the
-/// main-queue-created WebKit state; every WebKit call runs on the main queue
-/// and the wait is bounded.
+/// with the identity that will retry the request.
+///
+/// A clearance belongs to one browser identity: the protection hashes the user
+/// agent, address and client fingerprint into `cf_clearance`, and a request
+/// carrying a different agent is challenged again. The solver therefore
+/// presents the request's exact `User-Agent` and seeds the browser with the
+/// request's cookie jar, so an already-working session is the session that
+/// passes the check. A non-GET request is solved on the site root: a POST
+/// endpoint usually answers GET without a challenge, and clearance covers the
+/// whole site.
+///
+/// Success means the protection issued a fresh clearance cookie for the host,
+/// or the committed document is the page rather than the interstitial. A
+/// failed attempt removes only the cookies it added, so an earlier session
+/// survives. The engine queue is not the main queue; every WebKit call runs on
+/// the main queue and each reply is bounded, so a stuck callback cannot hang
+/// the source call.
 final class MihonChallengeSolver: NSObject, @unchecked Sendable {
-    private static let pollInterval: TimeInterval = 0.5
-    private static let timeout: TimeInterval = 25
+    /// One browser at a time: concurrent solves would race over the shared
+    /// cookie store and the main-queue WebKit state, and only one clearance
+    /// attempt per identity is useful.
+    static let shared = MihonChallengeSolver()
+
+    private static let pollInterval: TimeInterval = 0.25
     /// A WebKit callback that never arrives must not stretch the wait past the
     /// deadline, so each main-queue reply is awaited with its own limit.
     private static let replyTimeout: TimeInterval = 5
+    /// A clearance cookie can land before the protection has written the rest
+    /// of the session cookies; a solved attempt gives them one more tick.
+    private static let cookieGrace: TimeInterval = 0.75
+
+    private let lock = NSLock()
+    private var webView: WKWebView?
 
     /// A committed main-frame document; `nil` while WKWebView is still on
     /// `about:blank`, which is never evidence that the check passed.
     private struct DocumentState {
+        let url: URL
         let readyState: String
         let html: String
-    }
+        /// Visible text and element count of `body`. A freshly committed
+        /// document can be an empty shell while the protection is still
+        /// writing it; neither a blank body nor no body at all is evidence
+        /// that the check passed.
+        let textLength: Int
+        let childCount: Int
 
-    private var webView: WKWebView?
+        var hasContent: Bool { textLength > 0 || childCount > 0 }
+    }
 
     /// Cookies for the challenged host before the attempt started, per store.
     /// Only cookies the attempt itself adds are removed, so a session obtained
-    /// earlier stays usable.
+    /// earlier stays usable. The old clearance cookie is deliberately not part
+    /// of the snapshot: it has just failed to clear the request, so the attempt
+    /// replaces it or fails.
     private struct CookieSnapshot {
         var webKit: [HTTPCookie] = []
         var shared: [HTTPCookie] = []
@@ -808,62 +896,128 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
         var value: T?
     }
 
-    func solve(url: URL, userAgent: String) -> Bool {
+    // MARK: - Attempt
+
+    func solve(
+        url: URL,
+        userAgent: String,
+        method: String = "GET",
+        headers: [(String, String)] = []
+    ) -> Bool {
         guard !Thread.isMainThread else { return false }
-        DispatchQueue.main.sync {
-            let configuration = WKWebViewConfiguration()
-            configuration.websiteDataStore = .default()
-            let webView = WKWebView(frame: .zero, configuration: configuration)
-            // The clearance is issued to the identity that passed the check; the
-            // retry sends this exact agent, so the browser has to present it.
-            webView.customUserAgent = userAgent
-            self.webView = webView
+        let target = MihonChallengeBrowser.url(for: url, method: method)
+        lock.lock()
+        defer { lock.unlock() }
+        makeWebView(userAgent: userAgent)
+
+        let host = target.host?.lowercased()
+        // A stale clearance on the host is exactly what just failed. Drop it
+        // from both stores before loading, so a cookie seen afterwards is one
+        // this attempt earned rather than the one that did not work. Other
+        // session cookies stay and are handed to the browser, because the
+        // challenge may sit behind a login.
+        if let host {
+            removeClearanceCookies(for: target, host: host)
+            seedCookies(for: target, host: host)
         }
-        // Snapshot before the first load: what the attempt adds is exactly the
-        // difference to this state, and a failed attempt removes only that.
-        let host = url.host?.lowercased()
-        let before = host.flatMap { snapshot(for: $0, url: url) }
+        // A clearance may be issued for a different host than the one asked
+        // (a canonical-host redirect), so the baseline is every clearance the
+        // browser already holds; anything outside it was earned by this
+        // attempt.
+        let previousClearance = clearanceIdentities(in: allWebKitCookies() ?? [])
+        // Snapshot after seeding and removing: what the attempt adds is exactly
+        // the difference to this state, and a failed attempt removes only that.
+        let before = host.flatMap { snapshot(for: $0, url: target) }
         DispatchQueue.main.sync {
-            self.webView?.load(URLRequest(url: url))
+            self.webView?.load(MihonChallengeBrowser.request(
+                url: target,
+                userAgent: userAgent,
+                headers: headers
+            ))
         }
 
-        let deadline = Date().addingTimeInterval(Self.timeout)
-        var cleared = false
+        let deadline = Date().addingTimeInterval(MihonChallengeBrowser.timeout)
+        var clearanceSeenAt: Date?
+        var clearCandidateAt: Date?
+        var clearedByDocument = false
+        var attemptedHosts = host.map { Set([$0]) } ?? []
         while Date() < deadline {
+            if let cookies = allWebKitCookies(),
+               hasNewClearance(in: cookies, for: attemptedHosts, since: previousClearance) {
+                clearanceSeenAt = clearanceSeenAt ?? Date()
+            }
             if let document = currentDocument() {
-                // A finished document without a marker is the page the
-                // extension asked for; the protection already reloaded it.
-                if document.readyState != "loading", !document.html.isEmpty,
+                if let documentHost = document.url.host?.lowercased() { attemptedHosts.insert(documentHost) }
+                if VMChallengeDetector.textLooksLikeHardBlock(document.html) {
+                    // No browser can pass a hard block; waiting only burns
+                    // the source call's deadline.
+                    break
+                }
+                // A finished, non-empty document without a marker is the page
+                // the extension asked for. It has to stay that way for one
+                // more poll, because the protection can briefly commit an
+                // empty shell before its script writes the interstitial.
+                if document.readyState == "complete", !document.html.isEmpty,
+                   document.hasContent,
                    !VMChallengeDetector.textLooksLikeInterstitial(document.html) {
-                    cleared = true
-                    break
+                    if let since = clearCandidateAt {
+                        if Date().timeIntervalSince(since) >= Self.pollInterval {
+                            clearedByDocument = true
+                            break
+                        }
+                    } else {
+                        clearCandidateAt = Date()
+                    }
+                } else {
+                    clearCandidateAt = nil
                 }
-                // Otherwise the protection may have set its clearance cookie
-                // without replacing the interstitial document yet.
-                if hasClearanceCookie(for: url) {
-                    cleared = true
-                    break
-                }
+            }
+            // The clearance is the durable proof: once the protection has
+            // written it, the retry can send it even if the interstitial has
+            // not started its reload yet.
+            if let seen = clearanceSeenAt,
+               Date().timeIntervalSince(seen) >= Self.cookieGrace {
+                break
             }
             Thread.sleep(forTimeInterval: Self.pollInterval)
         }
+        let cleared = clearedByDocument || clearanceSeenAt != nil
         // Stop the page before reading its store: a load still in flight would
         // keep issuing cookies past the point the attempt gave up.
         DispatchQueue.main.sync {
             self.webView?.stopLoading()
         }
         if cleared {
-            copyCookiesToHTTPStorage(for: url)
+            copyCookieStorageToHTTPStorage()
         } else if let host, let before {
             // Without a snapshot the attempt cannot tell its own cookies from
             // earlier ones, so it leaves the store alone rather than risk
             // deleting a session that still works.
-            discardCookies(addedSince: before, for: url, host: host)
+            discardCookies(addedSince: before, for: target, host: host)
         }
         DispatchQueue.main.sync {
             self.webView = nil
         }
         return cleared
+    }
+
+    private func makeWebView(userAgent: String) {
+        DispatchQueue.main.sync {
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .default()
+            // A zero-sized view may have its timers throttled; a phone-sized
+            // one lays the challenge out the way the protection expects.
+            configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+            configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+            let webView = WKWebView(
+                frame: CGRect(x: 0, y: 0, width: 390, height: 844),
+                configuration: configuration
+            )
+            // The clearance is issued to the identity that passed the check;
+            // the retry sends this exact agent, so the browser presents it.
+            webView.customUserAgent = userAgent
+            self.webView = webView
+        }
     }
 
     // MARK: - WebKit state, read on the main queue
@@ -879,17 +1033,55 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
             let script = """
             (function () {
                 var root = document.documentElement;
-                return [String(location.href), document.readyState, root ? root.outerHTML : ""];
+                var body = document.body;
+                // Text nodes outside script/style/noscript/template. Reading
+                // them from the tree (instead of innerText) also works while
+                // the WebView is off-screen and has not laid the page out.
+                var textLength = 0;
+                var contentChildren = 0;
+                if (body) {
+                    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null);
+                    while (walker.nextNode()) {
+                        var parent = walker.currentNode.parentElement;
+                        var tag = parent ? parent.tagName : "";
+                        if (tag !== "SCRIPT" && tag !== "STYLE" && tag !== "NOSCRIPT" && tag !== "TEMPLATE") {
+                            var text = (walker.currentNode.nodeValue || "").trim();
+                            textLength += text.length;
+                        }
+                    }
+                    for (var i = 0; i < body.children.length; i++) {
+                        var childTag = body.children[i].tagName;
+                        if (childTag !== "SCRIPT" && childTag !== "STYLE" && childTag !== "LINK" && childTag !== "NOSCRIPT" && childTag !== "TEMPLATE") {
+                            contentChildren++;
+                        }
+                    }
+                }
+                return [
+                    String(location.href),
+                    document.readyState,
+                    root ? root.outerHTML : "",
+                    String(textLength),
+                    String(contentChildren)
+                ];
             })()
             """
             webView.evaluateJavaScript(script) { value, _ in
-                if let parts = value as? [Any], parts.count == 3,
+                if let parts = value as? [Any], parts.count == 5,
                    let address = parts[0] as? String,
                    let readyState = parts[1] as? String,
                    let html = parts[2] as? String,
-                   let scheme = URL(string: address)?.scheme?.lowercased(),
+                   let textLength = Int(parts[3] as? String ?? ""),
+                   let childCount = Int(parts[4] as? String ?? ""),
+                   let documentURL = URL(string: address),
+                   let scheme = documentURL.scheme?.lowercased(),
                    scheme == "http" || scheme == "https" {
-                    box.value = DocumentState(readyState: readyState, html: html)
+                    box.value = DocumentState(
+                        url: documentURL,
+                        readyState: readyState,
+                        html: html,
+                        textLength: textLength,
+                        childCount: childCount
+                    )
                 }
                 semaphore.signal()
             }
@@ -898,26 +1090,36 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
         return box.value
     }
 
-    private func hasClearanceCookie(for url: URL) -> Bool {
-        guard let host = url.host?.lowercased() else { return false }
-        // A clearance only counts for the challenged host: a cookie another
-        // site left in the shared store says nothing about this page.
-        return webKitCookies(for: host)?.contains {
-            VMChallengeDetector.isClearanceCookie($0.name)
-        } ?? false
+    /// Name, scope and value identify one clearance across reads. Comparing
+    /// sets means a clearance issued during the attempt is visible even when a
+    /// stale one for the same host could not be removed, and a clearance for a
+    /// redirect target counts the same as one for the requested host.
+    private func clearanceIdentities(in cookies: [HTTPCookie]) -> Set<String> {
+        Set(
+            cookies
+                .filter { VMChallengeDetector.isClearanceCookie($0.name) }
+                .map(Self.identity)
+        )
     }
 
-    /// Copies every cookie that belongs to the loaded host, not only the
-    /// clearance one: the protection's flow can leave several cookies and the
-    /// retry has to look exactly like the browser that passed the check.
-    private func copyCookiesToHTTPStorage(for url: URL) {
-        guard let host = url.host?.lowercased(), let cookies = webKitCookies(for: host) else { return }
-        for cookie in cookies { HTTPCookieStorage.shared.setCookie(cookie) }
+    /// A clearance the attempt earned, not one the browser already held. It
+    /// must belong to a host the attempt actually visited, so a clearance a
+    /// challenge's third-party subresource happens to set cannot fake success.
+    private func hasNewClearance(
+        in cookies: [HTTPCookie],
+        for hosts: Set<String>,
+        since baseline: Set<String>
+    ) -> Bool {
+        cookies.contains { cookie in
+            guard VMChallengeDetector.isClearanceCookie(cookie.name),
+                  !baseline.contains(Self.identity(cookie)) else { return false }
+            return hosts.isEmpty || hosts.contains { Self.cookie(cookie, appliesTo: $0) }
+        }
     }
 
     // MARK: - Cookie store access, on the main queue
 
-    private func webKitCookies(for host: String) -> [HTTPCookie]? {
+    private func allWebKitCookies() -> [HTTPCookie]? {
         let semaphore = DispatchSemaphore(value: 0)
         let box = ValueBox<[HTTPCookie]>()
         DispatchQueue.main.async {
@@ -926,12 +1128,81 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
                 return
             }
             store.getAllCookies { cookies in
-                box.value = cookies.filter { Self.cookie($0, appliesTo: host) }
+                box.value = cookies
                 semaphore.signal()
             }
         }
         guard semaphore.wait(timeout: .now() + Self.replyTimeout) == .success else { return nil }
         return box.value
+    }
+
+    private func webKitCookies(for host: String) -> [HTTPCookie]? {
+        allWebKitCookies()?.filter { Self.cookie($0, appliesTo: host) }
+    }
+
+    /// Drops a Cloudflare clearance the just-challenged request already
+    /// carried. It did not unlock that request, so the browser must earn a new
+    /// one rather than inherit a cookie that is already known not to work.
+    /// DDoS-Guard tokens are left alone: they are also written before the
+    /// browser has proved itself, and the challenge script uses them to reach
+    /// its decision.
+    private func removeClearanceCookies(for url: URL, host: String) {
+        func isRemovable(_ name: String) -> Bool {
+            VMChallengeDetector.clearanceCookieNames.contains(name.lowercased())
+        }
+        for cookie in HTTPCookieStorage.shared.cookies(for: url) ?? []
+        where Self.cookie(cookie, appliesTo: host) && isRemovable(cookie.name) {
+            HTTPCookieStorage.shared.deleteCookie(cookie)
+        }
+        guard let current = webKitCookies(for: host) else { return }
+        let doomed = current.filter { isRemovable($0.name) }
+        guard !doomed.isEmpty else { return }
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            guard let store = self.webView?.configuration.websiteDataStore.httpCookieStore else {
+                semaphore.signal()
+                return
+            }
+            let group = DispatchGroup()
+            for cookie in doomed {
+                group.enter()
+                store.delete(cookie) { group.leave() }
+            }
+            group.notify(queue: .main) { semaphore.signal() }
+        }
+        _ = semaphore.wait(timeout: .now() + Self.replyTimeout)
+    }
+
+    /// Hands the browser the session the source already holds (login cookies,
+    /// preferences), so the challenge page is the one the source would see.
+    private func seedCookies(for url: URL, host: String) {
+        let shared = (HTTPCookieStorage.shared.cookies(for: url) ?? [])
+            .filter { Self.cookie($0, appliesTo: host) }
+        guard !shared.isEmpty else { return }
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            guard let store = self.webView?.configuration.websiteDataStore.httpCookieStore else {
+                semaphore.signal()
+                return
+            }
+            let group = DispatchGroup()
+            for cookie in shared {
+                group.enter()
+                store.setCookie(cookie) { group.leave() }
+            }
+            group.notify(queue: .main) { semaphore.signal() }
+        }
+        _ = semaphore.wait(timeout: .now() + Self.replyTimeout)
+    }
+
+    /// Copies every cookie the attempt's browser holds, not only a clearance
+    /// for the requested host: the protection's flow leaves several cookies,
+    /// and a canonical-host redirect means the clearance can belong to the
+    /// host the browser actually landed on. The retry then looks like the
+    /// browser that passed the check, whichever host issued the cookie.
+    private func copyCookieStorageToHTTPStorage() {
+        guard let cookies = allWebKitCookies() else { return }
+        for cookie in cookies { HTTPCookieStorage.shared.setCookie(cookie) }
     }
 
     private func snapshot(for host: String, url: URL) -> CookieSnapshot? {
@@ -958,8 +1229,12 @@ final class MihonChallengeSolver: NSObject, @unchecked Sendable {
                         semaphore.signal()
                         return
                     }
-                    for cookie in added { store.delete(cookie) }
-                    semaphore.signal()
+                    let group = DispatchGroup()
+                    for cookie in added {
+                        group.enter()
+                        store.delete(cookie) { group.leave() }
+                    }
+                    group.notify(queue: .main) { semaphore.signal() }
                 }
                 _ = semaphore.wait(timeout: .now() + Self.replyTimeout)
             }

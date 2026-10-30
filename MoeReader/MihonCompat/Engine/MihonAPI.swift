@@ -1447,6 +1447,30 @@ enum MihonAPI {
                 guard let payload = runtime.payload(args[1], as: VMChainPayload.self) else { return .null }
                 return try runtime.proceedChain(payload: payload, request: payload.request)
             }
+            // The host client supplies these interceptors, but an extension
+            // that builds its own `NetworkHelper`-shaped client instantiates
+            // one directly. Its work happens in the transport (the user agent
+            // is applied there and a challenge is solved once per response),
+            // so the objects only need the constructors extension bytecode
+            // can call.
+            cls.method("<init>", "()V") { _, _, _ in .zero }
+            if name == "CloudflareInterceptor" {
+                let context = "Landroid/content/Context;"
+                let cookieJar = "Lokhttp3/CookieJar;"
+                let userAgentProvider = "Lkotlin/jvm/functions/Function0;"
+                let scope = "Lkotlinx/coroutines/CoroutineScope;"
+                let defaults = "ILkotlin/jvm/internal/DefaultConstructorMarker;"
+                for signature in [
+                    "(\(context))V",
+                    "(\(context)\(cookieJar))V",
+                    "(\(context)\(cookieJar)\(userAgentProvider))V",
+                    "(\(context)\(cookieJar)\(userAgentProvider)\(defaults))V",
+                    "(\(context)\(cookieJar)\(scope)\(userAgentProvider))V",
+                    "(\(context)\(cookieJar)\(scope)\(userAgentProvider)\(defaults))V",
+                ] {
+                    cls.method("<init>", signature) { _, _, _ in .zero }
+                }
+            }
             result.append(cls)
         }
 

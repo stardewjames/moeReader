@@ -32,6 +32,9 @@ final class MihonChallengeRetryTests: XCTestCase {
         var solveCalls = 0
         var clearOnSolve = true
         var succeeds = false
+        var challengeCode = 403
+        var challengeHeaders: [(String, String)] = [("Server", "cloudflare")]
+        var challengeBody = "<html><body>Just a moment</body></html>"
 
         func performRequest(_ request: VMHTTPRequest) throws -> VMHTTPResponse {
             requests.append(request)
@@ -46,10 +49,10 @@ final class MihonChallengeRetryTests: XCTestCase {
             }
             return VMHTTPResponse(
                 url: request.url,
-                code: 403,
+                code: challengeCode,
                 message: "Forbidden",
-                headers: [("Server", "cloudflare")],
-                body: Data("<html><body>Just a moment</body></html>".utf8)
+                headers: challengeHeaders,
+                body: Data(challengeBody.utf8)
             )
         }
 
@@ -93,10 +96,13 @@ final class MihonChallengeRetryTests: XCTestCase {
         }
     }
 
-    private func makeRequest(_ runtime: VMRuntime) -> VMValue {
-        runtime.makeRequest(
+    private func makeRequest(_ runtime: VMRuntime, headers: [(String, String)] = []) -> VMValue {
+        let value = headers.isEmpty
+            ? VMValue.null
+            : runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(headers))
+        return runtime.makeRequest(
             url: "https://\(Self.hostName)/series/1",
-            headers: .null,
+            headers: value,
             method: "GET",
             body: .null
         )
@@ -141,5 +147,51 @@ final class MihonChallengeRetryTests: XCTestCase {
 
         XCTAssertEqual(host.solveCalls, 0)
         XCTAssertEqual(host.requests.count, 1)
+    }
+
+    func testRetryKeepsTheRequestUserAgent() throws {
+        let host = Host()
+        let runtime = VMRuntime(host: host)
+
+        _ = try runtime.performHttp(
+            request: makeRequest(runtime, headers: [("User-Agent", "SourceBrowser/7.1")])
+        )
+
+        XCTAssertEqual(host.solveCalls, 1)
+        XCTAssertEqual(host.requests.count, 2)
+        for request in host.requests {
+            XCTAssertEqual(
+                request.headers.first { $0.0.caseInsensitiveCompare("User-Agent") == .orderedSame }?.1,
+                "SourceBrowser/7.1",
+                "both the challenged request and the retry present the source's own agent"
+            )
+        }
+    }
+
+    func testMitigatedHeaderAloneDrivesTheRetry() throws {
+        let host = Host()
+        host.challengeCode = 200
+        host.challengeHeaders = [("cf-mitigated", "challenge")]
+        let runtime = VMRuntime(host: host)
+
+        _ = try runtime.performHttp(request: makeRequest(runtime))
+
+        XCTAssertEqual(host.solveCalls, 1)
+        XCTAssertEqual(host.requests.count, 2)
+    }
+
+    func testHardBlockIsNotHandedToTheSolver() throws {
+        let host = Host()
+        host.challengeBody = """
+        <html><head><title>Attention Required! | Cloudflare</title></head>
+        <body><h1>Sorry, you have been blocked</h1><p>Error code: 1020</p></body></html>
+        """
+        let runtime = VMRuntime(host: host)
+
+        let response = try runtime.performHttp(request: makeRequest(runtime))
+
+        XCTAssertEqual(host.solveCalls, 0, "a hard block has no browser check to clear")
+        XCTAssertEqual(host.requests.count, 1)
+        XCTAssertEqual(runtime.payload(response, as: VMResponsePayload.self)?.code, 403)
     }
 }

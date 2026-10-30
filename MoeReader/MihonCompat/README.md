@@ -579,11 +579,16 @@ wording and unspecified reflection ordering must not be mistaken for DEX bugs.
   (space as `+`, UTF-8), `addEncoded` stays verbatim, and `contentLength`,
   `writeTo` and the transport send the same rendered bytes, including for the
   array constructor.
-- `MihonChallengeDetectionTests` covers both protection families (server
-  header, interstitial markup, clearance-cookie names, status codes),
-  `MihonChallengeRetryTests` covers the single retry with a fresh cookie jar,
-  and `MihonChallengeUserAgentTests` pins the solver/retry user-agent match
-  (any header casing, empty or absent header, first repeated value).
+- `MihonChallengeDetectionTests` covers both protection families, Cloudflare's
+  authoritative `cf-mitigated: challenge` header (any status), every
+  interstitial variant the solver recognises, and hard blocks that must not be
+  solved; `MihonChallengeRetryTests` covers the single retry with a fresh
+  cookie jar, the preserved request user agent, and skipping a hard block;
+  `MihonChallengeRequestTests` pins the browser policy (GET keeps its URL,
+  other methods solve the site root, body/cookie headers belong to the
+  browser, request headers are copied, cache is bypassed); and
+  `MihonChallengeUserAgentTests` pins the solver/retry user-agent match (any
+  header casing, empty or absent header, first repeated value).
 - Engine unit tests cover the DEX reader, interpreter arithmetic/control
   flow/exceptions against JVM-produced expected values, the string/collection
   runtime, selector pseudos, and arena recycling.
@@ -661,7 +666,7 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 
 | Gap | Effect |
 |---|---|
-| Browser-check interstitials | Detection matches Cloudflare and DDoS-Guard markers (server header, interstitial markup, clearance-cookie names) on 403/429/503, and the transport retries once: `MihonEngineHost` loads the URL in an off-screen `WKWebView`, waits up to 25 s for a clearance cookie or for a non-interstitial document, copies the host's cookies into `HTTPCookieStorage`, and retries with the rebuilt jar. Detection and the retry bookkeeping are unit-tested; a headless host has no WebKit, so the clearance path itself is exercised only on a device. `CloudflareInterceptor` remains a pass-through. |
+| Browser-check interstitials | Detection trusts Cloudflare's `cf-mitigated: challenge` header on any status, and otherwise requires a Cloudflare/DDoS-Guard status (403/429/503) plus a protection server or interstitial marker. A hard block (Cloudflare error 1020 and the like) is classified but not solved, because no clearance unlocks it. The transport retries once: `MihonEngineHost` solves the check in one shared, serialised off-screen `WKWebView` that presents the request's own user agent and is seeded with the request's cookie jar. A non-GET request is solved on the site root; a clearance issued during the attempt is proof of success; every cookie for the host is copied into `HTTPCookieStorage` before the retry; and a failed attempt removes only the cookies it added. Detection and the retry bookkeeping are unit-tested; a headless host has no WebKit, so the clearance path itself is exercised only on a device. An interactive Turnstile challenge still needs the user: a source call has no UI surface to answer it. `CloudflareInterceptor` remains the transport's pass-through entry point (its constructors exist for extensions that build their own client). |
 | Apple-only frameworks | `android.graphics`/`android.text` pixel work (CoreGraphics/ImageIO/CoreText) and `app.cash.quickjs` (JavaScriptCore) exist only on Apple hosts; `android.webkit.WebView` needs WebKit or a host-supplied `VMWebViewPlatform`. Elsewhere each raises a typed `UnsupportedOperationException` naming the operation, so a source that needs them stops instead of receiving fabricated bytes. |
 | WebView request interception | WKWebView cannot hold a subresource request back, so `shouldInterceptRequest` sees subresources after they loaded and cannot substitute a response; only the main-frame request can be replaced. Page-side challenges a source solves by swapping a frame's content (an interactive captcha) therefore need the user, not the engine. |
 | RxJava-only sources | Extensions whose only fetch entry points are the RxJava `fetch*` overrides are not executed. Request/parse-style lib-1.4/1.5 sources and the suspend API run without RxJava. |

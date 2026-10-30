@@ -2616,35 +2616,87 @@ final class VMFormBodyPayload {
 
 /// Browser-check interstitials (Cloudflare, DDoS-Guard, and pages built the
 /// same way) that a host transport can return instead of the requested page.
-/// The status code alone is never enough: the headers or body must also carry
-/// a marker from the challenge page itself, so an ordinary error response from
-/// the same host is left alone.
+/// A status code alone is never enough except for Cloudflare's own
+/// `cf-mitigated: challenge` header, which the protection defines as the
+/// authoritative marker for every challenge type. Otherwise the response must
+/// also carry a marker from the challenge page itself, so an ordinary error
+/// response from the same host is left alone.
 enum VMChallengeDetector {
     /// Cookies the protections issue for the cleared browser.
     static let clearanceCookieNames: [String] = ["cf_clearance"]
     static let clearanceCookiePrefixes: [String] = ["__ddg1_", "__ddg2_", "__ddg5_"]
 
+    /// Statuses either protection uses for its interstitial.
+    static let challengeStatusCodes: Set<Int> = [403, 429, 503]
+
+    /// `Server` values the two protections send with an interstitial.
+    static let challengeServers: Set<String> = ["cloudflare", "cloudflare-nginx", "ddos-guard"]
+
     /// Markers the interstitial documents embed in their scripts and copy.
+    /// They cover all three Cloudflare challenge types (interstitial,
+    /// managed, non-interactive) as well as older JS-challenge markup and
+    /// DDoS-Guard. Each one is specific to the check page; generic error-page
+    /// words such as "ray id" are deliberately absent.
     static let bodyMarkers: [String] = [
         "cf-chl",
+        "cf_challenge",
+        "cf-please-wait",
+        "cf-spinner-please-wait",
         "cf-browser-verification",
         "_cf_chl_opt",
+        "cf_chl_opt",
+        "__cf_chl_",
         "challenge-platform",
+        "challenge-stage",
         "just a moment",
         "checking your browser before accessing",
+        "checking if the site connection is secure",
+        "verifying you are human",
+        "enable javascript and cookies to continue",
+        "this process is automatic",
         "ddos-guard.net",
     ] + clearanceCookiePrefixes
 
+    /// Text of a hard block (Cloudflare error 1020, for example), which no
+    /// browser can clear by passing a challenge. Solving it would only wait
+    /// out the solver's deadline and fail the retry the same way.
+    static let hardBlockMarkers: [String] = [
+        "error code: 1020",
+        "error code 1020",
+        "you have been blocked",
+        "attention required! | cloudflare",
+    ]
+
     /// Cookie names a protection sets once the browser has passed the check.
+    /// Cookie names are case-sensitive in the jar, but the protections always
+    /// spell these in lower case; comparing case-insensitively costs nothing
+    /// and tolerates an implementation that does not.
     static func isClearanceCookie(_ name: String) -> Bool {
-        clearanceCookieNames.contains(name)
-            || clearanceCookiePrefixes.contains { name.hasPrefix($0) }
+        let lowered = name.lowercased()
+        return clearanceCookieNames.contains(lowered)
+            || clearanceCookiePrefixes.contains { lowered.hasPrefix($0) }
+    }
+
+    static func header(_ name: String, in headers: [(String, String)]) -> String? {
+        headers.first { $0.0.caseInsensitiveCompare(name) == .orderedSame }?.1
     }
 
     static func isChallenge(status: Int, headers: [(String, String)], body: Data) -> Bool {
-        guard status == 403 || status == 429 || status == 503 else { return false }
-        let server = headers.first { $0.0.caseInsensitiveCompare("Server") == .orderedSame }?.1.lowercased() ?? ""
-        if server.contains("cloudflare") || server.contains("ddos-guard") { return true }
+        // Cloudflare sets this header on every challenge type, whatever the
+        // status code and content type. The documented value is `challenge`.
+        if let mitigated = header("cf-mitigated", in: headers)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+           mitigated == "challenge" {
+            return true
+        }
+        guard challengeStatusCodes.contains(status) else { return false }
+        if let server = header("Server", in: headers)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+           challengeServers.contains(server) {
+            return true
+        }
         // A protection can also answer with only its cookie family in the
         // headers, before its script has had a chance to render the page.
         for (name, value) in headers where name.caseInsensitiveCompare("Set-Cookie") == .orderedSame {
@@ -2661,11 +2713,27 @@ enum VMChallengeDetector {
         let lowered = text.lowercased()
         return bodyMarkers.contains { lowered.contains($0) }
     }
+
+    /// A block that a browser cannot clear, so the solver may fail fast.
+    static func textLooksLikeHardBlock(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return hardBlockMarkers.contains { lowered.contains($0) }
+    }
 }
 
 extension VMRuntime {
     static func isChallenge(_ response: VMHTTPResponse) -> Bool {
         VMChallengeDetector.isChallenge(status: response.code, headers: response.headers, body: response.body)
+    }
+
+    /// A challenge a browser can actually clear. A hard block (Cloudflare
+    /// error 1020 and the like) is still classified as the protection's
+    /// response, but no clearance cookie unlocks it, so handing it to the
+    /// solver only burns the deadline.
+    static func isSolvableChallenge(_ response: VMHTTPResponse) -> Bool {
+        guard isChallenge(response) else { return false }
+        let text = String(decoding: response.body.prefix(8192), as: UTF8.self)
+        return !VMChallengeDetector.textLooksLikeHardBlock(text)
     }
 
     /// OkHttp/WHATWG canonicalisation for http(s) URL text that arrives from a
@@ -2778,7 +2846,7 @@ extension VMRuntime {
         do {
             response = try host.performRequest(vmRequest)
             storeResponseCookies(response)
-            if Self.isChallenge(response), try host.solveChallenge(vmRequest) {
+            if Self.isSolvableChallenge(response), try host.solveChallenge(vmRequest) {
                 // Solving writes the freshly issued clearance cookie into the
                 // jar, so the retry has to send the cookie set as it stands
                 // now instead of the one captured before the challenge.
