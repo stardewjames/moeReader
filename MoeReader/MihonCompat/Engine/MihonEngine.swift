@@ -214,7 +214,7 @@ final class MihonEngine: @unchecked Sendable {
         while true {
             let name = index == 1 ? "classes.dex" : "classes\(index).dex"
             guard let data = try? archive.data(for: name), !data.isEmpty else { break }
-            dexFiles.append(try DexFile(data: data, name: name))
+            dexFiles.append(contentsOf: try DexFile.load(data: data, name: name))
             index += 1
         }
         guard !dexFiles.isEmpty else { throw MihonEngineError("no classes.dex") }
@@ -652,7 +652,9 @@ final class MihonEngine: @unchecked Sendable {
         }
         if runtime.payload(request, as: VMRequestPayload.self) == nil {
             let resolved = pagePayload.imageUrl.bits != 0 ? pagePayload.imageUrl : pagePayload.url
-            guard let url = runtime.stringValue(resolved), URL(string: url) != nil else { return nil }
+            guard let rawURL = runtime.stringValue(resolved) else { return nil }
+            let url = VMRuntime.canonicalURLText(rawURL)
+            guard URL(string: url) != nil else { return nil }
             let headers = runtime.callVirtual(source, "getHeaders()Lokhttp3/Headers;", []) ?? .null
             request = runtime.makeRequest(url: url, headers: headers, method: "GET", body: .null)
         }
@@ -665,6 +667,47 @@ final class MihonEngine: @unchecked Sendable {
         let response = try runtime.executeOkHttp(request: request, client: client)
         guard let responsePayload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self) else {
             throw VMJavaException("Ljava/io/IOException;", "image request produced no response")
+        }
+        guard (200..<300).contains(responsePayload.code) else {
+            throw VMJavaException("Ljava/io/IOException;", "HTTP error \(responsePayload.code)")
+        }
+        let finalURL = runtime.payload(responsePayload.request, as: VMRequestPayload.self)?.url
+        return MihonEngineImage(
+            data: responsePayload.body,
+            contentType: responsePayload.contentType,
+            sourceURL: finalURL
+        )
+    }
+
+    // MARK: - Covers
+
+    /// Bytes of one cover through the source's own client, so a source whose
+    /// interceptors serve or rewrite covers (placeholder cover URLs answered
+    /// from an interceptor, CDN rewrites) loads the same covers the reader's
+    /// pages get. The default image loader would bypass those interceptors.
+    func coverImage(sourceIndex: Int, url: String, headers: [String: String]) throws -> MihonEngineImage? {
+        runtime.beginOperation(#function)
+        defer {
+            runtime.endOperation()
+            recycleIfNeeded()
+        }
+        let source = try source(at: sourceIndex)
+        let headerEntries = headers.map { ($0.key, $0.value) }.sorted { $0.0 < $1.0 }
+        let request = runtime.makeRequest(
+            url: VMRuntime.canonicalURLText(url),
+            headers: runtime.makeNative("Lokhttp3/Headers;", payload: VMHeadersPayload(headerEntries)),
+            method: "GET",
+            body: .null
+        )
+        let client: VMValue
+        if let method = runtime.classOf(source)?.lookupVirtual(key: "getClient()Lokhttp3/OkHttpClient;") {
+            client = try runtime.invoke(method, [source])
+        } else {
+            client = runtime.defaultMihonClient()
+        }
+        let response = try runtime.executeOkHttp(request: request, client: client)
+        guard let responsePayload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self) else {
+            throw VMJavaException("Ljava/io/IOException;", "cover request produced no response")
         }
         guard (200..<300).contains(responsePayload.code) else {
             throw VMJavaException("Ljava/io/IOException;", "HTTP error \(responsePayload.code)")
@@ -888,7 +931,7 @@ final class MihonEngine: @unchecked Sendable {
         var manga = MihonManga(
             id: url,
             title: runtime.stringValue(payload.title) ?? "",
-            coverURL: runtime.stringValue(payload.thumbnail).flatMap { URL(string: $0) },
+            coverURL: runtime.stringValue(payload.thumbnail).flatMap { URL(string: VMRuntime.canonicalURLText($0)) },
             description: runtime.stringValue(payload.description),
             author: runtime.stringValue(payload.author),
             artist: runtime.stringValue(payload.artist),

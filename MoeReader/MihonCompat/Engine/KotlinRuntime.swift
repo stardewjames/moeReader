@@ -942,8 +942,9 @@ enum KotlinRuntime {
 
         let mutex = NativeClass(
             "Lkotlinx/coroutines/sync/Mutex;",
-            superclass: "Ljava/lang/Object;",
-            interfaces: []
+            superclass: nil,
+            interfaces: [],
+            access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
         )
         mutex.method("lock", "(Ljava/lang/Object;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             if let payload: VMMutexPayload = runtime.payload(args[0], as: VMMutexPayload.self) {
@@ -971,7 +972,7 @@ enum KotlinRuntime {
         }
         result.append(mutex)
 
-        let mutexImpl = NativeClass("Lkotlinx/coroutines/sync/MutexImpl;", superclass: "Lkotlinx/coroutines/sync/Mutex;")
+        let mutexImpl = NativeClass("Lkotlinx/coroutines/sync/MutexImpl;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/coroutines/sync/Mutex;"])
         result.append(mutexImpl)
 
         let mutexKt = NativeClass("Lkotlinx/coroutines/sync/MutexKt;")
@@ -4133,7 +4134,7 @@ enum KotlinRuntime {
         }
         result.append(regexCompanion)
 
-        let matchResult = NativeClass("Lkotlin/text/MatchResult;", superclass: "Ljava/lang/Object;")
+        let matchResult = NativeClass("Lkotlin/text/MatchResult;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         matchResult.method("getValue", "()Ljava/lang/String;") { runtime, args, _ in
             guard let payload: VMMatchResultPayload = runtime.payload(args[0], as: VMMatchResultPayload.self),
                   let first = payload.groups.first else { return .null }

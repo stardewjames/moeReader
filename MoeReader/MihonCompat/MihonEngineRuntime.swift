@@ -671,6 +671,19 @@ final class MihonEngineRuntime: MihonSourceRuntime, MihonSourcePreferencesProvid
         }
     }
 
+    func coverImage(url: URL, headers: [String: String], source: MihonSource) async throws -> Data {
+        try await perform(source: source) { engine, index in
+            guard let image = try engine.coverImage(
+                sourceIndex: index,
+                url: url.absoluteString,
+                headers: headers
+            ), !image.data.isEmpty else {
+                throw MihonEngineFailure("no cover data for \(url.absoluteString)")
+            }
+            return image.data
+        }
+    }
+
     func preferences(source: MihonSource) async throws -> [MihonSourcePreference] {
         try await perform(source: source) { engine, index in
             try engine.sourcePreferences(sourceIndex: index)

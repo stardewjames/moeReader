@@ -1158,7 +1158,7 @@ enum AndroidRuntime {
         }
         result.append(typeImpl)
 
-        let factory = NativeClass("Luy/kohesive/injekt/api/InjektFactory;", superclass: "Ljava/lang/Object;")
+        let factory = NativeClass("Luy/kohesive/injekt/api/InjektFactory;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         factory.staticField("INSTANCE", "Luy/kohesive/injekt/api/InjektFactory;")
         factory.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Luy/kohesive/injekt/api/InjektFactory;", payload: NSNull())
@@ -1181,7 +1181,7 @@ enum AndroidRuntime {
             runtime.makeNative("Luy/kohesive/injekt/api/InjektScope;", payload: NSNull())
         }
         result.append(injekt)
-        let scope = NativeClass("Luy/kohesive/injekt/api/InjektScope;", superclass: "Ljava/lang/Object;")
+        let scope = NativeClass("Luy/kohesive/injekt/api/InjektScope;", superclass: "Ljava/lang/Object;", interfaces: ["Luy/kohesive/injekt/api/InjektFactory;"])
         scope.method("getInstance", "(Ljava/lang/reflect/Type;)Ljava/lang/Object;") { runtime, args, _ in
             let name = runtime.payload(args[1], as: VMTypePayload.self)?.name ?? ""
             if name.contains("kotlinx.serialization.json.Json") {

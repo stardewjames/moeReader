@@ -193,7 +193,11 @@ struct MihonMangaView: View {
                     url: manga.coverURL,
                     headers: manga.coverHeaders,
                     maxPixelSize: 360,
-                    contentMode: .fill
+                    contentMode: .fill,
+                    sourceFetch: manga.coverURL.map { url -> (@Sendable () async throws -> Data) in
+                        let headers = manga.coverHeaders
+                        return { try await runtime.coverImage(url: url, headers: headers, source: source) }
+                    }
                 )
                 .frame(width: 116, height: 172)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))

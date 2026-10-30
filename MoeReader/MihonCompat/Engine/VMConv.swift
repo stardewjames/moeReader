@@ -17,6 +17,30 @@ final class VMJavaStringBuilder {
     var units: [UInt16] = []
 }
 
+final class VMStringLinesStream {
+    let units: [UInt16]
+    var consumed = false
+    init(units: [UInt16]) { self.units = units }
+
+    func count() throws -> Int64 {
+        guard !consumed else { throw VMJavaException("Ljava/lang/IllegalStateException;", "stream has already been operated upon or closed") }
+        consumed = true
+        var result: Int64 = 0
+        var index = 0
+        var start = 0
+        while index < units.count {
+            if units[index] == 0x0A || units[index] == 0x0D {
+                result += 1
+                if units[index] == 0x0D, index + 1 < units.count, units[index + 1] == 0x0A { index += 1 }
+                start = index + 1
+            }
+            index += 1
+        }
+        if start < units.count { result += 1 }
+        return result
+    }
+}
+
 final class VMCharset {
     let name: String
     init(name: String) { self.name = name }
@@ -182,13 +206,12 @@ extension VMRuntime {
 
     func indexOf(_ haystack: VMValue, needle: VMValue, from: Int, last: Bool) -> Int32 {
         guard let haystackUnits = stringUnits(haystack), let needleUnits = stringUnits(needle) else { return -1 }
-        guard !needleUnits.isEmpty, needleUnits.count <= haystackUnits.count else {
-            return needleUnits.isEmpty ? Int32(max(0, min(from, haystackUnits.count))) : -1
-        }
+        if needleUnits.isEmpty { return Int32(last ? max(-1, min(from, haystackUnits.count)) : max(0, min(from, haystackUnits.count))) }
+        guard needleUnits.count <= haystackUnits.count else { return -1 }
         if last {
-            var index = haystackUnits.count - needleUnits.count
+            var index = min(from, haystackUnits.count - needleUnits.count)
             while index >= 0 {
-                if Array(haystackUnits[index..<index + needleUnits.count]) == needleUnits { return Int32(index) }
+                if haystackUnits[index..<index + needleUnits.count].elementsEqual(needleUnits) { return Int32(index) }
                 index -= 1
             }
             return -1
@@ -196,10 +219,43 @@ extension VMRuntime {
         let start = max(0, from)
         var index = start
         while index + needleUnits.count <= haystackUnits.count {
-            if Array(haystackUnits[index..<index + needleUnits.count]) == needleUnits { return Int32(index) }
+            if haystackUnits[index..<index + needleUnits.count].elementsEqual(needleUnits) { return Int32(index) }
             index += 1
         }
         return -1
+    }
+
+    func charSequenceUnits(_ value: VMValue) throws -> [UInt16] {
+        guard value.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        if let units = stringUnits(value) { return units }
+        if let builder = payload(value, as: VMJavaStringBuilder.self) { return builder.units }
+        guard let cls = classOf(value),
+              let length = cls.lookupVirtual(key: "length()I"),
+              let charAt = cls.lookupVirtual(key: "charAt(I)C") else {
+            throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+        }
+        let count = Int(try invoke(length, [value]).asInt32)
+        var units: [UInt16] = []
+        units.reserveCapacity(count)
+        for index in 0..<count {
+            units.append(UInt16(truncatingIfNeeded: try invoke(charAt, [value, .int32(Int32(index))]).asInt32))
+        }
+        return units
+    }
+
+    func charArrayUnits(_ value: VMValue, offset: Int = 0, count: Int? = nil) throws -> [UInt16] {
+        guard value.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        let total = arrayLength(value)
+        let count = count ?? total
+        guard offset >= 0, count >= 0, offset <= total - count else {
+            throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;")
+        }
+        var units: [UInt16] = []
+        units.reserveCapacity(count)
+        for index in offset..<(offset + count) {
+            units.append(UInt16(truncatingIfNeeded: arrayElement(value, index).asInt32))
+        }
+        return units
     }
 
     func mutatingString(_ value: VMValue) -> VMJavaStringBuilder {
@@ -216,7 +272,8 @@ extension VMRuntime {
         let builder = mutatingString(receiver)
         switch kind {
         case "string", "sequence":
-            builder.units.append(contentsOf: stringUnits(value) ?? [])
+            let units = stringUnits(value) ?? payload(value, as: VMJavaStringBuilder.self)?.units
+            builder.units.append(contentsOf: value.bits == 0 ? Array("null".utf16) : (units ?? stringUnits(javaToString(value)) ?? []))
         case "object":
             builder.units.append(contentsOf: stringUnits(javaToString(value)) ?? [])
         case "int":
@@ -243,102 +300,189 @@ extension VMRuntime {
         }
     }
 
-    func insertString(_ receiver: VMValue, at index: Int, text: String) {
-        let builder = mutatingString(receiver)
-        let clamped = max(0, min(index, builder.units.count))
-        builder.units.insert(contentsOf: Array(text.utf16), at: clamped)
+    func stringConversionUnits(_ value: VMValue, kind: String) throws -> [UInt16] {
+        switch kind {
+        case "string", "sequence":
+            return value.bits == 0 ? Array("null".utf16) : try charSequenceUnits(value)
+        case "object": return stringUnits(javaToString(value)) ?? []
+        case "chars": return try charArrayUnits(value)
+        case "char": return [UInt16(truncatingIfNeeded: value.asInt32)]
+        case "bool": return Array((value.asBoolean ? "true" : "false").utf16)
+        case "int": return Array(String(value.asInt32).utf16)
+        case "long": return Array(String(value.asInt64).utf16)
+        case "float": return Array(String(value.asFloat).utf16)
+        case "double": return Array(String(value.asDouble).utf16)
+        default: return []
+        }
     }
 
-    func format(template: VMValue, arguments: VMValue) -> VMValue {
-        guard let text = stringValue(template) else { return .null }
-        var output = ""
-        var argumentIndex = 0
-        let argumentCount = arguments.bits == 0 ? 0 : Int(VMObjectLayout.aux(arguments.object!))
-        var pending = Array(text)
+    func insertString(_ receiver: VMValue, at index: Int, units: [UInt16]) throws {
+        let builder = mutatingString(receiver)
+        guard index >= 0, index <= builder.units.count else {
+            throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;")
+        }
+        builder.units.insert(contentsOf: units, at: index)
+    }
+
+    func reverseString(_ receiver: VMValue) {
+        let builder = mutatingString(receiver)
+        builder.units.reverse()
         var index = 0
-        while index < pending.count {
-            let character = pending[index]
-            if character != "%" {
-                output.append(character)
+        while index + 1 < builder.units.count {
+            if (0xDC00...0xDFFF).contains(builder.units[index]),
+               (0xD800...0xDBFF).contains(builder.units[index + 1]) {
+                builder.units.swapAt(index, index + 1)
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+    }
+
+    func format(template: VMValue, arguments: VMValue) throws -> VMValue {
+        guard let text = stringUnits(template) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        var output: [UInt16] = []
+        var argumentIndex = 0
+        var previousIndex = -1
+        let argumentCount = arguments.bits == 0 ? 0 : arrayLength(arguments)
+        var index = 0
+        while index < text.count {
+            if text[index] != 0x25 {
+                output.append(text[index])
                 index += 1
                 continue
             }
             index += 1
-            guard index < pending.count else { break }
-            // Flags and width.
-            var flags = ""
-            while index < pending.count, "-+ 0,#".contains(pending[index]) {
-                flags.append(pending[index])
+            let digitStart = index
+            while index < text.count, (0x30...0x39).contains(text[index]) { index += 1 }
+            var explicitIndex: Int?
+            if index < text.count, text[index] == 0x24 {
+                explicitIndex = (Int(String(decoding: text[digitStart..<index], as: UTF16.self)) ?? 1) - 1
                 index += 1
-            }
-            var width = ""
-            while index < pending.count, pending[index].isNumber {
-                width.append(pending[index])
-                index += 1
-            }
-            var precision = ""
-            if index < pending.count, pending[index] == "." {
-                index += 1
-                while index < pending.count, pending[index].isNumber {
-                    precision.append(pending[index])
-                    index += 1
-                }
-            }
-            guard index < pending.count else { break }
-            let specifier = pending[index]
-            index += 1
-            let value: VMValue
-            if argumentIndex < argumentCount, arguments.bits != 0, let array = arguments.object {
-                value = VMObjectLayout.slot(array, argumentIndex).pointee
             } else {
-                value = .null
+                index = digitStart
             }
-            argumentIndex += 1
+            var flags = ""
+            while index < text.count, let scalar = UnicodeScalar(text[index]), "-+ 0,#(<".unicodeScalars.contains(scalar) {
+                flags.unicodeScalars.append(scalar)
+                index += 1
+            }
+            let widthStart = index
+            while index < text.count, (0x30...0x39).contains(text[index]) { index += 1 }
+            let width = String(decoding: text[widthStart..<index], as: UTF16.self)
+            var precision = ""
+            if index < text.count, text[index] == 0x2E {
+                index += 1
+                let start = index
+                while index < text.count, (0x30...0x39).contains(text[index]) { index += 1 }
+                precision = String(decoding: text[start..<index], as: UTF16.self)
+            }
+            guard index < text.count else { throw VMJavaException("Ljava/util/UnknownFormatConversionException;") }
+            let specifier = text[index]
+            index += 1
+            if !precision.isEmpty, [0x64, 0x78, 0x58, 0x6F, 0x63, 0x43, 0x25, 0x6E].contains(specifier) {
+                throw VMJavaException("Ljava/util/IllegalFormatPrecisionException;", precision)
+            }
+            let consumesArgument = specifier != 0x25 && specifier != 0x6E
+            let selectedIndex: Int
+            if flags.contains("<") {
+                selectedIndex = previousIndex
+            } else if let explicitIndex {
+                selectedIndex = explicitIndex
+            } else {
+                selectedIndex = argumentIndex
+                if consumesArgument { argumentIndex += 1 }
+            }
+            if consumesArgument, selectedIndex < 0 || (arguments.bits != 0 && selectedIndex >= argumentCount) {
+                throw VMJavaException("Ljava/util/MissingFormatArgumentException;")
+            }
+            if consumesArgument { previousIndex = selectedIndex }
+            let value = selectedIndex >= 0 && selectedIndex < argumentCount ? arrayElement(arguments, selectedIndex) : .null
             var rendered: String
             switch specifier {
-            case "s", "S":
-                rendered = stringValue(value) ?? stringValue(javaToString(value)) ?? "null"
-            case "d":
-                rendered = String(formatInteger(value))
-                if let widthValue = Int(width), rendered.count < widthValue {
-                    let pad = String(repeating: flags.contains("0") ? "0" : " ", count: widthValue - rendered.count)
-                    rendered = flags.contains("-") ? rendered + pad : pad + rendered
+            case 0x73, 0x53:
+                var units = stringUnits(javaToString(value)) ?? Array("null".utf16)
+                if let limit = Int(precision), units.count > limit { units.removeSubrange(limit...) }
+                if specifier == 0x53 { units = Array(String(decoding: units, as: UTF16.self).uppercased().utf16) }
+                appendFormatted(units, width: Int(width) ?? 0, left: flags.contains("-"), to: &output)
+                continue
+            case 0x64:
+                rendered = formatDecimal(value, flags: flags, width: Int(width) ?? 0)
+            case 0x78, 0x58, 0x6F:
+                rendered = value.bits == 0 ? "null" : formatRadix(value, radix: specifier == 0x6F ? 8 : 16, uppercase: specifier == 0x58, flags: flags, width: width)
+            case 0x66, 0x65, 0x45:
+                if value.bits == 0 {
+                    rendered = "null"
+                } else {
+                    let conversion = specifier == 0x66 ? "f" : (specifier == 0x45 ? "E" : "e")
+                    let floatFlags = String(flags.filter { "-+ 0#".contains($0) })
+                    rendered = String(format: "%\(floatFlags)\(width).\(Int(precision) ?? 6)\(conversion)", locale: Locale(identifier: "en_US_POSIX"), formatDouble(value))
                 }
-            case "x", "X":
-                rendered = formatHex(value, uppercase: specifier == "X", flags: flags, width: width, precision: precision)
-            case "f":
-                let digits = Int(precision) ?? 6
-                rendered = String(format: "%.\(digits)f", formatDouble(value))
-            case "e":
-                rendered = String(format: "%.6e", formatDouble(value))
-            case "b":
+            case 0x62, 0x42:
                 rendered = formatBoolean(value) ? "true" : "false"
-            case "c":
-                rendered = String(UnicodeScalar(UInt32(truncatingIfNeeded: formatInteger(value))) ?? " ")
-            case "%":
-                rendered = "%"
-            default:
-                rendered = String(specifier)
+                if specifier == 0x42 { rendered = rendered.uppercased() }
+            case 0x63, 0x43:
+                if value.bits == 0 {
+                    rendered = "null"
+                } else {
+                    let codePoint = formatInteger(value)
+                    var units: [UInt16]
+                    if codePoint >= 0, codePoint <= 0xFFFF {
+                        units = [UInt16(codePoint)]
+                    } else if codePoint >= 0x10000, let scalar = UnicodeScalar(UInt32(truncatingIfNeeded: codePoint)) {
+                        units = Array(String(scalar).utf16)
+                    } else {
+                        throw VMJavaException("Ljava/util/IllegalFormatCodePointException;", "\(codePoint)")
+                    }
+                    if specifier == 0x43 { units = Array(String(decoding: units, as: UTF16.self).uppercased().utf16) }
+                    appendFormatted(units, width: Int(width) ?? 0, left: flags.contains("-"), to: &output)
+                    continue
+                }
+            case 0x25: rendered = "%"
+            case 0x6E: rendered = "\n"
+            default: throw VMJavaException("Ljava/util/UnknownFormatConversionException;", String(UnicodeScalar(specifier) ?? " "))
             }
-            if specifier == "s", let widthValue = Int(width), rendered.count < widthValue {
-                let pad = String(repeating: " ", count: widthValue - rendered.count)
-                rendered = flags.contains("-") ? rendered + pad : pad + rendered
-            }
-            output += rendered
+            appendFormatted(Array(rendered.utf16), width: Int(width) ?? 0, left: flags.contains("-"), to: &output)
         }
-        return newString(output)
+        return newString(units: output)
     }
 
-    /// Java's `%x`/`%X` treat a boxed `Byte`/`Short`/`Integer` as unsigned at
-    /// that width (8/16/32 bits), unlike `%d`, which sign-extends. Precision is
-    /// a minimum digit count, `#` adds the radix prefix, and width pads after
-    /// the prefix when the zero flag is set.
-    private func formatHex(
+    private func appendFormatted(_ units: [UInt16], width: Int, left: Bool, to output: inout [UInt16]) {
+        let padding = max(0, width - units.count)
+        if !left { output.append(contentsOf: repeatElement(0x20, count: padding)) }
+        output.append(contentsOf: units)
+        if left { output.append(contentsOf: repeatElement(0x20, count: padding)) }
+    }
+
+    private func formatDecimal(_ value: VMValue, flags: String, width: Int) -> String {
+        guard value.bits != 0 else { return "null" }
+        let number = formatInteger(value)
+        var digits = String(number.magnitude)
+        if flags.contains(",") {
+            var grouped = ""
+            for (index, digit) in digits.enumerated() {
+                if index > 0, (digits.count - index) % 3 == 0 { grouped.append(",") }
+                grouped.append(digit)
+            }
+            digits = grouped
+        }
+        let parentheses = number < 0 && flags.contains("(")
+        let prefix = number < 0 ? (parentheses ? "(" : "-") : (flags.contains("+") ? "+" : (flags.contains(" ") ? " " : ""))
+        let suffix = parentheses ? ")" : ""
+        if flags.contains("0"), !flags.contains("-") {
+            digits = String(repeating: "0", count: max(0, width - prefix.count - digits.count - suffix.count)) + digits
+        }
+        return prefix + digits + suffix
+    }
+
+    /// Java's radix conversions retain the boxed integer width. Alternate
+    /// form prefixes precede zero padding; integer precision is invalid.
+    private func formatRadix(
         _ value: VMValue,
+        radix: Int,
         uppercase: Bool,
         flags: String,
-        width: String,
-        precision: String
+        width: String
     ) -> String {
         var bits: UInt64
         if let pointer = value.object, let cls = classOf(value) {
@@ -357,17 +501,14 @@ extension VMRuntime {
         } else {
             bits = UInt64(bitPattern: formatInteger(value))
         }
-        var digits = String(bits, radix: 16, uppercase: uppercase)
-        if let precisionValue = Int(precision), digits.count < precisionValue {
-            digits = String(repeating: "0", count: precisionValue - digits.count) + digits
-        }
-        let prefix = flags.contains("#") && bits != 0 ? (uppercase ? "0X" : "0x") : ""
+        let digits = String(bits, radix: radix, uppercase: uppercase)
+        let prefix = flags.contains("#") ? (radix == 8 ? "0" : (uppercase ? "0X" : "0x")) : ""
         var rendered = prefix + digits
         if let widthValue = Int(width), rendered.count < widthValue {
             let padCount = widthValue - rendered.count
             if flags.contains("-") {
                 rendered += String(repeating: " ", count: padCount)
-            } else if flags.contains("0"), Int(precision) == nil {
+            } else if flags.contains("0") {
                 rendered = prefix + String(repeating: "0", count: padCount) + digits
             } else {
                 rendered = String(repeating: " ", count: padCount) + rendered
@@ -383,6 +524,8 @@ extension VMRuntime {
             return Int64(VMObjectLayout.slot(pointer, 0).pointee.asInt32)
         case "Ljava/lang/Long;":
             return VMObjectLayout.slot(pointer, 0).pointee.asInt64
+        case "Ljava/lang/Character;":
+            return Int64(value.asBoxedChar(self))
         default:
             return value.asInt64
         }
@@ -392,24 +535,35 @@ extension VMRuntime {
         guard let pointer = value.object, let cls = classOf(value) else { return value.asDouble }
         switch cls.descriptor {
         case "Ljava/lang/Double;":
-            return Double(bitPattern: VMObjectLayout.aux(pointer))
+            return value.asBoxedDouble(self)
         case "Ljava/lang/Float;":
-            return Double(Float(bitPattern: UInt32(truncatingIfNeeded: VMObjectLayout.aux(pointer))))
+            return Double(value.asBoxedFloat(self))
         default:
             return value.asDouble
         }
     }
 
     private func formatBoolean(_ value: VMValue) -> Bool {
-        guard let pointer = value.object, let cls = classOf(value) else { return value.asBoolean }
-        if cls.descriptor == "Ljava/lang/Boolean;" { return VMObjectLayout.aux(pointer) != 0 }
-        return value.asBoolean
+        guard value.bits != 0 else { return false }
+        if classOf(value)?.descriptor == "Ljava/lang/Boolean;" { return value.asBoxedBoolean(self) }
+        return true
     }
 
-    func join(separator: VMValue, elements: VMValue) -> VMValue {
-        let separatorText = stringValue(separator) ?? ""
-        guard let iterator = iterableValues(elements) else { return newString("") }
-        return newString(iterator.map { stringValue(javaToString($0)) ?? "" }.joined(separator: separatorText))
+    func join(separator: VMValue, elements: VMValue) throws -> VMValue {
+        let separatorUnits = try charSequenceUnits(separator)
+        guard elements.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        let values: [VMValue]
+        if classOf(elements)?.descriptor.hasPrefix("[") == true {
+            values = (0..<arrayLength(elements)).map { arrayElement(elements, $0) }
+        } else {
+            values = iterableValues(elements) ?? []
+        }
+        var units: [UInt16] = []
+        for (index, value) in values.enumerated() {
+            if index != 0 { units.append(contentsOf: separatorUnits) }
+            units.append(contentsOf: value.bits == 0 ? Array("null".utf16) : try charSequenceUnits(value))
+        }
+        return newString(units: units)
     }
 
     func iterableValues(_ value: VMValue) -> [VMValue]? {
@@ -442,6 +596,23 @@ extension VMRuntime {
     func decode(bytes: [UInt8], charset: String) -> String {
         switch charset.uppercased() {
         case "UTF-8", "UTF8": return String(decoding: bytes, as: UTF8.self)
+        case "UTF-16", "UTF16", "UTF-16BE", "UTF-16LE":
+            var littleEndian = charset.uppercased() == "UTF-16LE"
+            var index = 0
+            if charset.uppercased() == "UTF-16" || charset.uppercased() == "UTF16", bytes.count >= 2 {
+                if bytes[0] == 0xFE, bytes[1] == 0xFF { index = 2 }
+                else if bytes[0] == 0xFF, bytes[1] == 0xFE { littleEndian = true; index = 2 }
+            }
+            var units: [UInt16] = []
+            units.reserveCapacity((bytes.count - index + 1) / 2)
+            while index + 1 < bytes.count {
+                units.append(littleEndian
+                    ? UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+                    : (UInt16(bytes[index]) << 8) | UInt16(bytes[index + 1]))
+                index += 2
+            }
+            if index < bytes.count { units.append(0xFFFD) }
+            return String(decoding: units, as: UTF16.self)
         case "US-ASCII", "ASCII":
             return String(decoding: bytes.map { UInt16($0 < 0x80 ? UInt16($0) : 0xFFFD) }, as: UTF16.self)
         case "ISO-8859-1", "ISO8859-1", "LATIN1":
@@ -451,12 +622,60 @@ extension VMRuntime {
     }
 
     func encode(_ value: String, charset: String) -> [UInt8] {
-        switch charset.uppercased() {
-        case "UTF-8", "UTF8": return Array(value.utf8)
-        case "US-ASCII", "ASCII": return value.unicodeScalars.compactMap { $0.value < 128 ? UInt8($0.value) : UInt8(ascii: "?") }
-        case "ISO-8859-1", "ISO8859-1", "LATIN1": return value.unicodeScalars.compactMap { $0.value < 256 ? UInt8($0.value) : UInt8(ascii: "?") }
-        default: return Array(value.utf8)
+        encode(units: Array(value.utf16), charset: charset)
+    }
+
+    func encode(units: [UInt16], charset: String) -> [UInt8] {
+        let name = charset.uppercased()
+        let utf16 = name == "UTF-16" || name == "UTF16" || name == "UTF-16BE" || name == "UTF-16LE"
+        let littleEndian = name == "UTF-16LE"
+        let singleByteLimit: UInt32? = ["US-ASCII", "ASCII"].contains(name) ? 0x7F
+            : (["ISO-8859-1", "ISO8859-1", "LATIN1"].contains(name) ? 0xFF : nil)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(units.count * (utf16 ? 2 : 1))
+        if !units.isEmpty, name == "UTF-16" || name == "UTF16" { bytes.append(contentsOf: [0xFE, 0xFF]) }
+        func appendUnit(_ unit: UInt16) {
+            bytes.append(UInt8(truncatingIfNeeded: littleEndian ? unit : unit >> 8))
+            bytes.append(UInt8(truncatingIfNeeded: littleEndian ? unit >> 8 : unit))
         }
+        var index = 0
+        while index < units.count {
+            let first = units[index]
+            var codePoint = UInt32(first)
+            var paired = false
+            var malformed = false
+            if (0xD800...0xDBFF).contains(first), index + 1 < units.count,
+               (0xDC00...0xDFFF).contains(units[index + 1]) {
+                codePoint = 0x10000 + ((UInt32(first) - 0xD800) << 10) + UInt32(units[index + 1]) - 0xDC00
+                paired = true
+            } else if (0xD800...0xDFFF).contains(first) {
+                malformed = true
+            }
+            if utf16 {
+                appendUnit(malformed ? 0xFFFD : first)
+                if paired { appendUnit(units[index + 1]) }
+            } else if let limit = singleByteLimit {
+                bytes.append(!malformed && codePoint <= limit ? UInt8(codePoint) : 0x3F)
+            } else if malformed {
+                bytes.append(0x3F)
+            } else if codePoint < 0x80 {
+                bytes.append(UInt8(codePoint))
+            } else if codePoint < 0x800 {
+                bytes.append(UInt8(0xC0 | (codePoint >> 6)))
+                bytes.append(UInt8(0x80 | (codePoint & 0x3F)))
+            } else if codePoint < 0x10000 {
+                bytes.append(UInt8(0xE0 | (codePoint >> 12)))
+                bytes.append(UInt8(0x80 | ((codePoint >> 6) & 0x3F)))
+                bytes.append(UInt8(0x80 | (codePoint & 0x3F)))
+            } else {
+                bytes.append(UInt8(0xF0 | (codePoint >> 18)))
+                bytes.append(UInt8(0x80 | ((codePoint >> 12) & 0x3F)))
+                bytes.append(UInt8(0x80 | ((codePoint >> 6) & 0x3F)))
+                bytes.append(UInt8(0x80 | (codePoint & 0x3F)))
+            }
+            index += paired ? 2 : 1
+        }
+        return bytes
     }
 
     // MARK: - Regular expressions
@@ -470,6 +689,11 @@ extension VMRuntime {
     func regexReplace(_ text: String, pattern: String, replacement: String, firstOnly: Bool = false) -> String {
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        if firstOnly {
+            guard let match = expression.firstMatch(in: text, range: range) else { return text }
+            let rendered = expression.replacementString(for: match, in: text, offset: 0, template: replacement)
+            return (text as NSString).replacingCharacters(in: match.range, with: rendered)
+        }
         return expression.stringByReplacingMatches(
             in: text,
             options: [],
@@ -479,19 +703,19 @@ extension VMRuntime {
     }
 
     func javaSplit(_ text: String, pattern: String, limit: Int) -> [String] {
-        if pattern.isEmpty {
-            return text.map(String.init)
-        }
+        if text.isEmpty { return [""] }
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return [text] }
         let nsText = text as NSString
         let matches = expression.matches(in: text, range: NSRange(location: 0, length: nsText.length))
         var parts: [String] = []
         var cursor = 0
         for match in matches {
+            if match.range.location == 0, match.range.length == 0 { continue }
             if limit > 0, parts.count == limit - 1 { break }
             parts.append(nsText.substring(with: NSRange(location: cursor, length: match.range.location - cursor)))
             cursor = match.range.location + match.range.length
         }
+        if cursor == 0, parts.isEmpty { return [text] }
         parts.append(nsText.substring(from: cursor))
         if limit == 0 {
             while let last = parts.last, last.isEmpty { parts.removeLast() }
@@ -587,7 +811,7 @@ enum JavaShared {
             }
         }
         cls.method("printf", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;") { runtime, args, _ in
-            let text = runtime.format(template: args[1], arguments: args[2])
+            let text = try runtime.format(template: args[1], arguments: args[2])
             if let stream = runtime.payload(args[0], as: VMPrintStream.self) { stream.write(runtime.stringValue(text) ?? "") }
             return args[0]
         }
@@ -653,11 +877,8 @@ enum JavaShared {
 
     private static func standardCharsetsClass() -> NativeClass {
         let cls = NativeClass("Ljava/nio/charset/StandardCharsets;", superclass: "Ljava/lang/Object;")
-        let names = ["UTF_8", "UTF_16", "US_ASCII", "ISO_8859_1"]
-        for (index, name) in names.enumerated() {
-            cls.staticField(name, "Ljava/nio/charset/Charset;")
-            _ = index
-        }
+        let names = ["UTF_8", "UTF_16", "UTF_16BE", "UTF_16LE", "US_ASCII", "ISO_8859_1"]
+        for name in names { cls.staticField(name, "Ljava/nio/charset/Charset;") }
         cls.prepare = { runtime, cls in
             for (index, name) in names.enumerated() {
                 let value = runtime.makeNative("Ljava/nio/charset/Charset;", payload: VMCharset(name: name.replacingOccurrences(of: "_", with: "-")))
@@ -824,12 +1045,14 @@ extension VMRuntime {
         let descriptor = VMObjectLayout.cls(pointer).arrayComponent ?? "Ljava/lang/Object;"
         for index in 0..<count {
             let element = VMObjectLayout.slot(pointer, index).pointee
-            if DexDescriptor.isReference(descriptor) {
-                parts.append(stringValue(javaToString(element)) ?? "null")
-            } else if descriptor == "C" {
-                parts.append(String(UnicodeScalar(UInt32(truncatingIfNeeded: element.asInt32)) ?? " "))
-            } else {
-                parts.append(String(element.asInt64))
+            // Cells hold canonical values: an `int` (and narrower) element is a
+            // zero-extended 32-bit pattern, so it is read back as `Int32`.
+            switch descriptor {
+            case "C": parts.append(String(decoding: [UInt16(truncatingIfNeeded: element.asInt32)], as: UTF16.self))
+            case "Z": parts.append(element.asInt32 != 0 ? "true" : "false")
+            case "J": parts.append(String(element.asInt64))
+            case "B", "S", "I": parts.append(String(element.asInt32))
+            default: parts.append(stringValue(javaToString(element)) ?? "null")
             }
         }
         return newString("[" + parts.joined(separator: ", ") + "]")
@@ -892,17 +1115,8 @@ extension VMRuntime {
 
     func sortList(_ listValue: VMValue, comparator: VMValue) throws {
         let list = try mutableList(listValue)
-        let compareMethod = comparator.bits == 0
-            ? nil
-            : classOf(comparator)?.lookupVirtual(key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I")
-        let local = self
-        if let compareMethod {
-            try list.items.sort { left, right in
-                let result = (try? local.invoke(compareMethod, [comparator, left, right]))?.asInt32 ?? 0
-                return result < 0
-            }
-        } else {
-            list.items.sort { local.naturalCompare($0, $1) < 0 }
+        try list.items.sort { left, right in
+            try JavaUtil.compareValues(self, left, right, comparator: comparator) < 0
         }
     }
 
@@ -910,17 +1124,9 @@ extension VMRuntime {
         guard let items = listItems(collection), !items.isEmpty else {
             throw VMJavaException("Ljava/util/NoSuchElementException;")
         }
-        let compareMethod = comparator.bits == 0
-            ? nil
-            : classOf(comparator)?.lookupVirtual(key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I")
         var best = items[0]
         for item in items.dropFirst() {
-            let result: Int32
-            if let compareMethod {
-                result = (try? invoke(compareMethod, [comparator, item, best]))?.asInt32 ?? 0
-            } else {
-                result = naturalCompare(item, best)
-            }
+            let result = try JavaUtil.compareValues(self, item, best, comparator: comparator)
             if maximum ? result > 0 : result < 0 { best = item }
         }
         return best

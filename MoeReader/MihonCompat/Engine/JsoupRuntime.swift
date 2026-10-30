@@ -363,6 +363,9 @@ enum JsoupHTML {
         // insertion mode), so `head meta[...]` selectors resolve.
         var inHead = true
         let headContentTags: Set<String> = ["base", "basefont", "bgsound", "link", "meta", "title", "style", "script", "noscript", "template"]
+        // jsoup adopts the first `<base href>` of the document as its base URI for `abs:` resolution.
+        var documentBaseUri = baseUri
+        var baseUriFromDocument = false
 
         func current() -> JNode { stack.last ?? body }
         func appendText(_ text: String) {
@@ -447,6 +450,14 @@ enum JsoupHTML {
                     parent = current()
                 }
                 let element = JNode(kind: .element, tag: tag, attributes: tokenizer.attributes)
+                if tag == "base", !baseUriFromDocument,
+                   let href = tokenizer.attributes.first(where: { $0.0.lowercased() == "href" })?.1 {
+                    let resolved = absoluteUrl(href, base: documentBaseUri)
+                    if !resolved.isEmpty {
+                        documentBaseUri = resolved
+                        baseUriFromDocument = true
+                    }
+                }
                 element.parent = parent
                 parent.children.append(element)
 
@@ -502,7 +513,7 @@ enum JsoupHTML {
             body.children = flattened
         }
 
-        return JDocumentPayload(root: documentNode, baseUri: baseUri)
+        return JDocumentPayload(root: documentNode, baseUri: documentBaseUri)
     }
 
     /// Finds the `>` that closes a tag, skipping `>` inside quoted attribute

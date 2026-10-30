@@ -1101,7 +1101,7 @@ enum FileRuntime {
         }
         result.append(unsafeCursor)
 
-        let bufferedSource = NativeClass("Lokio/BufferedSource;", superclass: "Ljava/lang/Object;", interfaces: ["Lokio/Source;", "Ljava/io/Closeable;"])
+        let bufferedSource = NativeClass("Lokio/BufferedSource;", superclass: nil, interfaces: ["Lokio/Source;", "Ljava/io/Closeable;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         bufferedSource.method("readUtf8", "()Ljava/lang/String;") { runtime, args, _ in
             guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .null }
             let text = String(decoding: source.consume(source.data.count - source.offset), as: UTF8.self)

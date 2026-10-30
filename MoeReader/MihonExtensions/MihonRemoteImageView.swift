@@ -19,7 +19,8 @@ actor MihonRemoteImageLoader {
     func image(
         for url: URL,
         headers: [String: String],
-        maxPixelSize: Int
+        maxPixelSize: Int,
+        sourceFetch: (@Sendable () async throws -> Data)? = nil
     ) async throws -> DecodedImage {
         let headerKey = headers.keys.sorted().map { "\($0)=\(headers[$0] ?? "")" }.joined(separator: "&")
         let key = url.absoluteString + "#\(maxPixelSize)#\(headerKey)"
@@ -31,14 +32,22 @@ actor MihonRemoteImageLoader {
             return try await existing.value
         }
 
+        let http = self.http
         let task = Task<DecodedImage, Error> {
-            let response = try await http.fetch(
-                MihonHTTPRequest(url: url, headers: headers, maxBytes: Self.maxImageBytes)
-            )
-            guard response.isSuccess else {
-                throw MihonError.httpStatus(response.statusCode)
+            // A source-backed fetch runs through the extension's own client,
+            // so an interceptor that serves or rewrites the cover applies.
+            let bytes: Data
+            if let sourceFetch {
+                bytes = try await sourceFetch()
+            } else {
+                let response = try await http.fetch(
+                    MihonHTTPRequest(url: url, headers: headers, maxBytes: Self.maxImageBytes)
+                )
+                guard response.isSuccess else {
+                    throw MihonError.httpStatus(response.statusCode)
+                }
+                bytes = response.data
             }
-            let bytes = response.data
             guard !bytes.isEmpty, bytes.count <= Self.maxImageBytes else {
                 throw MihonError.malformedResponse("Image response size")
             }
@@ -67,6 +76,10 @@ struct MihonRemoteImageView: View {
     var headers: [String: String] = [:]
     var maxPixelSize: Int = 1_600
     var contentMode: ContentMode = .fit
+    /// Fetched through the source's own runtime when present, so extension
+    /// interceptors that serve or rewrite covers apply; nil uses the shared
+    /// HTTP client (local images, proxy hosts that already apply them).
+    var sourceFetch: (@Sendable () async throws -> Data)?
 
     @State private var image: DecodedImage?
     @State private var failed = false
@@ -75,12 +88,14 @@ struct MihonRemoteImageView: View {
         url: URL?,
         headers: [String: String] = [:],
         maxPixelSize: Int = 1_600,
-        contentMode: ContentMode = .fit
+        contentMode: ContentMode = .fit,
+        sourceFetch: (@Sendable () async throws -> Data)? = nil
     ) {
         self.url = url
         self.headers = headers
         self.maxPixelSize = maxPixelSize
         self.contentMode = contentMode
+        self.sourceFetch = sourceFetch
     }
 
     var body: some View {
@@ -123,7 +138,8 @@ struct MihonRemoteImageView: View {
             image = try await MihonRemoteImageLoader.shared.image(
                 for: url,
                 headers: headers,
-                maxPixelSize: maxPixelSize
+                maxPixelSize: maxPixelSize,
+                sourceFetch: sourceFetch
             )
         } catch is CancellationError {
             return

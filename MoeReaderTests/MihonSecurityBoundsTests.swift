@@ -558,7 +558,9 @@ final class MihonSecurityBoundsTests: XCTestCase {
         }
 
         var data: Data {
-            Data(bytes)
+            var encoded = self
+            encoded.setU32(0x20, UInt32(bytes.count)) // file_size covers the entire physical file
+            return Data(encoded.bytes)
         }
 
         mutating func extend(to newCount: Int) {

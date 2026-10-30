@@ -2495,7 +2495,7 @@ struct SerializationRuntime {
         }
         result.append(builder)
 
-        let decoder = NativeClass("Lkotlinx/serialization/json/JsonDecoder;", superclass: "Ljava/lang/Object;", interfaces: ["Lkotlinx/serialization/encoding/Decoder;", "Lkotlinx/serialization/encoding/CompositeDecoder;"])
+        let decoder = NativeClass("Lkotlinx/serialization/json/JsonDecoder;", superclass: nil, interfaces: ["Lkotlinx/serialization/encoding/Decoder;", "Lkotlinx/serialization/encoding/CompositeDecoder;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         registerDecoderMethods(decoder)
         result.append(decoder)
 

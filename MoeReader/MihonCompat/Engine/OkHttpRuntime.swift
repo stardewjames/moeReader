@@ -1470,7 +1470,7 @@ enum OkHttpRuntime {
     }
 
     private static func callClasses() -> [NativeClass] {
-        let call = NativeClass("Lokhttp3/Call;", superclass: "Ljava/lang/Object;")
+        let call = NativeClass("Lokhttp3/Call;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         call.method("execute", "()Lokhttp3/Response;") { runtime, args, _ in
             let payload: VMCallPayload = try runtime.payloadBox(args[0])
             return try runtime.executeOkHttp(request: payload.request, client: payload.client)
@@ -1521,7 +1521,7 @@ enum OkHttpRuntime {
         let interceptor = NativeClass("Lokhttp3/Interceptor;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         interceptor.method("intercept", "(Lokhttp3/Interceptor$Chain;)Lokhttp3/Response;") { _, _, _ in .null }
 
-        let chain = NativeClass("Lokhttp3/Interceptor$Chain;", superclass: "Ljava/lang/Object;")
+        let chain = NativeClass("Lokhttp3/Interceptor$Chain;", superclass: "Ljava/lang/Object;", interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface)
         chain.method("request", "()Lokhttp3/Request;") { runtime, args, _ in
             runtime.payload(args[0], as: VMChainPayload.self)?.request ?? .null
         }
@@ -1837,7 +1837,7 @@ enum OkHttpRuntime {
             runtime.makeNative("Lokhttp3/ResponseBody;", payload: VMResponseBodyPayload(data: Data(), contentType: runtime.payload(args[1], as: VMMediaTypePayload.self)?.text))
         }
 
-        let bufferedSource = NativeClass("Lokio/BufferedSource;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Closeable;"])
+        let bufferedSource = NativeClass("Lokio/BufferedSource;", superclass: nil, interfaces: ["Lokio/Source;", "Ljava/io/Closeable;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         bufferedSource.method("readUtf8", "()Ljava/lang/String;") { runtime, args, _ in
             guard let source = runtime.payload(args[0], as: VMBufferedSourcePayload.self) else { return .null }
             return runtime.newString(String(decoding: source.consume(source.data.count - source.offset), as: UTF8.self))
@@ -2668,6 +2668,36 @@ extension VMRuntime {
         VMChallengeDetector.isChallenge(status: response.code, headers: response.headers, body: response.body)
     }
 
+    /// OkHttp/WHATWG canonicalisation for http(s) URL text that arrives from a
+    /// site: a literal backslash is a path separator, not data, so `https:\/\/`
+    /// in page markup resolves like `https://`. After the scheme any run of
+    /// slashes and backslashes introduces the authority, and inside the path a
+    /// backslash becomes a slash without collapsing runs — the form okhttp's
+    /// `HttpUrl` produces. URLSession rejects the raw form; okhttp rewrites it.
+    static func canonicalURLText(_ text: String) -> String {
+        guard text.contains("\\") else { return text }
+        guard let colon = text.firstIndex(of: ":"),
+              !text[..<colon].isEmpty,
+              text[..<colon].allSatisfy({ $0.isLetter || $0.isNumber || "+-.".contains($0) })
+        else {
+            return text.replacingOccurrences(of: "\\", with: "/")
+        }
+        let schemeEnd = text.index(after: colon)
+        var rest = text[schemeEnd...]
+        while let first = rest.first, first == "/" || first == "\\" {
+            rest = rest.dropFirst()
+        }
+        var authorityEnd = rest.endIndex
+        for terminator: Character in ["/", "\\", "?", "#"] {
+            if let at = rest.firstIndex(of: terminator), at < authorityEnd {
+                authorityEnd = at
+            }
+        }
+        let authority = rest[..<authorityEnd]
+        let tail = rest[authorityEnd...].replacingOccurrences(of: "\\", with: "/")
+        return "\(text[..<colon])://\(authority)\(tail)"
+    }
+
     func executeOkHttp(request: VMValue, client: VMValue) throws -> VMValue {
         guard let payload = payload(request, as: VMRequestPayload.self) else {
             throw VMJavaException("Ljava/lang/IllegalArgumentException;", "invalid request")
@@ -2722,9 +2752,10 @@ extension VMRuntime {
         }
         // BridgeInterceptor: the cookie jar supersedes an extension-provided
         // Cookie header whenever it holds cookies for this URL.
+        let canonicalURL = VMRuntime.canonicalURLText(payload.url)
         let cookieStorage = host.cookieStorage()
         func applyJarCookies(_ headers: inout [(String, String)]) {
-            guard let url = URL(string: payload.url) else { return }
+            guard let url = URL(string: canonicalURL) else { return }
             let jarCookies = VMCookieJar.cookies(storage: cookieStorage, for: url)
             guard !jarCookies.isEmpty else { return }
             headers.removeAll { $0.0.caseInsensitiveCompare("Cookie") == .orderedSame }
@@ -2732,7 +2763,7 @@ extension VMRuntime {
         }
         applyJarCookies(&headers)
         var vmRequest = VMHTTPRequest(
-            url: payload.url,
+            url: canonicalURL,
             method: payload.method,
             headers: headers,
             body: body
@@ -2741,7 +2772,7 @@ extension VMRuntime {
         // The response's own URL is the final hop; storing against the original
         // URL would misfile cookies a redirect issued for another host.
         func storeResponseCookies(_ response: VMHTTPResponse) {
-            guard let url = URL(string: response.url) ?? URL(string: payload.url) else { return }
+            guard let url = URL(string: response.url) ?? URL(string: canonicalURL) else { return }
             VMCookieJar.store(headers: response.headers, for: url, storage: cookieStorage)
         }
         do {
@@ -2754,7 +2785,7 @@ extension VMRuntime {
                 var retryHeaders = headers
                 applyJarCookies(&retryHeaders)
                 vmRequest = VMHTTPRequest(
-                    url: payload.url,
+                    url: canonicalURL,
                     method: payload.method,
                     headers: retryHeaders,
                     body: body

@@ -918,7 +918,7 @@ enum PlatformRuntime {
         }
         result.append(cookieCompanion)
 
-        let cookieJar = NativeClass("Lokhttp3/CookieJar;", superclass: "Ljava/lang/Object;")
+        let cookieJar = NativeClass("Lokhttp3/CookieJar;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         cookieJar.staticField("NO_COOKIES", "Lokhttp3/CookieJar;")
         cookieJar.prepare = { runtime, cls in
             cls.staticValues[0] = runtime.makeNative("Lokhttp3/CookieJar;", payload: VMNoCookiesJar())

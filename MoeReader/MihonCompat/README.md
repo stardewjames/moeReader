@@ -28,11 +28,11 @@ engine takes the second path so idle cost can be driven to near zero:
 
 | Path | Responsibility |
 |---|---|
-| `Engine/Dex.swift` | Zero-copy DEX reader: strings (MUTF-8), types, protos, fields, methods, class data, code items, try/catch, encoded values |
+| `Engine/Dex.swift` | Shared-buffer DEX reader: versioned headers/containers, raw MUTF-8/UTF-16, tables, code/try handlers, all encoded-value kinds, annotations, call sites, method handles and debug lines |
 | `Engine/VMValue.swift` | 64-bit values, object layout, arena allocator, exception types |
 | `Engine/VMClass.swift` | Class model, lazy linking, native-class registry, signature parsing |
-| `Engine/Interpreter.swift` | Full Dalvik opcode dispatch, Java exception unwinding, invoke semantics |
-| `Engine/VMRuntime.swift` | Class cache, object/array/string allocation, class initialisation, budget |
+| `Engine/Interpreter.swift` | Dalvik opcode dispatch, Java exception unwinding, monitor accounting and invoke semantics |
+| `Engine/VMRuntime.swift` | Class cache, object/array/string allocation, class initialisation, reusable register-frame stack and execution budget |
 | `Engine/VMConv.swift` | Value/Swift conversions, collection helpers, charsets, regex |
 | `Engine/JavaCore.swift` | `java.lang`: Object, String, StringBuilder, boxed primitives, Math, System, Class, Thread, throwables |
 | `Engine/JavaUtil.swift` | Collections (`Vector`, live list iterators, copy-on-write list/set), Arrays/Collections/Objects, Optional, StringJoiner |
@@ -55,7 +55,10 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/PreferencesRuntime.swift` | androidx.preference model exposed to the source settings UI |
 | `Engine/AndroidRuntime.swift` | Context, SharedPreferences, Injekt bridge, `android.util`/`android.os`/`android.view` stubs used by extensions |
 | `Engine/I18nRuntime.swift` | Property resource bundles from APK assets |
-| `Engine/ReflectRuntime.swift` | `java.lang.reflect`: `Field`/`Method` access and invocation, dynamic `Proxy` instances, `Constructor.setAccessible` |
+| `Engine/ReflectRuntime.swift` | Field/method/constructor reflection with boxing and invocation errors, nesting metadata, generic signatures and dynamic proxies |
+| `Engine/AnnotationRuntime.swift` | Runtime-visible annotation instances, defaults, inheritance, immutable array members, equality and hashing |
+| `Engine/InvokeRuntime.swift` | Method types/handles, polymorphic calls, bootstrap-linked call sites, lambda and string-concatenation factories |
+| `Engine/VarHandleRuntime.swift` | Signature-polymorphic field/array access modes within the single-threaded runtime |
 | `Engine/ConcurrencyRuntime.swift` | Atomic*, ConcurrentHashMap, `ReentrantLock`/`ReentrantReadWriteLock` |
 | `Engine/PlatformRuntime.swift` | `java.net` URL codecs, `TimeUnit`, `okhttp3.Cookie`/`CookieJar` over the shared jar, the Brotli interceptor, Android logging/bundle/build helpers |
 | `Engine/GraphicsRuntime.swift` | `android.graphics` (Bitmap, BitmapFactory, Canvas, Paint, Rect, Typeface) and `android.text` layout (StaticLayout, Layout, TextPaint) over CoreGraphics/ImageIO/CoreText |
@@ -145,7 +148,7 @@ and the suspend lib-1.6 API in practice:
   `java.util.Calendar`/`GregorianCalendar` and `TimeZone`,
   `java.text` `SimpleDateFormat`/`DecimalFormat`,
   `String.format` (including the unsigned width of boxed `Byte`/`Short`/
-  `Integer` under `%x`/`%X`, precision and zero padding), `java.util.regex.Pattern`/
+  `Integer` under `%x`/`%X`, indexed arguments and zero padding), `java.util.regex.Pattern`/
   `Matcher` over `NSRegularExpression`, field and method reflection
   including `Method.invoke`, `Class.forName` and dynamic `Proxy` instances,
   atomics, `ReentrantLock`/`ReentrantReadWriteLock`, `ConcurrentHashMap`,
@@ -336,7 +339,77 @@ the delegate in `getHeaders()`. Network clients start with the same interceptor
 names extensions assert on (`UncaughtExceptionInterceptor`,
 `UserAgentInterceptor`, `CloudflareInterceptor`).
 
+## Dalvik standards and conformance
+
+The targets are the AOSP [DEX file format](https://source.android.com/docs/core/runtime/dex-format)
+and [Dalvik bytecode semantics](https://source.android.com/docs/core/runtime/dalvik-bytecode).
+Java source-language behavior follows the [JLS](https://docs.oracle.com/javase/specs/jls/se21/html/index.html),
+especially [class initialization](https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html#jls-12.4.2);
+resolution and selection follow [JVMS chapter 5](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html).
+The JVMS is a semantic reference, not an input format: this engine executes DEX,
+not JVM class files. Android library availability is a separate compatibility axis.
+
+| Area | Implemented behavior | Evidence / boundary |
+|---|---|---|
+| DEX versions | 035, 037, 038, 039, 040 and 041 headers; little-endian input; 041 logical files share physical offsets/storage | Real d8 fixtures; unsupported versions and reverse-endian input are rejected. 041 is experimental, not a claim of production ART support |
+| Constants and metadata | All encoded-value tags, right-zero-extended float/double encodings, raw UTF-16 literals with interning, annotation directories, method handles, call-site arrays and debug line tables | Static-value, surrogate, annotation and constant-handle differential cases |
+| Instructions | Handlers for every defined standard opcode, including `0xfa–0xff`: polymorphic/custom invokes and range forms, constant method handles/types | Arithmetic/conversion boundaries, switch/payload data, exceptions, wide arguments, custom bootstraps and VarHandle cases; unused/optimized runtime-only opcodes are not standard APK input |
+| Linking / initialization | Declaring-class static access; declared-only `<clinit>`; superclass/default-superinterface ordering; erroneous initialization state; `ExceptionInInitializerError` then `NoClassDefFoundError`; array covariance, Cloneable and Serializable | Initialization, interface, cast and array differential cases. This is not a complete verifier or access-control implementation |
+| Dynamic invocation | Typed handles, exact/adapting/varargs invocation, field/constructor handles, common combinators, bootstrap linkage/failure caching, mutable call sites, lambda/concat factories | Method-handle and generated invoke-custom cases. The entire `java.lang.invoke` API is not implemented |
+| Reflection / annotations | Constructor invocation, primitive boxing/widening, invocation-target exceptions, declared/public members, generic signatures, inner/enclosing names, runtime-visible annotations/defaults/inheritance and array copies | Reflection and annotation differential cases. Type-use/repeatable-annotation APIs and all malformed-metadata error paths are not covered |
+| Synchronization | Reentrant monitor ownership, invalid exits, synchronized native calls; DEX `ACC_DECLARED_SYNCHRONIZED` remains reflection-only | Monitor ownership/exception cases. All code executes serially; volatile/acquire/release/opaque VarHandle modes do not establish a multi-threaded memory model |
+| Java natives | Numeric IEEE/overflow/narrowing rules, UTF-16 operations, array reflection/utilities, functional interfaces and comparator composition used by the fixture | A native method existing in the registry does not establish complete Java SE or Android library conformance |
+
+### Reproducing the comparison
+
+`scripts/build_conformance_dex.sh` compiles the generic Java programs under
+`MoeReaderTests/Fixtures/conformance/src`, runs them on HotSpot with `-Xint`
+and a pinned locale/timezone, then compiles the same classes with d8. It writes
+`conformance.expected`, `conformance.dex`, and the separate `dex041.dex` fixture.
+It requires JDK 21 and Android build-tools/platform 36; paths are overridable
+through `JAVA_HOME`, `ANDROID_BUILD_TOOLS` and `ANDROID_JAR`.
+
+`MihonDalvikConformanceTests` compares returned UTF-16 units and escaping
+exception classes against that oracle. It covers arithmetic, floating point,
+narrowing, arrays, strings, switches, exceptions, initialization, encoded
+static values, interfaces, casts, reflection, annotations and dynamic invocation.
+The generator checks that d8 retained the relevant special opcodes and payloads.
+HotSpot is not ART: differences in Android APIs, verifier behavior, stack-trace
+wording and unspecified reflection ordering must not be mistaken for DEX bugs.
+`MihonDexFormatTests` independently exercises the 041 header and rejection bounds.
+
+### What still separates this from a complete Dalvik VM
+
+1. **Verification before execution.** Add structural/control-flow validation
+   and register type analysis: instruction boundaries, branch/payload targets,
+   wide pairs, invoke arity, move-result/move-exception placement, uninitialized
+   references and monitor balance. Header/table checks are not an ART verifier.
+   Malformed bytecode is not a memory-safe sandbox.
+2. **Complete linkage and access rules.** Enforce private/protected/package and
+   final-member rules consistently across bytecode, reflection and handles,
+   including loader identity and circular hierarchy errors. Lookup access
+   checks currently cover only part of those rules.
+3. **An ART oracle.** Run the generic fixture on Android as well as HotSpot,
+   add bytecode-crafted negative/verifier cases, and measure instruction-format
+   and exception-path coverage. Passing the differential cases is not CTS.
+4. **Memory and concurrency semantics.** A serial arena runtime has no Java
+   threads, collector/finalization protocol, or Java memory-model implementation.
+   Supporting those requires a runtime design change, not more opcode branches.
+5. **Library completeness.** Expand missing Java/Android APIs independently of
+   opcode coverage. Formatter, streams, reflection metadata and invoke
+   combinators remain subsets; `String.lines()` currently supports count/close,
+   not a general stream pipeline. Unicode classifications follow the host's
+   Unicode data. Reverse-endian DEX and optimized/compact runtime artifacts are
+   outside the current input envelope.
+
 ## Verified
+- The generic differential fixture currently exercises **299 cases** against
+  HotSpot with no mismatches in the standalone interpreter smoke run. Separate
+  smoke runs load one- and two-logical-file d8 041 containers (cross-file call
+  results 2 and 151) and verify native synchronized instance/static methods
+  hold their monitor and release it on normal and exceptional returns.
+  These runs used Swift 6.2 on Linux/WSL; they do not substitute for an iOS
+  simulator build or Android CTS.
 
 - `MihonEngineSerializationTests` decodes and re-encodes nested
   nullable/default data classes and lists through a compiled
@@ -420,10 +493,10 @@ names extensions assert on (`UncaughtExceptionInterceptor`,
   no site reference is committed; local notes are in the ignored
   `site-notes.local.md`.
 - The portable suite (engine sources plus the MihonExtensions runtime files,
-  built on Linux) runs 452 tests with no failures (10 skipped: they need app
-  sources, Apple frameworks or a DEX fixture). The runner takes every
-  file in `MoeReaderTests`, then drops the ones that need app sources or Apple
-  frameworks, so a new engine test is picked up without editing a list.
+  built on Linux) runs 496 tests with no failures (10 skipped: they need app
+  sources, Apple frameworks or an unavailable fixture). This includes the
+  differential and DEX header tests. The local runner excludes test files that
+  require Apple/app dependencies; it is not the complete iOS application suite.
 - Randomised live sweeps of the published index (fixed seeds, 24 + 24 + 30
   extensions, each run through load, popular both pages, latest, both search
   modes, details, chapters, pages and the preference screen) were recorded
@@ -573,7 +646,14 @@ sets, preference change listeners (`SharedPreferences` writes and the source
 settings UI), filter construction defaults and selection replay (text, checkbox,
 tri-state, select, sort, grouped filters), interceptor list views, `TimeUnit`
 conversions, JSON encode/decode and JSON element conversion, and file/okio
-round-trips under a per-extension root. The runtime also resolves class methods before
+round-trips under a per-extension root. Native classes that the platform APIs
+declare as interfaces (`Interceptor.Chain`, `Interceptor`, `Call`, `CookieJar`,
+`Dns`, `Authenticator`, the Injekt factory, `locks.Condition`, okio's
+`Source`/`Sink`/`BufferedSource`, `kotlin.text.MatchResult`, the kotlinx
+serialization decoder interfaces, `coroutines.sync.Mutex`) carry interface
+semantics — including `Object`'s public methods on interface-typed receivers —
+so extension bytecode reaches their methods through `invoke-interface` like on
+Android. The runtime also resolves class methods before
 interface defaults, boxes Kotlin `Duration`/`Instant`, reads response bodies
 through okio, handles `JsonNames` aliases, treats missing fields as null for
 tolerant API decoding, formats through `String.format`, and drives suspend
@@ -588,7 +668,7 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 | Zstd response bodies | `OkioZstd` reads only raw/RLE-block frames. Entropy-coded zstd (what servers send) fails closed with an `IOException`. |
 | Duplicate response headers | URLSession merges repeated `Set-Cookie` response headers into one value; the engine splits that value once when it enters from the transport, honouring `Expires` commas, so the jar and `Response.headers` see one cookie per header. Other repeated response headers stay merged. |
 | `NetworkHelper.cookieJar` | `getCookieJar` returns the shared jar: `saveFromResponse`/`loadForRequest` run over the same `HTTPCookieStorage` the transport and WebView use. `client` and `cloudflareClient` are also available. |
-| Constructor reflection | `Field`/`Method` access and `Method.invoke` work, as do `Class.forName`, `getDeclaredMethod` and `getResource` (a class absent from the APK throws `ClassNotFoundException`); `Constructor.newInstance` is not implemented. |
+| Constructor reflection | `Field`/`Method` access, boxed `Method.invoke`, `Constructor.newInstance`, `Class.forName`, declared/public member queries and generic/nesting metadata are implemented; a class absent from the APK throws `ClassNotFoundException` through `Class.forName`. |
 
 Unsupported APIs fail closed with a typed error. The engine never guesses at a
 method's behaviour.
@@ -643,9 +723,10 @@ per source operation.
 
 - APKs are admitted by the existing verifier: package/version match, v2/v3
   signature, signer hash pinned to the repository key.
-- The interpreter is memory-safe for values it manages: register operands are
-  bounds-checked, casts and array stores are checked, and execution has an
-  instruction budget.
+- Casts, array stores, many register operands and execution budgets are checked.
+  There is no full bytecode verifier; objects/registers use unsafe host pointers.
+  Do not treat signed APK admission as proof of bytecode safety or the interpreter
+  as an isolation boundary for adversarial code.
 - There is no JIT, no dynamic code loading and no private API use; the engine is
   plain Swift running in the app's sandbox.
 - Extension file paths resolve under `Caches/MihonCompat/Files/<package>`;

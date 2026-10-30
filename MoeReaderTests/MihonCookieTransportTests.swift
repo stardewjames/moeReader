@@ -366,4 +366,27 @@ final class MihonCookieTransportTests: XCTestCase {
             "x y"
         )
     }
+
+    // MARK: - URL canonicalisation
+
+    /// OkHttp resolves backslashes in page-provided URL text like slashes: any
+    /// run of slashes and backslashes after the scheme introduces the
+    /// authority, and inside the path a backslash becomes a slash without
+    /// collapsing runs. URLSession rejects the raw form, so the engine
+    /// canonicalises before every request — cover and page URLs alike.
+    func testCanonicalURLTextMatchesOkHttpBackslashRules() {
+        let canonical = VMRuntime.canonicalURLText
+        // Each path backslash becomes a separator, so an adjacent literal slash
+        // stays: `\/` in the path yields `//` — okhttp's observed output.
+        XCTAssertEqual(
+            canonical("https:\\/\\/host.test\\/path\\/image.png"),
+            "https://host.test//path//image.png"
+        )
+        XCTAssertEqual(
+            canonical("https:////host.test//a\\/b.png?x=1\\2"),
+            "https://host.test//a//b.png?x=1/2"
+        )
+        XCTAssertEqual(canonical("http:\\/host.test\\/x"), "http://host.test//x")
+        XCTAssertEqual(canonical("https://host.test/a.png"), "https://host.test/a.png")
+    }
 }

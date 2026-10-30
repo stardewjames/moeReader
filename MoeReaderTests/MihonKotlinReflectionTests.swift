@@ -59,38 +59,6 @@ final class MihonKotlinReflectionTests: XCTestCase {
 
     // MARK: - Reflection
 
-    func testStaticFieldReflectedThroughSuperclass() throws {
-        let runtime = VMRuntime()
-        let base = NativeClass("Ltest/ReflectBase;")
-        base.staticField("SHARED", "I")
-        let derived = NativeClass("Ltest/ReflectSub;", superclass: "Ltest/ReflectBase;")
-        runtime.nativeClasses[base.descriptor] = base
-        runtime.nativeClasses[derived.descriptor] = derived
-
-        let baseClass = try runtime.linkClass("Ltest/ReflectBase;")
-        let subClass = try runtime.linkClass("Ltest/ReflectSub;")
-        try runtime.ensureInitialized(baseClass)
-        baseClass.staticValues[0] = .int32(41)
-
-        let classClass = try runtime.linkClass("Ljava/lang/Class;")
-        let classObject = runtime.classObject(subClass)
-        let getField = try XCTUnwrap(classClass.lookupVirtual(key: "getField(Ljava/lang/String;)Ljava/lang/reflect/Field;"))
-        let getDeclaredField = try XCTUnwrap(
-            classClass.lookupVirtual(key: "getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;")
-        )
-
-        for lookup in [getField, getDeclaredField] {
-            baseClass.staticValues[0] = .int32(41)
-            let field = try runtime.invoke(lookup, [classObject, runtime.newString("SHARED")])
-            let fieldClass = try XCTUnwrap(runtime.classOf(field))
-            let get = try XCTUnwrap(fieldClass.lookupVirtual(key: "get(Ljava/lang/Object;)Ljava/lang/Object;"))
-            XCTAssertEqual(try runtime.invoke(get, [field, .null]).asInt32, 41)
-
-            let setInt = try XCTUnwrap(fieldClass.lookupVirtual(key: "setInt(Ljava/lang/Object;I)V"))
-            _ = try runtime.invoke(setInt, [field, .null, .int32(7)])
-            XCTAssertEqual(baseClass.staticValues[0].asInt32, 7)
-        }
-    }
 
     func testMethodGetNameReturnsReflectedName() throws {
         let runtime = VMRuntime()

@@ -265,6 +265,44 @@ def load_registry(path: Path) -> Registry:
     return registry
 
 
+@dataclass
+class DexAudit:
+    index: int
+    defined: int
+    host_refs: int
+    missing_classes: dict[str, set[str]]
+    missing_methods: dict[str, set[str]]
+
+
+def audit_apk(apk: Path, registry: Registry) -> list[DexAudit]:
+    """Compare one APK's host references with the registry, dex by dex."""
+    audits: list[DexAudit] = []
+    for index, blob in enumerate(dex_files(apk)):
+        dex = Dex(blob)
+        defined = dex.defined_classes()
+        missing_classes: dict[str, set[str]] = defaultdict(set)
+        missing_methods: dict[str, set[str]] = defaultdict(set)
+        used_classes: Counter[str] = Counter()
+        for owner, name, signature in dex.methods():
+            if owner in defined:
+                continue
+            if not owner.startswith(HOST_PREFIXES):
+                continue
+            used_classes[owner] += 1
+            if not registry.has_class(owner):
+                missing_classes[owner].add(name + signature)
+            elif not registry.has_method(owner, name + signature):
+                missing_methods[owner].add(name + signature)
+        audits.append(DexAudit(
+            index=index,
+            defined=len(defined),
+            host_refs=len(used_classes),
+            missing_classes=dict(missing_classes),
+            missing_methods=dict(missing_methods),
+        ))
+    return audits
+
+
 def main(argv: list[str]) -> int:
     registry_path: Path | None = None
     if "--registry" in argv:
@@ -284,25 +322,11 @@ def main(argv: list[str]) -> int:
 
     for argument in argv:
         apk = Path(argument)
-        for index, blob in enumerate(dex_files(apk)):
-            dex = Dex(blob)
-            defined = dex.defined_classes()
-            missing_classes: dict[str, set[str]] = defaultdict(set)
-            missing_methods: dict[str, set[str]] = defaultdict(set)
-            used_classes: Counter[str] = Counter()
-            for owner, name, signature in dex.methods():
-                if owner in defined:
-                    continue
-                if not owner.startswith(HOST_PREFIXES):
-                    continue
-                used_classes[owner] += 1
-                if not registry.has_class(owner):
-                    missing_classes[owner].add(name + signature)
-                elif not registry.has_method(owner, name + signature):
-                    missing_methods[owner].add(name + signature)
-
-            print(f"\n=== {apk.name} classes{index}.dex: {len(defined)} defined, "
-                  f"{len(used_classes)} host classes referenced")
+        for audit in audit_apk(apk, registry):
+            missing_classes = audit.missing_classes
+            missing_methods = audit.missing_methods
+            print(f"\n=== {apk.name} classes{audit.index}.dex: {audit.defined} defined, "
+                  f"{audit.host_refs} host classes referenced")
             if missing_classes:
                 print(f"missing classes: {len(missing_classes)}")
                 by_package: Counter[str] = Counter()

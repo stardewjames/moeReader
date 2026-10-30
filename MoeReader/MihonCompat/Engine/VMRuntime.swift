@@ -99,6 +99,19 @@ final class VMRuntime: @unchecked Sendable {
     var sharedPreferenceListenerHubs: [ObjectIdentifier: VMSharedPreferencesListeners] = [:]
 
     private var stringConstants: [ObjectIdentifier: [Int: VMValue]] = [:]
+    /// JLS 3.10.5 string pool for the current arena (literals and `intern`).
+    private var internedStrings: [[UInt16]: VMValue] = [:]
+    /// Linked `invoke-custom` call sites (or their recorded bootstrap
+    /// failure), per dex and call-site index, for the current arena.
+    var callSiteTargets: [FieldRefKey: VMValue] = [:]
+    /// `const-method-handle` objects, per dex and handle index.
+    var methodHandleConstants: [FieldRefKey: VMValue] = [:]
+    /// Entry counts of monitors held by `synchronized` code (one thread, so
+    /// a count per object is the whole lock state).
+    var heldMonitors: [UInt64: Int] = [:]
+    /// Interpreted frames, innermost last, with the pc each one is suspended
+    /// at (updated at calls), for `Throwable` stack traces.
+    var traceFrames: [VMTraceFrame] = []
     var boxedPrimitiveCache: [String: [Int64: VMValue]] = [:]
     var instanceFieldOffsets: [FieldRefKey: Int] = [:]
     var staticFieldCache: [FieldRefKey: (VMClass, VMField)] = [:]
@@ -107,8 +120,12 @@ final class VMRuntime: @unchecked Sendable {
     weak var host: VMHost?
     var standardOutput: ((String) -> Void)?
     /// Method currently executing, for diagnostics that fire without a Java
-    /// stack (a class that cannot be linked).
-    private(set) var activeFrame = ""
+    /// stack (a class that cannot be linked). Kept as a reference so a call
+    /// costs no string building; the name is formatted only when reported.
+    private(set) var activeMethod: VMMethod?
+    var activeFrame: String { activeMethod?.displayName ?? "" }
+    /// Interpreter register files, one per active interpreted frame.
+    let frames = VMFrameStack()
     /// Guards runaway execution in a hostile extension.
     var instructionBudget = 50_000_000
     private var instructionsExecuted = 0
@@ -140,7 +157,9 @@ final class VMRuntime: @unchecked Sendable {
     /// Coroutines started with `launch`. They run to completion before
     /// `launch` returns, so a caller can tell when a call did background work.
     var launchedCoroutines = 0
-    var currentFrame = ""
+    /// Innermost interpreted method, for diagnostics.
+    var currentMethod: VMMethod?
+    var currentFrame: String { currentMethod?.displayName ?? "" }
     var genericDescriptorValue: VMValue?
     var jsonKindValue: VMValue?
     var primitiveSerializerCache: [String: VMValue] = [:]
@@ -251,12 +270,22 @@ final class VMRuntime: @unchecked Sendable {
         }
     }
 
+    /// `const-string`: the literal's exact UTF-16 units (an unpaired surrogate
+    /// survives), interned across dex files as JLS 3.10.5 requires, so equal
+    /// literals are one object and `String.intern()` can return it.
     func stringConstant(dex: DexFile, index: Int) -> VMValue {
         let identifier = ObjectIdentifier(dex)
         if let cached = stringConstants[identifier]?[index] { return cached }
-        let text = dex.string(at: index)
-        let value = newString(text)
+        let value = internedString(units: dex.stringUnits(at: index))
         stringConstants[identifier, default: [:]][index] = value
+        return value
+    }
+
+    /// The canonical string for `units` in the current arena.
+    func internedString(units: [UInt16]) -> VMValue {
+        if let existing = internedStrings[units] { return existing }
+        let value = newString(units: units)
+        internedStrings[units] = value
         return value
     }
 
@@ -356,18 +385,22 @@ final class VMRuntime: @unchecked Sendable {
         return isAssignable(VMObjectLayout.cls(pointer), to: cls)
     }
 
+    /// JLS 5.2 assignment compatibility of reference types, including array
+    /// covariance at any depth (`String[][]` to `CharSequence[][]`, `int[][]`
+    /// to `Object[]`) and the array supertypes `Object`, `Cloneable` and
+    /// `Serializable` (which `isSubclass` covers through the array class).
     func isAssignable(_ actual: VMClass, to target: VMClass) -> Bool {
         if actual.isSubclass(of: target) { return true }
-        if actual.isArray, target.isArray,
-           let actualComponent = actual.arrayComponent,
-           let targetComponent = target.arrayComponent,
-           DexDescriptor.isReference(actualComponent),
-           DexDescriptor.isReference(targetComponent),
-           let actualClass = try? linkClass(actualComponent),
-           let targetClass = try? linkClass(targetComponent) {
-            return actualClass.isSubclass(of: targetClass)
+        guard actual.isArray, target.isArray,
+              let actualComponent = actual.arrayComponent,
+              let targetComponent = target.arrayComponent,
+              DexDescriptor.isReference(actualComponent),
+              DexDescriptor.isReference(targetComponent),
+              let actualClass = try? linkClass(actualComponent),
+              let targetClass = try? linkClass(targetComponent) else {
+            return false
         }
-        return false
+        return isAssignable(actualClass, to: targetClass)
     }
 
     func checkCast(_ value: VMValue, to cls: VMClass) throws -> VMValue {
@@ -396,6 +429,11 @@ final class VMRuntime: @unchecked Sendable {
                 VMObjectLayout.slot(object, messageField.offset).pointee = .null
                 if let message { VMObjectLayout.slot(object, messageField.offset).pointee = newString(message) }
             }
+            // As a constructed throwable: no cause set yet (the self marker).
+            if let causeField = cls.field(named: "cause") {
+                VMObjectLayout.slot(object, causeField.offset).pointee = value
+            }
+            recordBacktrace(value)
             return value
         }
         if let cls = findClass("Ljava/lang/RuntimeException;") {
@@ -407,29 +445,134 @@ final class VMRuntime: @unchecked Sendable {
 
     func signatureStackDepth() -> Int { 0 }
 
+    /// The interpreted stack as `StackTraceElement` data, innermost first,
+    /// without the constructors of the throwable being built (what
+    /// `Throwable.fillInStackTrace` reports). Lines come from `debug_info`.
+    func captureStackTrace() -> [JavaCore.VMStackTracePayload] {
+        let throwable = findClass("Ljava/lang/Throwable;")
+        var result: [JavaCore.VMStackTracePayload] = []
+        result.reserveCapacity(traceFrames.count)
+        var skipping = true
+        for frame in traceFrames.reversed() {
+            let method = frame.method
+            if skipping, method.isConstructor, let owner = method.declaringClass, let throwable,
+               owner.isSubclass(of: throwable) {
+                continue
+            }
+            skipping = false
+            let line = method.code.flatMap { code in
+                method.dex?.lineNumber(debugInfoOffset: code.debugInfoOffset, pc: frame.pc)
+            }
+            result.append(JavaCore.VMStackTracePayload(
+                className: DexDescriptor.displayName(method.ownerDescriptor),
+                methodName: method.name,
+                fileName: method.declaringClass?.dexSource?.definition.sourceFile,
+                lineNumber: line ?? -1
+            ))
+        }
+        return result
+    }
+
+    /// Stores the current stack in a throwable's `backtrace` slot.
+    func recordBacktrace(_ throwable: VMValue) {
+        guard let pointer = throwable.object, let cls = classOf(throwable) else { return }
+        if let field = cls.field(named: "backtrace") {
+            // The throwable itself in the slot means "not writable".
+            if VMObjectLayout.slot(pointer, field.offset).pointee.bits == throwable.bits { return }
+            VMObjectLayout.slot(pointer, field.offset).pointee = makeNative(
+                "Ljava/lang/Object;",
+                payload: VMBacktracePayload(frames: captureStackTrace())
+            )
+        }
+        if let field = cls.field(named: "stackTrace") {
+            VMObjectLayout.slot(pointer, field.offset).pointee = .null
+        }
+    }
+
+    /// JLS 12.4.2 on a single thread. A class initializes its superclass and
+    /// every superinterface that declares a default method (an interface
+    /// initializes neither), then its constants and `<clinit>`. `<clinit>` is
+    /// looked up on the class itself only: an inherited one belongs to the
+    /// superclass and must not run twice. A Java exception from `<clinit>`
+    /// leaves the class erroneous; anything that is not an `Error` reaches the
+    /// caller as `ExceptionInInitializerError`.
     func ensureInitialized(_ cls: VMClass) throws {
-        if cls.initialized { return }
-        if cls.initializing { return }
+        if cls.initialized || cls.initializing { return }
+        if cls.initializationFailed {
+            throw VMJavaException(
+                "Ljava/lang/NoClassDefFoundError;",
+                "Could not initialize class \(cls.displayName)"
+            )
+        }
         cls.initializing = true
         defer { cls.initializing = false }
-        if let superclass = cls.superclass {
-            try ensureInitialized(superclass)
-        }
-
-        // Constant field values materialise into the current arena.
-        for field in cls.staticFields {
-            if let constant = field.constant {
-                cls.staticValues[field.offset] = try constant(self)
+        do {
+            if !cls.isInterface {
+                if let superclass = cls.superclass {
+                    try ensureInitialized(superclass)
+                }
+                for proto in defaultMethodSuperinterfaces(of: cls) {
+                    try ensureInitialized(proto)
+                }
             }
-        }
 
-        if let prepare = cls.prepare {
-            try prepare(self, cls)
-        }
-        if let clinit = cls.lookupStatic("<clinit>", "()V") {
-            _ = try invoke(clinit, arguments: [], count: 0)
+            // Constant field values materialise into the current arena.
+            for field in cls.staticFields {
+                if let constant = field.constant {
+                    cls.staticValues[field.offset] = try constant(self)
+                }
+            }
+
+            if let prepare = cls.prepare {
+                try prepare(self, cls)
+            }
+            if let clinit = cls.staticMethods["<clinit>()V"] {
+                _ = try invoke(clinit, arguments: [], count: 0)
+            }
+        } catch let exception as VMJavaException {
+            cls.initializationFailed = true
+            throw initializerError(exception)
         }
         cls.initialized = true
+    }
+
+    /// Superinterfaces in the JLS 12.4.2 order: for each direct interface,
+    /// its own superinterfaces first, then itself; only those that declare a
+    /// default method, each once.
+    private func defaultMethodSuperinterfaces(of cls: VMClass) -> [VMClass] {
+        var ordered: [VMClass] = []
+        var seen: Set<ObjectIdentifier> = []
+        func visit(_ proto: VMClass) {
+            guard seen.insert(ObjectIdentifier(proto)).inserted else { return }
+            for parent in proto.interfaces { visit(parent) }
+            if proto.declaresDefaultMethods { ordered.append(proto) }
+        }
+        for proto in cls.interfaces { visit(proto) }
+        return ordered
+    }
+
+    /// `Error`s propagate unchanged; any other throwable is wrapped.
+    private func initializerError(_ exception: VMJavaException) -> VMJavaException {
+        var exception = exception
+        if exception.object.bits == 0 {
+            exception.object = makeThrowable(exception.classDescriptor, message: exception.message)
+        }
+        if let thrown = classOf(exception.object), let error = findClass("Ljava/lang/Error;"),
+           thrown.isSubclass(of: error) {
+            return exception
+        }
+        // The Java object carries no message, as on the JVM; the Swift-side
+        // message keeps the cause visible where the engine reports failures.
+        var wrapped = VMJavaException("Ljava/lang/ExceptionInInitializerError;", "caused by \(exception.display)")
+        wrapped.object = makeThrowable("Ljava/lang/ExceptionInInitializerError;", message: nil)
+        setThrowableCause(wrapped.object, exception.object)
+        return wrapped
+    }
+
+    /// Stores `cause` in a throwable's `cause` slot (what `initCause` does).
+    func setThrowableCause(_ throwable: VMValue, _ cause: VMValue) {
+        guard let pointer = throwable.object, let field = VMObjectLayout.cls(pointer).field(named: "cause") else { return }
+        VMObjectLayout.slot(pointer, field.offset).pointee = cause
     }
 
     /// Incremented by every `resetArena`. Host work created against one arena
@@ -452,8 +595,12 @@ final class VMRuntime: @unchecked Sendable {
         hostEvents.discardAll()
         heap.reset()
         nativeObjects.removeAll(keepingCapacity: false)
+        heldMonitors.removeAll(keepingCapacity: false)
         sharedPreferenceListenerHubs.removeAll(keepingCapacity: false)
         stringConstants.removeAll(keepingCapacity: false)
+        internedStrings.removeAll(keepingCapacity: false)
+        callSiteTargets.removeAll(keepingCapacity: false)
+        methodHandleConstants.removeAll(keepingCapacity: false)
         boxedPrimitiveCache.removeAll(keepingCapacity: false)
         classObjects.removeAll(keepingCapacity: false)
         genericDescriptorValue = nil
@@ -466,6 +613,7 @@ final class VMRuntime: @unchecked Sendable {
         for cls in classCache.values {
             cls.initialized = false
             cls.initializing = false
+            cls.initializationFailed = false
             for index in cls.staticValues.indices { cls.staticValues[index] = .zero }
         }
         instanceFieldOffsets.removeAll(keepingCapacity: true)
@@ -483,11 +631,28 @@ final class VMRuntime: @unchecked Sendable {
         if traceEnabled {
             FileHandle.standardError.write("CALL \(method.ownerDescriptor).\(method.key)\n".data(using: .utf8)!)
         }
-        let previousFrame = activeFrame
-        activeFrame = "\(method.ownerDescriptor).\(method.key)"
-        defer { activeFrame = previousFrame }
+        let previousMethod = activeMethod
+        activeMethod = method
+        defer { activeMethod = previousMethod }
         try checkNativeStack()
         if let body = method.body {
+            // DEX ACC_SYNCHRONIZED is executable only for native methods;
+            // ACC_DECLARED_SYNCHRONIZED does not acquire an extra monitor.
+            var monitor: UInt64?
+            if method.access & DexAccess.isSynchronized != 0 {
+                let owner = method.isStatic
+                    ? classObject(try method.declaringClass ?? linkClass(method.ownerDescriptor))
+                    : arguments[0]
+                guard owner.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                monitor = owner.bits
+                heldMonitors[owner.bits, default: 0] += 1
+            }
+            defer {
+                if let monitor, let depth = heldMonitors[monitor] {
+                    if depth <= 1 { heldMonitors.removeValue(forKey: monitor) }
+                    else { heldMonitors[monitor] = depth - 1 }
+                }
+            }
             let parameterCount = (method.isStatic ? 0 : 1) + method.parameterTypes.count
             let capacity = parameterCount + VMRuntime.nativeArgumentPadding
             return try withUnsafeTemporaryAllocation(of: VMValue.self, capacity: capacity) { buffer in
@@ -679,6 +844,72 @@ struct VMCallTimeout: Error, CustomStringConvertible, Equatable {
         operation.isEmpty
             ? "source operation timed out after \(Int(seconds))s"
             : "\(operation) timed out after \(Int(seconds))s"
+    }
+}
+
+/// One interpreted frame of the stack trace: its method and the pc it is
+/// suspended at.
+struct VMTraceFrame {
+    unowned(unsafe) let method: VMMethod
+    var pc: Int
+}
+
+/// A throwable's captured stack (`Throwable.backtrace`).
+final class VMBacktracePayload {
+    let frames: [JavaCore.VMStackTracePayload]
+    init(frames: [JavaCore.VMStackTracePayload]) { self.frames = frames }
+}
+
+/// Register files for interpreted frames. Frames nest strictly (a callee
+/// returns or unwinds before its caller continues), so they are pushed and
+/// popped on a chunked stack instead of being bump-allocated in the arena,
+/// where a loop of calls would grow the heap by one register file per call
+/// until the next recycle. Chunks are never moved, so a frame's pointer stays
+/// valid while deeper frames come and go.
+final class VMFrameStack {
+    struct Mark {
+        fileprivate let chunk: Int
+        fileprivate let top: Int
+    }
+
+    private static let chunkCells = 16 * 1024
+    private var chunks: [(base: UnsafeMutablePointer<VMValue>, capacity: Int)] = []
+    private var chunk = -1
+    private var top = 0
+
+    /// A zeroed register file of `count` cells and the mark that releases it.
+    @inline(__always)
+    func push(_ count: Int) -> (UnsafeMutablePointer<VMValue>, Mark) {
+        let mark = Mark(chunk: chunk, top: top)
+        if chunk < 0 || top + count > chunks[chunk].capacity {
+            advance(atLeast: count)
+        }
+        let base = chunks[chunk].base + top
+        top += count
+        base.initialize(repeating: .zero, count: count)
+        return (base, mark)
+    }
+
+    @inline(__always)
+    func pop(_ mark: Mark) {
+        chunk = mark.chunk
+        top = mark.top
+    }
+
+    private func advance(atLeast count: Int) {
+        var next = chunk + 1
+        while next < chunks.count, chunks[next].capacity < count { next += 1 }
+        if next >= chunks.count {
+            let capacity = max(Self.chunkCells, count)
+            chunks.append((UnsafeMutablePointer<VMValue>.allocate(capacity: capacity), capacity))
+            next = chunks.count - 1
+        }
+        chunk = next
+        top = 0
+    }
+
+    deinit {
+        for entry in chunks { entry.base.deallocate() }
     }
 }
 

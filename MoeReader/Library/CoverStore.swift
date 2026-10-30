@@ -53,7 +53,8 @@ actor CoverStore {
               let image = try? await MihonRemoteImageLoader.shared.image(
                   for: sourceURL,
                   headers: entry.coverHeaders,
-                  maxPixelSize: 1200
+                  maxPixelSize: 1200,
+                  sourceFetch: await coverFetch(for: entry)
               ) else {
             return nil
         }
@@ -62,6 +63,19 @@ actor CoverStore {
         }
         cache.setObject(image, forKey: cacheKey, cost: image.cost)
         return image
+    }
+
+    /// The source-backed fetch for a saved entry, so its covers load through
+    /// the extension's own client even after a relaunch. Nil when the source
+    /// cannot be resolved (extension uninstalled or disabled).
+    private func coverFetch(for entry: RemoteMangaEntry) async -> (@Sendable () async throws -> Data)? {
+        guard let resolved = await MihonRuntimeSelection.shared.resolve(entry: entry) else { return nil }
+        let source = resolved.source
+        let runtime = resolved.runtime
+        return { [source, runtime] in
+            guard let url = entry.coverURL else { throw MihonError.malformedResponse("missing cover URL") }
+            return try await runtime.coverImage(url: url, headers: entry.coverHeaders, source: source)
+        }
     }
 
     func invalidate(bookID: UUID, caches: URL) {

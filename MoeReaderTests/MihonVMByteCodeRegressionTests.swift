@@ -293,6 +293,7 @@ final class MihonVMByteCodeRegressionTests: XCTestCase {
         setU32(&bytes, classDefs + 20, 0)         // no annotations
         setU32(&bytes, classDefs + 24, UInt32(classData))
         setU32(&bytes, classDefs + 28, 0)         // no static values
+        setU32(&bytes, 0x20, UInt32(bytes.count)) // file_size
 
         return Data(bytes)
     }

@@ -31,6 +31,7 @@ enum JavaCore {
         result += characterClass()
         result += floatClass()
         result += doubleClass()
+        result.append(NativeClass("Ljava/lang/Void;", superclass: "Ljava/lang/Object;", access: DexAccess.isPublic | DexAccess.isFinal))
         result += mathClass()
         result += systemClass()
         result += classClass()
@@ -94,17 +95,43 @@ enum JavaCore {
                 }
                 return .reference(copy)
             }
+            // JLS: `Object.clone` of a class that is not `Cloneable` throws.
+            // Host classes declare their own `clone` where Java has one, so
+            // the check covers bytecode classes.
+            if cls.dexSource != nil, let cloneable = runtime.findClass("Ljava/lang/Cloneable;"), !cls.isSubclass(of: cloneable) {
+                throw VMJavaException("Ljava/lang/CloneNotSupportedException;", cls.displayName)
+            }
             let copy = runtime.allocateObject(cls)
             for index in 0..<cls.instanceFieldCount {
                 VMObjectLayout.slot(copy, index).pointee = VMObjectLayout.slot(source, index).pointee
             }
             return .reference(copy)
         }
-        cls.method("notify", "()V") { _, _, _ in .zero }
-        cls.method("notifyAll", "()V") { _, _, _ in .zero }
-        cls.method("wait", "()V") { _, _, _ in .zero }
-        cls.method("wait", "(J)V") { _, _, _ in .zero }
-        cls.method("wait", "(JI)V") { _, _, _ in .zero }
+        // One thread: `notify` has nobody to wake, and `wait` returns at once
+        // (a spurious wakeup, which the contract allows). Both still require
+        // the caller to hold the monitor.
+        func requireMonitor(_ runtime: VMRuntime, _ object: VMValue) throws {
+            guard object.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            guard runtime.heldMonitors[object.bits] != nil else {
+                throw VMJavaException("Ljava/lang/IllegalMonitorStateException;", "object not locked by thread before wait/notify")
+            }
+        }
+        cls.method("notify", "()V") { runtime, args, _ in try requireMonitor(runtime, args[0]); return .zero }
+        cls.method("notifyAll", "()V") { runtime, args, _ in try requireMonitor(runtime, args[0]); return .zero }
+        cls.method("wait", "()V") { runtime, args, _ in try requireMonitor(runtime, args[0]); return .zero }
+        cls.method("wait", "(J)V") { runtime, args, _ in
+            guard args[1].asInt64 >= 0 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "timeout value is negative") }
+            try requireMonitor(runtime, args[0])
+            return .zero
+        }
+        cls.method("wait", "(JI)V") { runtime, args, _ in
+            guard args[1].asInt64 >= 0 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "timeout value is negative") }
+            guard (0...999_999).contains(args[2].asInt32) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "nanosecond timeout value out of range")
+            }
+            try requireMonitor(runtime, args[0])
+            return .zero
+        }
         cls.method("finalize", "()V") { _, _, _ in .zero }
         return [cls]
     }
@@ -142,13 +169,22 @@ enum JavaCore {
     }
 
     private static func numberClass() -> [NativeClass] {
-        let cls = NativeClass("Ljava/lang/Number;", superclass: "Ljava/lang/Object;")
-        cls.method("intValue", "()I") { _, _, _ in .int32(0) }
-        cls.method("longValue", "()J") { _, _, _ in .int64(0) }
-        cls.method("floatValue", "()F") { _, _, _ in .float(0) }
-        cls.method("doubleValue", "()D") { _, _, _ in .double(0) }
-        cls.method("byteValue", "()B") { _, _, _ in .int32(0) }
-        cls.method("shortValue", "()S") { _, _, _ in .int32(0) }
+        let cls = NativeClass("Ljava/lang/Number;", superclass: "Ljava/lang/Object;", access: DexAccess.isPublic | DexAccess.isAbstract)
+        cls.method("<init>", "()V") { _, _, _ in .zero }
+        for (name, result) in [("intValue", "I"), ("longValue", "J"), ("floatValue", "F"), ("doubleValue", "D")] {
+            cls.methods.append(NativeMethod(name: name, signature: "()\(result)", access: DexAccess.isPublic | DexAccess.isAbstract, body: { _, _, _ in
+                throw VMJavaException("Ljava/lang/AbstractMethodError;")
+            }))
+        }
+        for short in [false, true] {
+            cls.method(short ? "shortValue" : "byteValue", short ? "()S" : "()B") { runtime, args, _ in
+                guard let method = runtime.classOf(args[0])?.lookupVirtual(key: "intValue()I") else {
+                    throw VMJavaException("Ljava/lang/AbstractMethodError;")
+                }
+                let value = try runtime.invoke(method, [args[0]]).asInt32
+                return .int32(short ? Int32(Int16(truncatingIfNeeded: value)) : Int32(Int8(truncatingIfNeeded: value)))
+            }
+        }
         return [cls]
     }
 
@@ -192,15 +228,8 @@ enum JavaCore {
             return .zero
         }
         cls.method("<init>", "([CII)V") { runtime, args, _ in
-            guard let target = args[0].object, let array = args[1].object else { return .zero }
-            let offset = Int(args[2].asInt32)
-            let count = Int(args[3].asInt32)
-            let total = Int(VMObjectLayout.aux(array))
-            var units = [UInt16](repeating: 0, count: max(0, min(count, total - offset)))
-            for index in 0..<units.count {
-                units[index] = UInt16(truncatingIfNeeded: VMObjectLayout.slot(array, offset + index).pointee.asInt32)
-            }
-            runtime.fillString(target, units: units)
+            guard let target = args[0].object else { return .zero }
+            runtime.fillString(target, units: try runtime.charArrayUnits(args[1], offset: Int(args[2].asInt32), count: Int(args[3].asInt32)))
             return .zero
         }
         cls.method("<init>", "([B)V") { runtime, args, _ in
@@ -262,14 +291,13 @@ enum JavaCore {
             }
             return .zero
         }
-        cls.staticMethod("valueOf", "([C)Ljava/lang/String;") { runtime, args, _ in
-            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
-            var units: [UInt16] = []
-            units.reserveCapacity(runtime.arrayLength(args[0]))
-            for index in 0..<runtime.arrayLength(args[0]) {
-                units.append(UInt16(truncatingIfNeeded: runtime.arrayElement(args[0], index).asInt32))
+        for name in ["valueOf", "copyValueOf"] {
+            cls.staticMethod(name, "([C)Ljava/lang/String;") { runtime, args, _ in
+                runtime.newString(units: try runtime.charArrayUnits(args[0]))
             }
-            return runtime.newString(units: units)
+            cls.staticMethod(name, "([CII)Ljava/lang/String;") { runtime, args, _ in
+                runtime.newString(units: try runtime.charArrayUnits(args[0], offset: Int(args[1].asInt32), count: Int(args[2].asInt32)))
+            }
         }
         cls.staticField("CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;")
         cls.prepare = { runtime, cls in
@@ -283,10 +311,10 @@ enum JavaCore {
         cls.method("isEmpty", "()Z") { runtime, args, _ in .boolean((runtime.stringUnits(args[0])?.count ?? 0) == 0) }
         cls.method("isBlank", "()Z") { runtime, args, _ in
             guard let units = runtime.stringUnits(args[0]) else { return .boolean(true) }
-            return .boolean(!units.contains { !CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar($0) ?? " ") })
+            return .boolean(units.allSatisfy(JavaCore.isJavaWhitespace))
         }
         cls.staticMethod("format", "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
-            runtime.format(template: args[1], arguments: args[2])
+            try runtime.format(template: args[1], arguments: args[2])
         }
         cls.method("toString", "()Ljava/lang/String;") { _, args, _ in args[0] }
         cls.method("charAt", "(I)C") { runtime, args, _ in
@@ -309,6 +337,25 @@ enum JavaCore {
                 }
             }
             return .int32(Int32(first))
+        }
+        cls.method("codePointCount", "(II)I") { runtime, args, _ in
+            let units = runtime.stringUnits(args[0]) ?? []
+            let begin = Int(args[1].asInt32), end = Int(args[2].asInt32)
+            guard begin >= 0, end <= units.count, begin <= end else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            var count = 0
+            var index = begin
+            while index < end {
+                if (0xD800...0xDBFF).contains(units[index]), index + 1 < end,
+                   (0xDC00...0xDFFF).contains(units[index + 1]) { index += 1 }
+                count += 1
+                index += 1
+            }
+            return .int32(Int32(count))
+        }
+        for signature in ["(Ljava/lang/CharSequence;)Z", "(Ljava/lang/StringBuffer;)Z"] {
+            cls.method("contentEquals", signature) { runtime, args, _ in
+                .boolean(try runtime.stringUnits(args[0]) == runtime.charSequenceUnits(args[1]))
+            }
         }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             .boolean(runtime.stringsEqual(args[0], args[1]))
@@ -364,18 +411,18 @@ enum JavaCore {
             for index in 0..<suffix.count where text[offset + index] != suffix[index] { return .boolean(false) }
             return .boolean(true)
         }
-        cls.method("indexOf", "(I)I") { runtime, args, _ in
-            guard let units = runtime.stringUnits(args[0]) else { return .int32(-1) }
-            let target = UInt16(truncatingIfNeeded: args[1].asInt32)
-            return .int32(Int32(units.firstIndex(of: target) ?? -1))
-        }
-        cls.method("indexOf", "(II)I") { runtime, args, _ in
-            guard let units = runtime.stringUnits(args[0]) else { return .int32(-1) }
-            let target = UInt16(truncatingIfNeeded: args[1].asInt32)
-            let from = Int(args[2].asInt32)
-            guard from >= 0, from <= units.count else { return .int32(-1) }
-            for index in from..<units.count where units[index] == target { return .int32(Int32(index)) }
-            return .int32(-1)
+        for signature in ["(I)I", "(II)I"] {
+            cls.method("indexOf", signature) { runtime, args, count in
+                let codePoint = args[1].asInt32
+                guard codePoint >= 0, codePoint <= 0x10FFFF else { return .int32(-1) }
+                let target: [UInt16]
+                if codePoint < 0x10000 {
+                    target = [UInt16(codePoint)]
+                } else {
+                    target = [UInt16(0xD800 + ((codePoint - 0x10000) >> 10)), UInt16(0xDC00 + ((codePoint - 0x10000) & 0x3FF))]
+                }
+                return .int32(runtime.indexOf(args[0], needle: runtime.newString(units: target), from: count > 2 ? Int(args[2].asInt32) : 0, last: false))
+            }
         }
         cls.method("indexOf", "(Ljava/lang/String;)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: 0, last: false)) }
         cls.method("indexOf", "(Ljava/lang/String;I)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: Int(args[2].asInt32), last: false)) }
@@ -384,7 +431,8 @@ enum JavaCore {
             let target = UInt16(truncatingIfNeeded: args[1].asInt32)
             return .int32(Int32(units.lastIndex(of: target) ?? -1))
         }
-        cls.method("lastIndexOf", "(Ljava/lang/String;)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: 0, last: true)) }
+        cls.method("lastIndexOf", "(Ljava/lang/String;)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: Int.max, last: true)) }
+        cls.method("lastIndexOf", "(Ljava/lang/String;I)I") { runtime, args, _ in .int32(runtime.indexOf(args[0], needle: args[1], from: Int(args[2].asInt32), last: true)) }
         cls.method("substring", "(I)Ljava/lang/String;") { runtime, args, _ in
             try runtime.substring(args[0], from: Int(args[1].asInt32), to: nil, receiver: args[0])
         }
@@ -395,9 +443,8 @@ enum JavaCore {
             try runtime.substring(args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), receiver: args[0])
         }
         cls.method("concat", "(Ljava/lang/String;)Ljava/lang/String;") { runtime, args, _ in
-            let left = runtime.stringValue(args[0]) ?? ""
-            let right = runtime.stringValue(args[1]) ?? ""
-            return runtime.newString(left + right)
+            guard let left = runtime.stringUnits(args[0]), let right = runtime.stringUnits(args[1]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return right.isEmpty ? args[0] : runtime.newString(units: left + right)
         }
         cls.method("replace", "(CC)Ljava/lang/String;") { runtime, args, _ in
             guard var units = runtime.stringUnits(args[0]) else { return .null }
@@ -407,10 +454,28 @@ enum JavaCore {
             return runtime.newString(units: units)
         }
         cls.method("replace", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;") { runtime, args, _ in
-            guard let text = runtime.stringValue(args[0]) else { return .null }
-            let from = runtime.stringValue(args[1]) ?? ""
-            let to = runtime.stringValue(args[2]) ?? ""
-            return runtime.newString(from.isEmpty ? text : text.replacingOccurrences(of: from, with: to))
+            let text = runtime.stringUnits(args[0]) ?? []
+            let from = try runtime.charSequenceUnits(args[1])
+            let to = try runtime.charSequenceUnits(args[2])
+            var result: [UInt16] = []
+            var index = 0
+            while index <= text.count {
+                if from.isEmpty {
+                    result.append(contentsOf: to)
+                    if index < text.count { result.append(text[index]) }
+                    index += 1
+                } else if index + from.count <= text.count,
+                          text[index..<index + from.count].elementsEqual(from) {
+                    result.append(contentsOf: to)
+                    index += from.count
+                } else if index < text.count {
+                    result.append(text[index])
+                    index += 1
+                } else {
+                    break
+                }
+            }
+            return runtime.newString(units: result)
         }
         cls.method("trim", "()Ljava/lang/String;") { runtime, args, _ in
             var units = runtime.stringUnits(args[0]) ?? []
@@ -449,8 +514,8 @@ enum JavaCore {
             return array
         }
         cls.method("getBytes", "()[B") { runtime, args, _ in
-            guard let text = runtime.stringValue(args[0]) else { return .null }
-            let bytes = Array(text.utf8)
+            guard let units = runtime.stringUnits(args[0]) else { return .null }
+            let bytes = runtime.encode(units: units, charset: "UTF-8")
             let array = runtime.newArray(component: "B", count: bytes.count)
             if let pointer = array.object {
                 for (index, byte) in bytes.enumerated() {
@@ -460,9 +525,8 @@ enum JavaCore {
             return array
         }
         cls.method("getBytes", "(Ljava/nio/charset/Charset;)[B") { runtime, args, _ in
-            guard let text = runtime.stringValue(args[0]) else { return .null }
-            let charset = runtime.stringValue(args[1]) ?? "UTF-8"
-            let bytes = runtime.encode(text, charset: charset)
+            guard let units = runtime.stringUnits(args[0]), args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let bytes = runtime.encode(units: units, charset: runtime.charsetName(args[1]))
             let array = runtime.newArray(component: "B", count: bytes.count)
             if let pointer = array.object {
                 for (index, byte) in bytes.enumerated() {
@@ -503,7 +567,10 @@ enum JavaCore {
             guard let text = runtime.stringValue(args[0]), let pattern = runtime.stringValue(args[1]) else { return .boolean(false) }
             return .boolean(runtime.regexMatches(text, pattern: pattern))
         }
-        cls.method("intern", "()Ljava/lang/String;") { _, args, _ in args[0] }
+        cls.method("intern", "()Ljava/lang/String;") { runtime, args, _ in
+            guard let units = runtime.stringUnits(args[0]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return runtime.internedString(units: units)
+        }
         cls.staticMethod("valueOf", "(I)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asInt32)) }
         cls.staticMethod("valueOf", "(J)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asInt64)) }
         cls.staticMethod("valueOf", "(F)Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asFloat)) }
@@ -516,25 +583,73 @@ enum JavaCore {
             args[0].bits == 0 ? runtime.newString("null") : runtime.javaToString(args[0])
         }
         cls.staticMethod("format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
-            runtime.format(template: args[0], arguments: args[1])
+            try runtime.format(template: args[0], arguments: args[1])
         }
-        cls.staticMethod("join", "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;") { runtime, args, _ in
-            runtime.join(separator: args[0], elements: args[1])
+        for signature in ["(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;", "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;"] {
+            cls.staticMethod("join", signature) { runtime, args, _ in
+                try runtime.join(separator: args[0], elements: args[1])
+            }
         }
-        cls.staticMethod("copyValueOf", "([C)Ljava/lang/String;") { runtime, args, _ in
-            guard let array = args[0].object else { return .null }
-            let count = Int(VMObjectLayout.aux(array))
-            var units = [UInt16](repeating: 0, count: count)
-            for index in 0..<count { units[index] = UInt16(truncatingIfNeeded: VMObjectLayout.slot(array, index).pointee.asInt32) }
-            return runtime.newString(units: units)
+        cls.method("repeat", "(I)Ljava/lang/String;") { runtime, args, _ in
+            let count = Int(args[1].asInt32)
+            guard count >= 0 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "count is negative: \(count)") }
+            let units = runtime.stringUnits(args[0]) ?? []
+            if count == 1 || units.isEmpty { return args[0] }
+            let (length, overflow) = units.count.multipliedReportingOverflow(by: count)
+            guard !overflow, length <= Int(Int32.max) else { throw VMJavaException("Ljava/lang/OutOfMemoryError;") }
+            var result: [UInt16] = []
+            result.reserveCapacity(length)
+            for _ in 0..<count { result.append(contentsOf: units) }
+            return runtime.newString(units: result)
         }
-        return [cls]
+        for signature in ["(ILjava/lang/String;II)Z", "(ZILjava/lang/String;II)Z"] {
+            cls.method("regionMatches", signature) { runtime, args, count in
+                let ignoreCase = count == 6 && args[1].asBoolean
+                let offset = count == 6 ? 2 : 1
+                guard let left = runtime.stringUnits(args[0]), let right = runtime.stringUnits(args[offset + 1]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                let leftStart = Int(args[offset].asInt32), rightStart = Int(args[offset + 2].asInt32)
+                let length = Int(args[offset + 3].asInt32)
+                guard leftStart >= 0, rightStart >= 0, leftStart <= left.count - length, rightStart <= right.count - length else { return .boolean(false) }
+                if length <= 0 { return .boolean(true) }
+                for index in 0..<length {
+                    let a = left[leftStart + index], b = right[rightStart + index]
+                    if a == b { continue }
+                    guard ignoreCase, let sa = UnicodeScalar(a), let sb = UnicodeScalar(b) else { return .boolean(false) }
+                    let upperA = String(sa).uppercased(), upperB = String(sb).uppercased()
+                    if upperA != upperB && upperA.lowercased() != upperB.lowercased() { return .boolean(false) }
+                }
+                return .boolean(true)
+            }
+        }
+        cls.method("lines", "()Ljava/util/stream/Stream;") { runtime, args, _ in
+            runtime.makeNative("Lmihon/compat/StringLinesStream;", payload: VMStringLinesStream(units: runtime.stringUnits(args[0]) ?? []))
+        }
+        let interfaceAccess = DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract
+        let baseStream = NativeClass("Ljava/util/stream/BaseStream;", interfaces: ["Ljava/lang/AutoCloseable;"], access: interfaceAccess)
+        baseStream.methods.append(NativeMethod(name: "close", signature: "()V", access: DexAccess.isPublic | DexAccess.isAbstract, body: { _, _, _ in
+            throw VMJavaException("Ljava/lang/AbstractMethodError;")
+        }))
+        let stream = NativeClass("Ljava/util/stream/Stream;", interfaces: ["Ljava/util/stream/BaseStream;"], access: interfaceAccess)
+        stream.methods.append(NativeMethod(name: "count", signature: "()J", access: DexAccess.isPublic | DexAccess.isAbstract, body: { _, _, _ in
+            throw VMJavaException("Ljava/lang/AbstractMethodError;")
+        }))
+        let lines = NativeClass("Lmihon/compat/StringLinesStream;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/stream/Stream;"], access: DexAccess.isFinal)
+        lines.method("count", "()J") { runtime, args, _ in
+            let stream: VMStringLinesStream = try runtime.payloadBox(args[0])
+            return .int64(try stream.count())
+        }
+        lines.method("close", "()V") { runtime, args, _ in
+            let stream: VMStringLinesStream = try runtime.payloadBox(args[0])
+            stream.consumed = true
+            return .zero
+        }
+        return [cls, baseStream, stream, lines]
     }
 
     // MARK: - java.lang.StringBuilder
 
     private static func stringBuilderClass() -> [NativeClass] {
-        let cls = NativeClass("Ljava/lang/StringBuilder;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Appendable;"])
+        let cls = NativeClass("Ljava/lang/StringBuilder;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Appendable;", "Ljava/io/Serializable;"])
         cls.method("<init>", "()V") { runtime, args, _ in
             runtime.mutatingString(args[0]).units.removeAll(keepingCapacity: true)
             return .zero
@@ -544,13 +659,11 @@ enum JavaCore {
             return .zero
         }
         cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
-            let text = runtime.stringValue(args[1]) ?? ""
-            runtime.mutatingString(args[0]).units = Array(text.utf16)
+            runtime.mutatingString(args[0]).units = try runtime.charSequenceUnits(args[1])
             return .zero
         }
         cls.method("<init>", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
-            let text = runtime.stringValue(args[1]) ?? ""
-            runtime.mutatingString(args[0]).units = Array(text.utf16)
+            runtime.mutatingString(args[0]).units = try runtime.charSequenceUnits(args[1])
             return .zero
         }
         for (signature, kind) in [
@@ -566,7 +679,7 @@ enum JavaCore {
             ("(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;", "sequence"),
         ] {
             cls.method("append", signature) { runtime, args, _ in
-                runtime.appendString(args[0], kind: kind, value: args[1])
+                runtime.mutatingString(args[0]).units.append(contentsOf: try runtime.stringConversionUnits(args[1], kind: kind))
                 return args[0]
             }
         }
@@ -585,33 +698,68 @@ enum JavaCore {
             ("([C)Ljava/lang/Appendable;", "chars"),
         ] {
             cls.method("append", signature) { runtime, args, _ in
-                runtime.appendString(args[0], kind: kind, value: args[1])
+                runtime.mutatingString(args[0]).units.append(contentsOf: try runtime.stringConversionUnits(args[1], kind: kind))
                 return args[0]
             }
         }
-        cls.method("insert", "(ILjava/lang/String;)Ljava/lang/StringBuilder;") { runtime, args, _ in
-            runtime.insertString(args[0], at: Int(args[1].asInt32), text: runtime.stringValue(args[2]) ?? "")
+        for (signature, kind) in [
+            ("(ILjava/lang/String;)Ljava/lang/StringBuilder;", "string"),
+            ("(ILjava/lang/CharSequence;)Ljava/lang/StringBuilder;", "sequence"),
+            ("(ILjava/lang/Object;)Ljava/lang/StringBuilder;", "object"),
+            ("(II)Ljava/lang/StringBuilder;", "int"),
+            ("(IJ)Ljava/lang/StringBuilder;", "long"),
+            ("(IF)Ljava/lang/StringBuilder;", "float"),
+            ("(ID)Ljava/lang/StringBuilder;", "double"),
+            ("(IZ)Ljava/lang/StringBuilder;", "bool"),
+            ("(IC)Ljava/lang/StringBuilder;", "char"),
+            ("(I[C)Ljava/lang/StringBuilder;", "chars"),
+        ] {
+            cls.method("insert", signature) { runtime, args, _ in
+                try runtime.insertString(args[0], at: Int(args[1].asInt32), units: runtime.stringConversionUnits(args[2], kind: kind))
+                return args[0]
+            }
+        }
+        cls.method("insert", "(I[CII)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            try runtime.insertString(args[0], at: Int(args[1].asInt32), units: runtime.charArrayUnits(args[2], offset: Int(args[3].asInt32), count: Int(args[4].asInt32)))
+            return args[0]
+        }
+        cls.method("insert", "(ILjava/lang/CharSequence;II)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            let units = args[2].bits == 0 ? Array("null".utf16) : try runtime.charSequenceUnits(args[2])
+            let start = Int(args[3].asInt32), end = Int(args[4].asInt32)
+            guard start >= 0, end <= units.count, start <= end else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            try runtime.insertString(args[0], at: Int(args[1].asInt32), units: Array(units[start..<end]))
+            return args[0]
+        }
+        cls.method("replace", "(IILjava/lang/String;)Ljava/lang/StringBuilder;") { runtime, args, _ in
+            let builder = runtime.mutatingString(args[0])
+            let start = Int(args[1].asInt32), end = min(Int(args[2].asInt32), builder.units.count)
+            guard start >= 0, start <= builder.units.count, start <= end else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            guard let replacement = runtime.stringUnits(args[3]) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            builder.units.replaceSubrange(start..<end, with: replacement)
             return args[0]
         }
         cls.method("reverse", "()Ljava/lang/StringBuilder;") { runtime, args, _ in
-            runtime.mutatingString(args[0]).units.reverse()
+            runtime.reverseString(args[0])
             return args[0]
         }
         cls.method("length", "()I") { runtime, args, _ in .int32(Int32(runtime.mutatingString(args[0]).units.count)) }
         cls.method("charAt", "(I)C") { runtime, args, _ in
-            .int32(Int32(runtime.mutatingString(args[0]).units[Int(args[1].asInt32)]))
+            let units = runtime.mutatingString(args[0]).units
+            let index = Int(args[1].asInt32)
+            guard index >= 0, index < units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            return .int32(Int32(units[index]))
         }
         cls.method("setCharAt", "(IC)V") { runtime, args, _ in
             let index = Int(args[1].asInt32)
             let units = runtime.mutatingString(args[0]).units
-            if index >= 0, index < units.count {
-                runtime.mutatingString(args[0]).units[index] = UInt16(truncatingIfNeeded: args[2].asInt32)
-            }
+            guard index >= 0, index < units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            runtime.mutatingString(args[0]).units[index] = UInt16(truncatingIfNeeded: args[2].asInt32)
             return .zero
         }
         cls.method("setLength", "(I)V") { runtime, args, _ in
-            let length = max(0, Int(args[1].asInt32))
-            var builder = runtime.mutatingString(args[0])
+            let length = Int(args[1].asInt32)
+            guard length >= 0 else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            let builder = runtime.mutatingString(args[0])
             var units = builder.units
             if units.count > length {
                 units.removeSubrange(length..<units.count)
@@ -619,20 +767,21 @@ enum JavaCore {
                 units.append(contentsOf: repeatElement(0, count: length - units.count))
             }
             builder.units = units
-            runtime.mutatingString(args[0]).units = units
             return .zero
         }
         cls.method("deleteCharAt", "(I)Ljava/lang/StringBuilder;") { runtime, args, _ in
             let index = Int(args[1].asInt32)
             var units = runtime.mutatingString(args[0]).units
-            if index >= 0, index < units.count { units.remove(at: index) }
+            guard index >= 0, index < units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
+            units.remove(at: index)
             runtime.mutatingString(args[0]).units = units
             return args[0]
         }
         cls.method("delete", "(II)Ljava/lang/StringBuilder;") { runtime, args, _ in
-            let start = max(0, Int(args[1].asInt32))
+            let start = Int(args[1].asInt32)
             let end = min(Int(args[2].asInt32), runtime.mutatingString(args[0]).units.count)
             var units = runtime.mutatingString(args[0]).units
+            guard start >= 0, start <= units.count, start <= end else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
             if start < end { units.removeSubrange(start..<end) }
             runtime.mutatingString(args[0]).units = units
             return args[0]
@@ -656,8 +805,7 @@ enum JavaCore {
             return runtime.newString(units: Array(units[start..<end]))
         }
         cls.method("append", "(Ljava/lang/CharSequence;II)Ljava/lang/StringBuilder;") { runtime, args, _ in
-            let text = args[1].bits == 0 ? "null" : (runtime.stringValue(runtime.javaToString(args[1])) ?? "")
-            let units = Array(text.utf16)
+            let units = args[1].bits == 0 ? Array("null".utf16) : try runtime.charSequenceUnits(args[1])
             let start = Int(args[2].asInt32)
             let end = Int(args[3].asInt32)
             guard start >= 0, end <= units.count, start <= end else {
@@ -671,12 +819,9 @@ enum JavaCore {
             guard codePoint >= 0, codePoint <= 0x10FFFF else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Not a valid Unicode code point: 0x\(String(UInt32(bitPattern: codePoint), radix: 16))")
             }
-            let units: [UInt16]
-            if let scalar = UnicodeScalar(UInt32(bitPattern: codePoint)) {
-                units = Array(String(scalar).utf16)
-            } else {
-                units = []
-            }
+            let units: [UInt16] = codePoint < 0x10000
+                ? [UInt16(codePoint)]
+                : [UInt16(0xD800 + ((codePoint - 0x10000) >> 10)), UInt16(0xDC00 + ((codePoint - 0x10000) & 0x3FF))]
             runtime.mutatingString(args[0]).units.append(contentsOf: units)
             return args[0]
         }
@@ -705,17 +850,15 @@ enum JavaCore {
     /// type fields and parameters with it (and `String.length`/`getChars` on
     /// it), and it must answer covariant `append` returns for its own type.
     private static func stringBufferClass() -> [NativeClass] {
-        let cls = NativeClass("Ljava/lang/StringBuffer;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Appendable;"])
+        let cls = NativeClass("Ljava/lang/StringBuffer;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/CharSequence;", "Ljava/lang/Appendable;", "Ljava/io/Serializable;"])
         cls.method("<init>", "()V") { _, _, _ in .zero }
         cls.method("<init>", "(I)V") { _, _, _ in .zero }
         cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
-            let text = runtime.stringValue(args[1]) ?? ""
-            runtime.mutatingString(args[0]).units = Array(text.utf16)
+            runtime.mutatingString(args[0]).units = try runtime.charSequenceUnits(args[1])
             return .zero
         }
         cls.method("<init>", "(Ljava/lang/CharSequence;)V") { runtime, args, _ in
-            let text = runtime.stringValue(args[1]) ?? ""
-            runtime.mutatingString(args[0]).units = Array(text.utf16)
+            runtime.mutatingString(args[0]).units = try runtime.charSequenceUnits(args[1])
             return .zero
         }
         for (signature, kind) in [
@@ -731,13 +874,12 @@ enum JavaCore {
             ("(Ljava/lang/CharSequence;)Ljava/lang/StringBuffer;", "sequence"),
         ] {
             cls.method("append", signature) { runtime, args, _ in
-                runtime.appendString(args[0], kind: kind, value: args[1])
+                runtime.mutatingString(args[0]).units.append(contentsOf: try runtime.stringConversionUnits(args[1], kind: kind))
                 return args[0]
             }
         }
         cls.method("append", "(Ljava/lang/CharSequence;II)Ljava/lang/StringBuffer;") { runtime, args, _ in
-            let text = args[1].bits == 0 ? "null" : (runtime.stringValue(runtime.javaToString(args[1])) ?? "")
-            let units = Array(text.utf16)
+            let units = args[1].bits == 0 ? Array("null".utf16) : try runtime.charSequenceUnits(args[1])
             let start = Int(args[2].asInt32)
             let end = Int(args[3].asInt32)
             guard start >= 0, end <= units.count, start <= end else {
@@ -748,21 +890,45 @@ enum JavaCore {
         }
         cls.method("appendCodePoint", "(I)Ljava/lang/StringBuffer;") { runtime, args, _ in
             let codePoint = args[1].asInt32
-            guard codePoint >= 0, codePoint <= 0x10FFFF, let scalar = UnicodeScalar(UInt32(bitPattern: codePoint)) else {
+            guard codePoint >= 0, codePoint <= 0x10FFFF else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Not a valid Unicode code point")
             }
-            runtime.mutatingString(args[0]).units.append(contentsOf: String(scalar).utf16)
+            let units: [UInt16] = codePoint < 0x10000
+                ? [UInt16(codePoint)]
+                : [UInt16(0xD800 + ((codePoint - 0x10000) >> 10)), UInt16(0xDC00 + ((codePoint - 0x10000) & 0x3FF))]
+            runtime.mutatingString(args[0]).units.append(contentsOf: units)
             return args[0]
         }
-        cls.method("insert", "(ILjava/lang/String;)Ljava/lang/StringBuffer;") { runtime, args, _ in
-            let index = Int(args[1].asInt32)
-            let units = runtime.mutatingString(args[0]).units
-            guard index >= 0, index <= units.count else { throw VMJavaException("Ljava/lang/StringIndexOutOfBoundsException;") }
-            runtime.insertString(args[0], at: index, text: runtime.stringValue(args[2]) ?? "")
+        for (signature, kind) in [
+            ("(ILjava/lang/String;)Ljava/lang/StringBuffer;", "string"),
+            ("(ILjava/lang/CharSequence;)Ljava/lang/StringBuffer;", "sequence"),
+            ("(ILjava/lang/Object;)Ljava/lang/StringBuffer;", "object"),
+            ("(II)Ljava/lang/StringBuffer;", "int"),
+            ("(IJ)Ljava/lang/StringBuffer;", "long"),
+            ("(IF)Ljava/lang/StringBuffer;", "float"),
+            ("(ID)Ljava/lang/StringBuffer;", "double"),
+            ("(IZ)Ljava/lang/StringBuffer;", "bool"),
+            ("(IC)Ljava/lang/StringBuffer;", "char"),
+            ("(I[C)Ljava/lang/StringBuffer;", "chars"),
+        ] {
+            cls.method("insert", signature) { runtime, args, _ in
+                try runtime.insertString(args[0], at: Int(args[1].asInt32), units: runtime.stringConversionUnits(args[2], kind: kind))
+                return args[0]
+            }
+        }
+        cls.method("insert", "(I[CII)Ljava/lang/StringBuffer;") { runtime, args, _ in
+            try runtime.insertString(args[0], at: Int(args[1].asInt32), units: runtime.charArrayUnits(args[2], offset: Int(args[3].asInt32), count: Int(args[4].asInt32)))
+            return args[0]
+        }
+        cls.method("insert", "(ILjava/lang/CharSequence;II)Ljava/lang/StringBuffer;") { runtime, args, _ in
+            let units = args[2].bits == 0 ? Array("null".utf16) : try runtime.charSequenceUnits(args[2])
+            let start = Int(args[3].asInt32), end = Int(args[4].asInt32)
+            guard start >= 0, end <= units.count, start <= end else { throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;") }
+            try runtime.insertString(args[0], at: Int(args[1].asInt32), units: Array(units[start..<end]))
             return args[0]
         }
         cls.method("reverse", "()Ljava/lang/StringBuffer;") { runtime, args, _ in
-            runtime.mutatingString(args[0]).units.reverse()
+            runtime.reverseString(args[0])
             return args[0]
         }
         cls.method("length", "()I") { runtime, args, _ in .int32(Int32(runtime.mutatingString(args[0]).units.count)) }
@@ -861,6 +1027,7 @@ enum JavaCore {
             return .int32(Int32(bitPattern: UInt32(truncatingIfNeeded: UInt(bitPattern: pointer) / 16)))
         }
         cls.staticMethod("valueOf", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;") { runtime, args, _ in
+            guard args[0].bits != 0, args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
             guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else {
                 throw VMJavaException("Ljava/lang/IllegalArgumentException;")
             }
@@ -916,6 +1083,18 @@ enum JavaCore {
         return cls
     }
 
+    private static func comparableMethods(_ cls: NativeClass, _ body: @escaping NativeBody) {
+        for parameter in [cls.descriptor, "Ljava/lang/Object;"] {
+            cls.method("compareTo", "(\(parameter))I") { runtime, args, count in
+                guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                guard runtime.classOf(args[1])?.descriptor == cls.descriptor else {
+                    throw VMJavaException("Ljava/lang/ClassCastException;")
+                }
+                return try body(runtime, args, count)
+            }
+        }
+    }
+
     private static func booleanClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/lang/Boolean;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/lang/Comparable;", "Ljava/io/Serializable;"])
         cls.field("value", "Z")
@@ -950,6 +1129,10 @@ enum JavaCore {
             let left = args[0].asBoolean ? 1 : 0, right = args[1].asBoolean ? 1 : 0
             return .int32(Int32(left - right))
         }
+        comparableMethods(cls) { runtime, args, _ in
+            let left = args[0].asBoxedBoolean(runtime), right = args[1].asBoxedBoolean(runtime)
+            return .int32(left == right ? 0 : (left ? 1 : -1))
+        }
         cls.method("hashCode", "()I") { runtime, args, _ in .int32(args[0].asBoxedBoolean(runtime) ? 1231 : 1237) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == "Ljava/lang/Boolean;" else {
@@ -974,24 +1157,27 @@ enum JavaCore {
             cls.staticField("TYPE", "Ljava/lang/Class;")
         }
         cls.prepare = { runtime, cls in
-            cls.staticValues[0] = .int64(maxValue)
-            cls.staticValues[1] = .int64(minValue)
+            // An `int`-typed static holds a zero-extended 32-bit cell, exactly
+            // what `const` and `sget` produce for the same value.
+            cls.staticValues[0] = letter == "J" ? .int64(maxValue) : .int32(Int32(truncatingIfNeeded: maxValue))
+            cls.staticValues[1] = letter == "J" ? .int64(minValue) : .int32(Int32(truncatingIfNeeded: minValue))
             if letter == "J" {
                 cls.staticValues[2] = runtime.classObject(runtime.cachedClass("J"))
             }
         }
-        cls.method("<init>", "(I)V") { _, args, _ in
-            if let pointer = args[0].object { VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(args[1].asInt32)) }
-            return .zero
-        }
-        cls.method("<init>", "(J)V") { _, args, _ in
-            if let pointer = args[0].object { VMObjectLayout.slot(pointer, 0).pointee = args[1] }
+        cls.method("<init>", "(\(letter))V") { _, args, _ in
+            if let pointer = args[0].object {
+                VMObjectLayout.slot(pointer, 0).pointee = .int64(letter == "J" ? args[1].asInt64 : Int64(args[1].asInt32))
+            }
             return .zero
         }
         cls.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
             let text = runtime.stringValue(args[1]) ?? ""
+            guard let value = Int64(text), value >= minValue, value <= maxValue else {
+                throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            }
             if let pointer = args[0].object {
-                VMObjectLayout.slot(pointer, 0).pointee = .int64(Int64(text.trimmingCharacters(in: .whitespaces)) ?? 0)
+                VMObjectLayout.slot(pointer, 0).pointee = .int64(value)
             }
             return .zero
         }
@@ -1025,7 +1211,8 @@ enum JavaCore {
         }
         cls.method("hashCode", "()I") { _, args, _ in
             guard let pointer = args[0].object else { return .int32(0) }
-            return .int32(Int32(truncatingIfNeeded: VMObjectLayout.slot(pointer, 0).pointee.bits ^ (VMObjectLayout.slot(pointer, 0).pointee.bits >> 32)))
+            let value = VMObjectLayout.slot(pointer, 0).pointee
+            return .int32(Int32(truncatingIfNeeded: letter == "J" ? value.bits ^ (value.bits >> 32) : value.bits))
         }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard args[1].bits != 0, runtime.classOf(args[1])?.descriptor == descriptor,
@@ -1050,7 +1237,7 @@ enum JavaCore {
         cls.staticMethod("valueOf", "(Ljava/lang/String;)\(descriptor)") { runtime, args, _ in
             guard let cls = runtime.findClass(descriptor) else { return .null }
             let text = runtime.stringValue(args[0]) ?? ""
-            guard let value = Int64(text) else {
+            guard let value = Int64(text), value >= minValue, value <= maxValue else {
                 throw VMJavaException("Ljava/lang/NumberFormatException;", text)
             }
             let pointer = runtime.allocateObject(cls)
@@ -1074,7 +1261,7 @@ enum JavaCore {
         cls.staticMethod("parseInt", "(Ljava/lang/String;I)I") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
             let radix = Int(args[1].asInt32)
-            guard let value = Int32(text, radix: radix) else {
+            guard (2...36).contains(radix), let value = Int32(text, radix: radix) else {
                 throw VMJavaException("Ljava/lang/NumberFormatException;", text)
             }
             return .int32(value)
@@ -1088,7 +1275,7 @@ enum JavaCore {
         }
         cls.staticMethod("parseLong", "(Ljava/lang/String;I)J") { runtime, args, _ in
             let text = runtime.stringValue(args[0]) ?? ""
-            guard let value = Int64(text, radix: Int(args[1].asInt32)) else {
+            guard (2...36).contains(Int(args[1].asInt32)), let value = Int64(text, radix: Int(args[1].asInt32)) else {
                 throw VMJavaException("Ljava/lang/NumberFormatException;", text)
             }
             return .int64(value)
@@ -1111,110 +1298,133 @@ enum JavaCore {
             if letter == "J" { return runtime.newString(String(args[0].asInt64)) }
             return runtime.newString(String(args[0].asInt32))
         }
-        cls.method("compare", "(\(letter)\(letter))I") { _, args, _ in
-            if letter == "J" {
-                let a = args[0].asInt64, b = args[1].asInt64
-                return .int32(a < b ? -1 : (a > b ? 1 : 0))
-            }
-            let a = args[0].asInt32, b = args[1].asInt32
+        cls.staticMethod("compare", "(\(letter)\(letter))I") { _, args, _ in
+            let a = letter == "J" ? args[0].asInt64 : Int64(args[0].asInt32)
+            let b = letter == "J" ? args[1].asInt64 : Int64(args[1].asInt32)
+            if letter == "B" || letter == "S" { return .int32(Int32(a - b)) }
             return .int32(a < b ? -1 : (a > b ? 1 : 0))
         }
-        cls.staticMethod("toHexString", "(I)Ljava/lang/String;") { runtime, args, _ in
-            runtime.newString(String(UInt32(bitPattern: args[0].asInt32), radix: 16))
-        }
-        cls.staticMethod("bitCount", "(I)I") { _, args, _ in .int32(Int32(args[0].asUInt32.nonzeroBitCount)) }
-        cls.staticMethod("signum", "(I)I") { _, args, _ in .int32(args[0].asInt32.signum()) }
-        cls.method("max", "(\(letter)\(letter))\(letter)") { _, args, _ in
-            if letter == "J" { return .int64(max(args[0].asInt64, args[1].asInt64)) }
-            return .int32(max(args[0].asInt32, args[1].asInt32))
-        }
-        cls.method("min", "(\(letter)\(letter))\(letter)") { _, args, _ in
-            if letter == "J" { return .int64(min(args[0].asInt64, args[1].asInt64)) }
-            return .int32(min(args[0].asInt32, args[1].asInt32))
-        }
-        if letter == "B" {
-            cls.staticMethod("parseByte", "(Ljava/lang/String;)B") { runtime, args, _ in
-                let text = runtime.stringValue(args[0]) ?? ""
-                guard let value = Int8(text.trimmingCharacters(in: .whitespaces)) else {
-                    throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+        for parameter in [descriptor, "Ljava/lang/Object;"] {
+            cls.method("compareTo", "(\(parameter))I") { runtime, args, _ in
+                guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                guard runtime.classOf(args[1])?.descriptor == descriptor,
+                      let a = args[0].object, let b = args[1].object else {
+                    throw VMJavaException("Ljava/lang/ClassCastException;")
                 }
-                return .int32(Int32(value))
-            }
-            cls.staticMethod("parseByte", "(Ljava/lang/String;I)B") { runtime, args, _ in
-                let text = runtime.stringValue(args[0]) ?? ""
-                guard let value = Int8(text, radix: Int(args[1].asInt32)) else {
-                    throw VMJavaException("Ljava/lang/NumberFormatException;", text)
-                }
-                return .int32(Int32(value))
-            }
-        }
-        if letter == "I" {
-            cls.staticMethod("compareUnsigned", "(II)I") { _, args, _ in
-                let left = args[0].asUInt32, right = args[1].asUInt32
+                let left = VMObjectLayout.slot(a, 0).pointee.asInt64
+                let right = VMObjectLayout.slot(b, 0).pointee.asInt64
+                if letter == "B" || letter == "S" { return .int32(Int32(left - right)) }
                 return .int32(left < right ? -1 : (left > right ? 1 : 0))
             }
-            cls.staticMethod("remainderUnsigned", "(II)I") { _, args, _ in
-                let divisor = args[1].asUInt32
-                guard divisor != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
-                return .int32(Int32(bitPattern: args[0].asUInt32 % divisor))
+        }
+        if letter == "B" || letter == "S" {
+            let mask: UInt32 = letter == "B" ? 0xff : 0xffff
+            cls.staticMethod("toUnsignedInt", "(\(letter))I") { _, args, _ in
+                .int32(Int32(args[0].asUInt32 & mask))
             }
-            cls.staticMethod("rotateLeft", "(II)I") { _, args, _ in
-                let value = args[0].asUInt32
-                let distance = args[1].asInt32 & 31
-                if distance == 0 { return .int32(Int32(bitPattern: value)) }
-                return .int32(Int32(bitPattern: (value << UInt32(distance)) | (value >> UInt32(32 - distance))))
+            cls.staticMethod("toUnsignedLong", "(\(letter))J") { _, args, _ in
+                .int64(Int64(args[0].asUInt32 & mask))
             }
-            cls.staticMethod("highestOneBit", "(I)I") { _, args, _ in
-                let value = args[0].asUInt32
-                guard value != 0 else { return .int32(0) }
-                return .int32(Int32(bitPattern: UInt32(1) << UInt32(31 - value.leadingZeroBitCount)))
-            }
-            cls.staticMethod("numberOfLeadingZeros", "(I)I") { _, args, _ in
-                .int32(Int32(args[0].asUInt32.leadingZeroBitCount))
-            }
-            cls.staticMethod("toUnsignedString", "(I)Ljava/lang/String;") { runtime, args, _ in
-                runtime.newString(String(args[0].asUInt32))
-            }
-            cls.staticMethod("toUnsignedString", "(II)Ljava/lang/String;") { runtime, args, _ in
-                let radix = Int(args[1].asInt32)
-                return runtime.newString(String(args[0].asUInt32, radix: (2...36).contains(radix) ? radix : 10))
-            }
-            cls.staticMethod("toString", "(II)Ljava/lang/String;") { runtime, args, _ in
-                let radix = Int(args[1].asInt32)
-                return runtime.newString(String(args[0].asInt32, radix: (2...36).contains(radix) ? radix : 10))
-            }
-            cls.staticMethod("parseUnsignedInt", "(Ljava/lang/String;)I") { runtime, args, _ in
-                let text = runtime.stringValue(args[0]) ?? ""
-                guard let value = UInt32(text) else { throw VMJavaException("Ljava/lang/NumberFormatException;", text) }
-                return .int32(Int32(bitPattern: value))
-            }
-            cls.staticMethod("parseUnsignedInt", "(Ljava/lang/String;I)I") { runtime, args, _ in
-                let text = runtime.stringValue(args[0]) ?? ""
-                guard let value = UInt32(text, radix: Int(args[1].asInt32)) else {
-                    throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+            let parseName = letter == "B" ? "parseByte" : "parseShort"
+            for radixArgument in [false, true] {
+                cls.staticMethod(parseName, "(Ljava/lang/String;\(radixArgument ? "I" : ""))\(letter)") { runtime, args, _ in
+                    let text = runtime.stringValue(args[0]) ?? ""
+                    let radix = radixArgument ? Int(args[1].asInt32) : 10
+                    guard (2...36).contains(radix), let value = Int64(text, radix: radix),
+                          value >= minValue, value <= maxValue else {
+                        throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+                    }
+                    return .int32(Int32(value))
                 }
-                return .int32(Int32(bitPattern: value))
             }
         }
-        if letter == "J" {
-            cls.staticMethod("toString", "(JI)Ljava/lang/String;") { runtime, args, _ in
+        if letter == "I" || letter == "J" {
+            let wide = letter == "J"
+            let read: (VMValue) -> UInt64 = { wide ? $0.bits : UInt64($0.asUInt32) }
+            let cell: (UInt64) -> VMValue = { wide ? .int64(Int64(bitPattern: $0)) : .int32(Int32(truncatingIfNeeded: $0)) }
+            let width = wide ? 64 : 32
+            let mask = wide ? UInt64.max : UInt64(UInt32.max)
+            for (name, radix) in [("toBinaryString", 2), ("toOctalString", 8), ("toHexString", 16)] {
+                cls.staticMethod(name, "(\(letter))Ljava/lang/String;") { runtime, args, _ in
+                    runtime.newString(String(read(args[0]), radix: radix))
+                }
+            }
+            for withRadix in [false, true] {
+                cls.staticMethod("toUnsignedString", "(\(letter)\(withRadix ? "I" : ""))Ljava/lang/String;") { runtime, args, _ in
+                    let radix = withRadix ? Int(args[1].asInt32) : 10
+                    return runtime.newString(String(read(args[0]), radix: (2...36).contains(radix) ? radix : 10))
+                }
+                cls.staticMethod(wide ? "parseUnsignedLong" : "parseUnsignedInt", "(Ljava/lang/String;\(withRadix ? "I" : ""))\(letter)") { runtime, args, _ in
+                    let text = runtime.stringValue(args[0]) ?? ""
+                    let radix = withRadix ? Int(args[1].asInt32) : 10
+                    guard (2...36).contains(radix), let value = UInt64(text, radix: radix), value <= mask else {
+                        throw VMJavaException("Ljava/lang/NumberFormatException;", text)
+                    }
+                    return cell(value)
+                }
+            }
+            cls.staticMethod("toString", "(\(letter)I)Ljava/lang/String;") { runtime, args, _ in
                 let radix = Int(args[1].asInt32)
-                return runtime.newString(String(args[0].asInt64, radix: (2...36).contains(radix) ? radix : 10))
+                let value = wide ? args[0].asInt64 : Int64(args[0].asInt32)
+                return runtime.newString(String(value, radix: (2...36).contains(radix) ? radix : 10))
             }
-            cls.staticMethod("rotateRight", "(JI)J") { _, args, _ in
-                let value = UInt64(bitPattern: args[0].asInt64)
-                let distance = args[1].asInt32 & 63
-                if distance == 0 { return .int64(args[0].asInt64) }
-                let rotated = (value >> UInt64(distance)) | (value << UInt64(64 - distance))
-                return .int64(Int64(bitPattern: rotated))
+            cls.staticMethod("compareUnsigned", "(\(letter)\(letter))I") { _, args, _ in
+                let a = read(args[0]), b = read(args[1])
+                return .int32(a < b ? -1 : (a > b ? 1 : 0))
             }
-            cls.staticMethod("numberOfLeadingZeros", "(J)I") { _, args, _ in
-                .int32(Int32(UInt64(bitPattern: args[0].asInt64).leadingZeroBitCount))
+            for remainder in [false, true] {
+                cls.staticMethod(remainder ? "remainderUnsigned" : "divideUnsigned", "(\(letter)\(letter))\(letter)") { _, args, _ in
+                    let a = read(args[0]), b = read(args[1])
+                    guard b != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+                    return cell(remainder ? a % b : a / b)
+                }
             }
-            cls.staticMethod("highestOneBit", "(J)J") { _, args, _ in
-                let value = UInt64(bitPattern: args[0].asInt64)
-                guard value != 0 else { return .int64(0) }
-                return .int64(Int64(bitPattern: UInt64(1) << UInt64(63 - value.leadingZeroBitCount)))
+            for name in ["bitCount", "numberOfLeadingZeros", "numberOfTrailingZeros"] {
+                cls.staticMethod(name, "(\(letter))I") { _, args, _ in
+                    let value = read(args[0])
+                    let result: Int
+                    switch name {
+                    case "bitCount": result = value.nonzeroBitCount
+                    case "numberOfLeadingZeros": result = value.leadingZeroBitCount - (64 - width)
+                    default: result = value == 0 ? width : value.trailingZeroBitCount
+                    }
+                    return .int32(Int32(result))
+                }
+            }
+            for name in ["highestOneBit", "lowestOneBit", "reverse", "reverseBytes"] {
+                cls.staticMethod(name, "(\(letter))\(letter)") { _, args, _ in
+                    let value = read(args[0])
+                    switch name {
+                    case "highestOneBit": return cell(value == 0 ? 0 : UInt64(1) << (63 - value.leadingZeroBitCount))
+                    case "lowestOneBit": return cell(value & (0 &- value))
+                    case "reverseBytes": return cell(wide ? value.byteSwapped : UInt64(UInt32(truncatingIfNeeded: value).byteSwapped))
+                    default:
+                        var source = value, reversed: UInt64 = 0
+                        for _ in 0..<width { reversed = (reversed << 1) | (source & 1); source >>= 1 }
+                        return cell(reversed)
+                    }
+                }
+            }
+            for left in [false, true] {
+                cls.staticMethod(left ? "rotateLeft" : "rotateRight", "(\(letter)I)\(letter)") { _, args, _ in
+                    let value = read(args[0])
+                    let distance = Int(args[1].asInt32 & Int32(width - 1))
+                    if distance == 0 { return cell(value) }
+                    return cell((left ? (value << distance) | (value >> (width - distance)) : (value >> distance) | (value << (width - distance))) & mask)
+                }
+            }
+            cls.staticMethod("signum", "(\(letter))I") { _, args, _ in
+                .int32(wide ? Int32(args[0].asInt64.signum()) : args[0].asInt32.signum())
+            }
+            for name in ["min", "max", "sum"] {
+                cls.staticMethod(name, "(\(letter)\(letter))\(letter)") { _, args, _ in
+                    let a = wide ? args[0].asInt64 : Int64(args[0].asInt32)
+                    let b = wide ? args[1].asInt64 : Int64(args[1].asInt32)
+                    return cell(UInt64(bitPattern: name == "sum" ? a &+ b : (name == "min" ? min(a, b) : max(a, b))))
+                }
+            }
+            if !wide {
+                cls.staticMethod("toUnsignedLong", "(I)J") { _, args, _ in .int64(Int64(args[0].asUInt32)) }
             }
         }
         return [cls]
@@ -1236,8 +1446,8 @@ enum JavaCore {
             return .boolean(args[0].asBoxedChar(runtime) == args[1].asBoxedChar(runtime))
         }
         cls.method("hashCode", "()I") { runtime, args, _ in .int32(Int32(args[0].asBoxedChar(runtime))) }
-        cls.method("compareTo", "(Ljava/lang/Character;)I") { runtime, args, _ in
-            .int32(Int32(args[0].asBoxedChar(runtime)) - Int32(args[1].asBoxedChar(runtime)))
+        comparableMethods(cls) { runtime, args, _ in
+            return .int32(Int32(args[0].asBoxedChar(runtime)) - Int32(args[1].asBoxedChar(runtime)))
         }
         // `(C)` parameters are primitive cells: their bits are the code unit,
         // not a heap address, so they must never be unboxed.
@@ -1262,34 +1472,49 @@ enum JavaCore {
             VMObjectLayout.setAux(pointer, UInt64(raw))
             return .reference(pointer)
         }
-        cls.staticMethod("isDigit", "(C)Z") { _, args, _ in
-            .boolean(CharacterSet.decimalDigits.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
+        for letter in ["C", "I"] {
+            for name in ["isDigit", "isLetter", "isLetterOrDigit", "isWhitespace", "isUpperCase", "isLowerCase", "isJavaIdentifierStart", "isJavaIdentifierPart"] {
+                cls.staticMethod(name, "(\(letter))Z") { _, args, _ in
+                    let value = args[0].asUInt32
+                    guard let scalar = UnicodeScalar(value) else { return .boolean(false) }
+                    let category = scalar.properties.generalCategory
+                    let isLetter = category == .uppercaseLetter || category == .lowercaseLetter || category == .titlecaseLetter || category == .modifierLetter || category == .otherLetter
+                    let digit = category == .decimalNumber
+                    let start = isLetter || category == .letterNumber || category == .currencySymbol || category == .connectorPunctuation
+                    switch name {
+                    case "isDigit": return .boolean(digit)
+                    case "isLetter": return .boolean(isLetter)
+                    case "isLetterOrDigit": return .boolean(isLetter || digit)
+                    case "isUpperCase": return .boolean(scalar.properties.isUppercase)
+                    case "isLowerCase": return .boolean(scalar.properties.isLowercase)
+                    case "isJavaIdentifierStart": return .boolean(start)
+                    case "isJavaIdentifierPart":
+                        let ignorable = value <= 8 || (0x0e...0x1b).contains(value) || (0x7f...0x9f).contains(value) || category == .format
+                        return .boolean(start || digit || category == .nonspacingMark || category == .spacingMark || ignorable)
+                    default:
+                        let separator = category == .spaceSeparator || category == .lineSeparator || category == .paragraphSeparator
+                        return .boolean((9...13).contains(value) || (0x1c...0x1f).contains(value) || (separator && value != 0xa0 && value != 0x2007 && value != 0x202f))
+                    }
+                }
+            }
         }
-        cls.staticMethod("isLetter", "(C)Z") { _, args, _ in
-            .boolean(CharacterSet.letters.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
-        }
-        cls.staticMethod("isLetterOrDigit", "(C)Z") { _, args, _ in
-            let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
-            return .boolean(CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar))
-        }
-        cls.staticMethod("isWhitespace", "(C)Z") { _, args, _ in
-            .boolean(JavaCore.isJavaWhitespace(UInt16(truncatingIfNeeded: args[0].asInt32)))
-        }
-        cls.staticMethod("isUpperCase", "(C)Z") { _, args, _ in
-            let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
-            return .boolean(scalar.properties.isUppercase)
-        }
-        cls.staticMethod("isLowerCase", "(C)Z") { _, args, _ in
-            let scalar = UnicodeScalar(args[0].asUInt32) ?? " "
-            return .boolean(scalar.properties.isLowercase)
-        }
-        cls.staticMethod("toLowerCase", "(C)C") { _, args, _ in
-            let text = String(UnicodeScalar(args[0].asUInt32) ?? " ").lowercased()
-            return .int32(Int32(text.utf16.first ?? 0))
-        }
-        cls.staticMethod("toUpperCase", "(C)C") { _, args, _ in
-            let text = String(UnicodeScalar(args[0].asUInt32) ?? " ").uppercased()
-            return .int32(Int32(text.utf16.first ?? 0))
+        for letter in ["C", "I"] {
+            for name in ["toLowerCase", "toUpperCase", "toTitleCase"] {
+                cls.staticMethod(name, "(\(letter))\(letter)") { _, args, _ in
+                    let value = args[0].asUInt32
+                    guard let scalar = UnicodeScalar(value) else { return args[0] }
+                    if name == "toLowerCase" && value == 0x130 { return .int32(0x69) }
+                    let mapped: String
+                    switch name {
+                    case "toLowerCase": mapped = scalar.properties.lowercaseMapping
+                    case "toUpperCase": mapped = scalar.properties.uppercaseMapping
+                    default: mapped = scalar.properties.titlecaseMapping
+                    }
+                    guard mapped.unicodeScalars.count == 1, let result = mapped.unicodeScalars.first,
+                          letter == "I" || result.value <= 0xffff else { return args[0] }
+                    return .int32(Int32(result.value))
+                }
+            }
         }
         cls.staticMethod("isHighSurrogate", "(C)Z") { _, args, _ in
             let value = args[0].asUInt32
@@ -1311,65 +1536,184 @@ enum JavaCore {
         cls.staticMethod("charCount", "(I)I") { _, args, _ in
             .int32(args[0].asInt32 >= 0x10000 ? 2 : 1)
         }
+        for before in [false, true] {
+            for array in [false, true] {
+                for bounded in array ? [false, true] : [false] {
+                    let parameter = array ? "[C" : "Ljava/lang/CharSequence;"
+                    cls.staticMethod(before ? "codePointBefore" : "codePointAt", "(\(parameter)I\(bounded ? "I" : ""))I") { runtime, args, _ in
+                        let source = args[0]
+                        guard source.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                        let count: Int
+                        let read: (Int) throws -> UInt32
+                        if array {
+                            count = runtime.arrayLength(source)
+                            read = { runtime.arrayElement(source, $0).asUInt32 & 0xffff }
+                        } else {
+                            guard let owner = runtime.classOf(source),
+                                  let length = owner.lookupVirtual(key: "length()I"),
+                                  let charAt = owner.lookupVirtual(key: "charAt(I)C") else {
+                                throw VMJavaException("Ljava/lang/AbstractMethodError;")
+                            }
+                            count = Int(try runtime.invoke(length, [source]).asInt32)
+                            read = { index in
+                                try runtime.invoke(charAt, [source, .int32(Int32(index))]).asUInt32 & 0xffff
+                            }
+                        }
+                        let index = Int(args[1].asInt32)
+                        let boundary = bounded ? Int(args[2].asInt32) : (before ? 0 : count)
+                        if before {
+                            guard boundary >= 0, boundary < index, index <= count else {
+                                throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;")
+                            }
+                            let low = try read(index - 1)
+                            if (0xdc00...0xdfff).contains(low), index - 1 > boundary {
+                                let high = try read(index - 2)
+                                if (0xd800...0xdbff).contains(high) {
+                                    return .int32(Int32(((high - 0xd800) << 10) + low - 0xdc00 + 0x10000))
+                                }
+                            }
+                            return .int32(Int32(low))
+                        }
+                        guard index >= 0, index < boundary, boundary <= count else {
+                            throw VMJavaException("Ljava/lang/IndexOutOfBoundsException;")
+                        }
+                        let high = try read(index)
+                        if (0xd800...0xdbff).contains(high), index + 1 < boundary {
+                            let low = try read(index + 1)
+                            if (0xdc00...0xdfff).contains(low) {
+                                return .int32(Int32(((high - 0xd800) << 10) + low - 0xdc00 + 0x10000))
+                            }
+                        }
+                        return .int32(Int32(high))
+                    }
+                }
+            }
+        }
+        cls.staticMethod("toCodePoint", "(CC)I") { _, args, _ in
+            .int32(((args[0].asInt32 - 0xd800) << 10) + args[1].asInt32 - 0xdc00 + 0x10000)
+        }
+        cls.staticMethod("highSurrogate", "(I)C") { _, args, _ in
+            .int32(Int32(UInt16(truncatingIfNeeded: (args[0].asInt32 >> 10) + 0xd7c0)))
+        }
+        cls.staticMethod("lowSurrogate", "(I)C") { _, args, _ in
+            .int32((args[0].asInt32 & 0x3ff) + 0xdc00)
+        }
+        cls.staticMethod("isValidCodePoint", "(I)Z") { _, args, _ in
+            .boolean(args[0].asUInt32 <= 0x10ffff)
+        }
+        cls.staticMethod("isBmpCodePoint", "(I)Z") { _, args, _ in
+            .boolean(args[0].asUInt32 <= 0xffff)
+        }
+        cls.staticMethod("isSupplementaryCodePoint", "(I)Z") { _, args, _ in
+            .boolean((0x10000...0x10ffff).contains(args[0].asUInt32))
+        }
         cls.staticMethod("toChars", "(I)[C") { runtime, args, _ in
-            let scalar = UInt32(bitPattern: args[0].asInt32)
-            let text = UnicodeScalar(scalar).map { String($0) } ?? ""
-            let units = Array(text.utf16)
-            let array = runtime.newArray(component: "C", count: units.count)
-            for (offset, unit) in units.enumerated() {
-                runtime.setArrayElement(array, index: offset, value: .int32(Int32(unit)))
+            let code = args[0].asInt32
+            guard code >= 0 && code <= 0x10ffff else { throw VMJavaException("Ljava/lang/IllegalArgumentException;") }
+            let array = runtime.newArray(component: "C", count: code >= 0x10000 ? 2 : 1)
+            if code < 0x10000 {
+                runtime.setArrayElement(array, index: 0, value: .int32(code))
+            } else {
+                runtime.setArrayElement(array, index: 0, value: .int32(((code - 0x10000) >> 10) + 0xd800))
+                runtime.setArrayElement(array, index: 1, value: .int32(((code - 0x10000) & 0x3ff) + 0xdc00))
             }
             return array
         }
         cls.staticMethod("hashCode", "(C)I") { _, args, _ in .int32(Int32(bitPattern: args[0].asUInt32)) }
-        cls.staticMethod("digit", "(CI)I") { _, args, _ in
-            guard let digit = Int(String(UnicodeScalar(args[0].asUInt32) ?? " "), radix: Int(args[1].asInt32)) else {
-                return .int32(-1)
-            }
-            return .int32(Int32(digit))
+        cls.staticMethod("forDigit", "(II)C") { _, args, _ in
+            let digit = args[0].asInt32, radix = args[1].asInt32
+            guard (2...36).contains(radix), digit >= 0, digit < radix else { return .int32(0) }
+            return .int32(digit < 10 ? digit + 48 : digit + 87)
         }
-        cls.staticMethod("getNumericValue", "(C)I") { _, args, _ in
-            let value = args[0].asUInt32
-            if let scalar = UnicodeScalar(value) {
-                switch scalar.properties.numericType {
-                case .decimal, .digit:
-                    if let number = scalar.properties.numericValue { return .int32(Int32(number)) }
-                default:
-                    break
-                }
+        for letter in ["C", "I"] {
+            cls.staticMethod("digit", "(\(letter)I)I") { _, args, _ in
+                let radix = args[1].asInt32
+                guard (2...36).contains(radix), let scalar = UnicodeScalar(args[0].asUInt32) else { return .int32(-1) }
+                let value = javaCharacterNumericValue(scalar)
+                let decimal = scalar.properties.generalCategory == .decimalNumber
+                let code = scalar.value
+                let latin = (0x41...0x5a).contains(code) || (0x61...0x7a).contains(code) || (0xff21...0xff3a).contains(code) || (0xff41...0xff5a).contains(code)
+                return .int32((decimal || latin) && value >= 0 && value < radix ? value : -1)
             }
-            // JDK letters answer their position in the alphabet: a-z → 10...35,
-            // A-Z → 10...35.
-            switch value {
-            case 0x30...0x39: return .int32(Int32(value - 0x30))
-            case 0x61...0x7A: return .int32(Int32(value - 0x61 + 10))
-            case 0x41...0x5A: return .int32(Int32(value - 0x41 + 10))
-            default:
-                if let scalar = UnicodeScalar(value), let number = scalar.properties.numericValue {
-                    return .int32(Int32(number))
-                }
-                return .int32(-1)
+            cls.staticMethod("getNumericValue", "(\(letter))I") { _, args, _ in
+                guard let scalar = UnicodeScalar(args[0].asUInt32) else { return .int32(-1) }
+                return .int32(javaCharacterNumericValue(scalar))
             }
-        }
-        cls.staticMethod("toTitleCase", "(C)C") { _, args, _ in
-            let value = UInt16(truncatingIfNeeded: args[0].asUInt32)
-            guard let scalar = UnicodeScalar(UInt32(value)) else { return .int32(Int32(value)) }
-            let title = String(scalar).uppercased()
-            return .int32(Int32(title.utf16.first ?? value))
-        }
-        cls.staticMethod("isDigit", "(I)Z") { _, args, _ in
-            .boolean(CharacterSet.decimalDigits.contains(UnicodeScalar(args[0].asUInt32) ?? " "))
         }
         return [cls]
     }
 
+    private static func javaCharacterNumericValue(_ scalar: UnicodeScalar) -> Int32 {
+        switch scalar.value {
+        case 0x41...0x5a: return Int32(scalar.value - 0x41 + 10)
+        case 0x61...0x7a: return Int32(scalar.value - 0x61 + 10)
+        case 0xff21...0xff3a: return Int32(scalar.value - 0xff21 + 10)
+        case 0xff41...0xff5a: return Int32(scalar.value - 0xff41 + 10)
+        default:
+            guard let number = scalar.properties.numericValue else { return -1 }
+            guard number >= 0, number <= Double(Int32.max), number.rounded(.towardZero) == number else { return -2 }
+            return Int32(number)
+        }
+    }
+
+    private static func javaInt(_ value: Double) -> Int32 {
+        if value.isNaN { return 0 }
+        if value >= Double(Int32.max) { return .max }
+        if value <= Double(Int32.min) { return .min }
+        return Int32(value)
+    }
+
+    private static func javaLong(_ value: Double) -> Int64 {
+        if value.isNaN { return 0 }
+        if value >= Double(Int64.max) { return .max }
+        if value <= Double(Int64.min) { return .min }
+        return Int64(value)
+    }
+
+    private static func floatingConversions(_ cls: NativeClass, wide: Bool) {
+        let read: (VMRuntime, VMValue) -> Double = { runtime, value in
+            wide ? value.asBoxedDouble(runtime) : Double(value.asBoxedFloat(runtime))
+        }
+        cls.method("intValue", "()I") { runtime, args, _ in .int32(javaInt(read(runtime, args[0]))) }
+        cls.method("longValue", "()J") { runtime, args, _ in .int64(javaLong(read(runtime, args[0]))) }
+        cls.method("byteValue", "()B") { runtime, args, _ in
+            .int32(Int32(Int8(truncatingIfNeeded: javaInt(read(runtime, args[0])))))
+        }
+        cls.method("shortValue", "()S") { runtime, args, _ in
+            .int32(Int32(Int16(truncatingIfNeeded: javaInt(read(runtime, args[0])))))
+        }
+        if wide {
+            cls.method("floatValue", "()F") { runtime, args, _ in .float(Float(read(runtime, args[0]))) }
+        } else {
+            cls.method("doubleValue", "()D") { runtime, args, _ in .double(read(runtime, args[0])) }
+        }
+        for parameter in wide ? ["D"] : ["F", "D"] {
+            cls.method("<init>", "(\(parameter))V") { _, args, _ in
+                if let pointer = args[0].object {
+                    let bits = wide ? args[1].bits : UInt64((parameter == "D" ? Float(args[1].asDouble) : args[1].asFloat).bitPattern)
+                    VMObjectLayout.setAux(pointer, bits)
+                }
+                return .zero
+            }
+        }
+    }
+
     private static func floatClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/lang/Float;", superclass: "Ljava/lang/Number;", interfaces: ["Ljava/lang/Comparable;"])
+        floatingConversions(cls, wide: false)
         cls.staticField("MAX_VALUE", "F")
         cls.staticField("MIN_VALUE", "F")
+        cls.staticField("NaN", "F")
+        cls.staticField("POSITIVE_INFINITY", "F")
+        cls.staticField("NEGATIVE_INFINITY", "F")
+        cls.staticField("MIN_NORMAL", "F")
         cls.prepare = { _, cls in
             cls.staticValues[0] = .float(.greatestFiniteMagnitude)
             cls.staticValues[1] = .float(.leastNonzeroMagnitude)
+            cls.staticValues[2] = .float(.nan)
+            cls.staticValues[3] = .float(.infinity)
+            cls.staticValues[4] = .float(-.infinity)
+            cls.staticValues[5] = .float(.leastNormalMagnitude)
         }
         cls.method("floatValue", "()F") { runtime, args, _ in .float(args[0].asBoxedFloat(runtime)) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
@@ -1390,15 +1734,15 @@ enum JavaCore {
             if left > right { return .int32(1) }
             let leftBits = left.isNaN ? 0x7FC0_0000 : left.bitPattern
             let rightBits = right.isNaN ? 0x7FC0_0000 : right.bitPattern
-            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+            return .int32(leftBits == rightBits ? 0 : (Int32(bitPattern: leftBits) < Int32(bitPattern: rightBits) ? -1 : 1))
         }
-        cls.method("compareTo", "(Ljava/lang/Float;)I") { runtime, args, _ in
+        comparableMethods(cls) { runtime, args, _ in
             let left = args[0].asBoxedFloat(runtime), right = args[1].asBoxedFloat(runtime)
             if left < right { return .int32(-1) }
             if left > right { return .int32(1) }
             let leftBits = left.isNaN ? 0x7FC0_0000 : left.bitPattern
             let rightBits = right.isNaN ? 0x7FC0_0000 : right.bitPattern
-            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+            return .int32(leftBits == rightBits ? 0 : (Int32(bitPattern: leftBits) < Int32(bitPattern: rightBits) ? -1 : 1))
         }
         cls.staticMethod("isNaN", "(F)Z") { _, args, _ in .boolean(args[0].asFloat.isNaN) }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asBoxedFloat(runtime))) }
@@ -1436,11 +1780,20 @@ enum JavaCore {
 
     private static func doubleClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/lang/Double;", superclass: "Ljava/lang/Number;", interfaces: ["Ljava/lang/Comparable;"])
+        floatingConversions(cls, wide: true)
         cls.staticField("MAX_VALUE", "D")
         cls.staticField("MIN_VALUE", "D")
+        cls.staticField("NaN", "D")
+        cls.staticField("POSITIVE_INFINITY", "D")
+        cls.staticField("NEGATIVE_INFINITY", "D")
+        cls.staticField("MIN_NORMAL", "D")
         cls.prepare = { _, cls in
             cls.staticValues[0] = .double(.greatestFiniteMagnitude)
             cls.staticValues[1] = .double(.leastNonzeroMagnitude)
+            cls.staticValues[2] = .double(.nan)
+            cls.staticValues[3] = .double(.infinity)
+            cls.staticValues[4] = .double(-.infinity)
+            cls.staticValues[5] = .double(.leastNormalMagnitude)
         }
         cls.method("doubleValue", "()D") { runtime, args, _ in .double(args[0].asBoxedDouble(runtime)) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
@@ -1462,15 +1815,15 @@ enum JavaCore {
             if left > right { return .int32(1) }
             let leftBits = left.isNaN ? 0x7FF8_0000_0000_0000 : left.bitPattern
             let rightBits = right.isNaN ? 0x7FF8_0000_0000_0000 : right.bitPattern
-            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+            return .int32(leftBits == rightBits ? 0 : (Int64(bitPattern: leftBits) < Int64(bitPattern: rightBits) ? -1 : 1))
         }
-        cls.method("compareTo", "(Ljava/lang/Double;)I") { runtime, args, _ in
+        comparableMethods(cls) { runtime, args, _ in
             let left = args[0].asBoxedDouble(runtime), right = args[1].asBoxedDouble(runtime)
             if left < right { return .int32(-1) }
             if left > right { return .int32(1) }
             let leftBits = left.isNaN ? UInt64(0x7FF8_0000_0000_0000) : left.bitPattern
             let rightBits = right.isNaN ? UInt64(0x7FF8_0000_0000_0000) : right.bitPattern
-            return .int32(leftBits == rightBits ? 0 : (leftBits < rightBits ? -1 : 1))
+            return .int32(leftBits == rightBits ? 0 : (Int64(bitPattern: leftBits) < Int64(bitPattern: rightBits) ? -1 : 1))
         }
         cls.staticMethod("isNaN", "(D)Z") { _, args, _ in .boolean(args[0].asDouble.isNaN) }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in runtime.newString(String(args[0].asBoxedDouble(runtime))) }
@@ -1514,30 +1867,44 @@ enum JavaCore {
         let cls = NativeClass("Ljava/lang/Math;")
         cls.staticMethod("max", "(II)I") { _, args, _ in .int32(max(args[0].asInt32, args[1].asInt32)) }
         cls.staticMethod("max", "(JJ)J") { _, args, _ in .int64(max(args[0].asInt64, args[1].asInt64)) }
-        cls.staticMethod("max", "(FF)F") { _, args, _ in .float(max(args[0].asFloat, args[1].asFloat)) }
-        cls.staticMethod("max", "(DD)D") { _, args, _ in .double(max(args[0].asDouble, args[1].asDouble)) }
         cls.staticMethod("min", "(II)I") { _, args, _ in .int32(min(args[0].asInt32, args[1].asInt32)) }
         cls.staticMethod("min", "(JJ)J") { _, args, _ in .int64(min(args[0].asInt64, args[1].asInt64)) }
-        cls.staticMethod("min", "(FF)F") { _, args, _ in .float(min(args[0].asFloat, args[1].asFloat)) }
-        cls.staticMethod("min", "(DD)D") { _, args, _ in .double(min(args[0].asDouble, args[1].asDouble)) }
+        for wide in [false, true] {
+            let letter = wide ? "D" : "F"
+            for maximum in [false, true] {
+                cls.staticMethod(maximum ? "max" : "min", "(\(letter)\(letter))\(letter)") { _, args, _ in
+                    let a = wide ? args[0].asDouble : Double(args[0].asFloat)
+                    let b = wide ? args[1].asDouble : Double(args[1].asFloat)
+                    let result: Double
+                    if a.isNaN { result = a }
+                    else if b.isNaN { result = b }
+                    else if a == 0 && b == 0 {
+                        result = maximum ? (a.sign == .plus ? a : b) : (a.sign == .minus ? a : b)
+                    } else { result = maximum ? max(a, b) : min(a, b) }
+                    return wide ? .double(result) : .float(Float(result))
+                }
+            }
+            cls.staticMethod("signum", "(\(letter))\(letter)") { _, args, _ in
+                let value = wide ? args[0].asDouble : Double(args[0].asFloat)
+                let result = value == 0 || value.isNaN ? value : (value < 0 ? -1.0 : 1.0)
+                return wide ? .double(result) : .float(Float(result))
+            }
+        }
         cls.staticMethod("abs", "(I)I") { _, args, _ in .int32(args[0].asInt32.magnitude == 0x8000_0000 ? args[0].asInt32 : Swift.abs(args[0].asInt32)) }
         cls.staticMethod("abs", "(J)J") { _, args, _ in .int64(args[0].asInt64.magnitude == 0x8000_0000_0000_0000 ? args[0].asInt64 : Swift.abs(args[0].asInt64)) }
         cls.staticMethod("abs", "(F)F") { _, args, _ in .float(Swift.abs(args[0].asFloat)) }
         cls.staticMethod("abs", "(D)D") { _, args, _ in .double(Swift.abs(args[0].asDouble)) }
         cls.staticMethod("round", "(F)I") { _, args, _ in
-            let value = args[0].asFloat
-            if value.isNaN { return .int32(0) }
-            let rounded = (Double(value) + 0.5).rounded(.down)
-            return .int32(Int32(min(max(rounded, Double(Int32.min)), Double(Int32.max))))
+            let value = Double(args[0].asFloat)
+            let base = value.rounded(.down)
+            return .int32(javaInt(value - base >= 0.5 ? base + 1 : base))
         }
         cls.staticMethod("round", "(D)J") { _, args, _ in
             let value = args[0].asDouble
-            if value.isNaN { return .int64(0) }
-            let rounded = (value + 0.5).rounded(.down)
-            if rounded >= 9.223372036854775e18 { return .int64(Int64.max) }
-            if rounded <= -9.223372036854776e18 { return .int64(Int64.min) }
-            return .int64(Int64(rounded))
+            let base = value.rounded(.down)
+            return .int64(javaLong(value - base >= 0.5 ? base + 1 : base))
         }
+        cls.staticMethod("rint", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.toNearestOrEven)) }
         cls.staticMethod("floor", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.down)) }
         cls.staticMethod("ceil", "(D)D") { _, args, _ in .double(args[0].asDouble.rounded(.up)) }
         cls.staticMethod("pow", "(DD)D") { _, args, _ in .double(pow(args[0].asDouble, args[1].asDouble)) }
@@ -1546,17 +1913,53 @@ enum JavaCore {
         cls.staticMethod("log10", "(D)D") { _, args, _ in .double(log10(args[0].asDouble)) }
         cls.staticMethod("exp", "(D)D") { _, args, _ in .double(exp(args[0].asDouble)) }
         cls.staticMethod("random", "()D") { _, _, _ in .double(Double.random(in: 0..<1)) }
-        cls.staticMethod("floorDiv", "(II)I") { _, args, _ in .int32(Int32(floor(Double(args[0].asInt32) / Double(args[1].asInt32)))) }
-        cls.staticMethod("floorMod", "(II)I") { _, args, _ in
-            let b = args[1].asInt32
-            guard b != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
-            var value = args[0].asInt32 % b
-            if (value != 0) && ((value < 0) != (b < 0)) { value += b }
+        for (left, right) in [("I", "I"), ("J", "J"), ("J", "I")] {
+            for modulo in [false, true] {
+                let resultType = modulo ? right : left
+                cls.staticMethod(modulo ? "floorMod" : "floorDiv", "(\(left)\(right))\(resultType)") { _, args, _ in
+                    let a = left == "J" ? args[0].asInt64 : Int64(args[0].asInt32)
+                    let b = right == "J" ? args[1].asInt64 : Int64(args[1].asInt32)
+                    guard b != 0 else { throw VMJavaException("Ljava/lang/ArithmeticException;", "/ by zero") }
+                    let minimum = left == "J" ? Int64.min : Int64(Int32.min)
+                    var quotient: Int64
+                    var remainder: Int64
+                    if a == minimum && b == -1 { quotient = minimum; remainder = 0 }
+                    else { quotient = a / b; remainder = a % b }
+                    if remainder != 0 && (a < 0) != (b < 0) { quotient -= 1; remainder += b }
+                    let result = modulo ? remainder : quotient
+                    return resultType == "J" ? .int64(result) : .int32(Int32(truncatingIfNeeded: result))
+                }
+            }
+        }
+        for letter in ["I", "J"] {
+            let wide = letter == "J"
+            for name in ["addExact", "subtractExact", "multiplyExact", "incrementExact", "decrementExact", "negateExact"] {
+                let binary = name == "addExact" || name == "subtractExact" || name == "multiplyExact"
+                cls.staticMethod(name, "(\(letter)\(binary ? letter : ""))\(letter)") { _, args, _ in
+                    let a = wide ? args[0].asInt64 : Int64(args[0].asInt32)
+                    let b = binary ? (wide ? args[1].asInt64 : Int64(args[1].asInt32)) : 1
+                    let result: (partialValue: Int64, overflow: Bool)
+                    switch name {
+                    case "addExact", "incrementExact": result = a.addingReportingOverflow(b)
+                    case "subtractExact", "decrementExact": result = a.subtractingReportingOverflow(b)
+                    case "multiplyExact": result = a.multipliedReportingOverflow(by: b)
+                    default: result = Int64(0).subtractingReportingOverflow(a)
+                    }
+                    guard !result.overflow, wide || (result.partialValue >= Int64(Int32.min) && result.partialValue <= Int64(Int32.max)) else {
+                        throw VMJavaException("Ljava/lang/ArithmeticException;", "integer overflow")
+                    }
+                    return wide ? .int64(result.partialValue) : .int32(Int32(result.partialValue))
+                }
+            }
+        }
+        cls.staticMethod("toIntExact", "(J)I") { _, args, _ in
+            guard let value = Int32(exactly: args[0].asInt64) else { throw VMJavaException("Ljava/lang/ArithmeticException;", "integer overflow") }
             return .int32(value)
         }
-        cls.staticMethod("signum", "(D)D") { _, args, _ in
-            let value = args[0].asDouble
-            return .double(value < 0 ? -1 : (value > 0 ? 1 : 0))
+        cls.staticMethod("multiplyExact", "(JI)J") { _, args, _ in
+            let result = args[0].asInt64.multipliedReportingOverflow(by: Int64(args[1].asInt32))
+            guard !result.overflow else { throw VMJavaException("Ljava/lang/ArithmeticException;", "long overflow") }
+            return .int64(result.partialValue)
         }
         cls.staticField("PI", "D")
         cls.staticField("E", "D")
@@ -1583,6 +1986,23 @@ enum JavaCore {
             guard let source = args[0].object, let destination = args[2].object else {
                 throw VMJavaException("Ljava/lang/NullPointerException;")
             }
+            // `System.arraycopy` contract: both operands are arrays with the
+            // same primitive component, or both reference arrays; reference
+            // elements are store-checked one by one.
+            let sourceClass = VMObjectLayout.cls(source), destinationClass = VMObjectLayout.cls(destination)
+            guard let sourceComponent = sourceClass.arrayComponent else {
+                throw VMJavaException("Ljava/lang/ArrayStoreException;", "source type \(sourceClass.displayName) is not an array")
+            }
+            guard let destinationComponent = destinationClass.arrayComponent else {
+                throw VMJavaException("Ljava/lang/ArrayStoreException;", "destination type \(destinationClass.displayName) is not an array")
+            }
+            let referenceCopy = DexDescriptor.isReference(sourceComponent) && DexDescriptor.isReference(destinationComponent)
+            guard referenceCopy || sourceComponent == destinationComponent else {
+                throw VMJavaException(
+                    "Ljava/lang/ArrayStoreException;",
+                    "\(sourceClass.displayName) and \(destinationClass.displayName) are incompatible array types"
+                )
+            }
             let sourceOffset = Int(args[1].asInt32)
             let destinationOffset = Int(args[3].asInt32)
             let count = Int(args[4].asInt32)
@@ -1593,13 +2013,27 @@ enum JavaCore {
                   destinationOffset + count <= destinationCount else {
                 throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;")
             }
+            // Elements need a check unless the source component is assignable
+            // to the destination's.
+            let storeCheck: VMClass? = {
+                guard referenceCopy, let target = runtime.findClass(destinationComponent) else { return nil }
+                if let from = runtime.findClass(sourceComponent), runtime.isAssignable(from, to: target) { return nil }
+                return target
+            }()
             if source == destination {
                 let temporary = (0..<count).map { VMObjectLayout.slot(source, sourceOffset + $0).pointee }
                 for index in 0..<count { VMObjectLayout.slot(destination, destinationOffset + index).pointee = temporary[index] }
             } else {
                 for index in 0..<count {
-                    VMObjectLayout.slot(destination, destinationOffset + index).pointee =
-                        VMObjectLayout.slot(source, sourceOffset + index).pointee
+                    let element = VMObjectLayout.slot(source, sourceOffset + index).pointee
+                    // Elements before a failing one are copied, as specified.
+                    if let storeCheck, element.bits != 0, !runtime.isInstance(element, of: storeCheck) {
+                        throw VMJavaException(
+                            "Ljava/lang/ArrayStoreException;",
+                            "\(runtime.classOf(element)?.displayName ?? "?") cannot be stored in \(destinationClass.displayName)"
+                        )
+                    }
+                    VMObjectLayout.slot(destination, destinationOffset + index).pointee = element
                 }
             }
             return .zero
@@ -1704,22 +2138,24 @@ enum JavaCore {
         return VMMapPayload(values.map { (key: runtime.newString($0.0), value: runtime.newString($0.1)) })
     }
 
-    /// Resolves a field for `Class.getField`/`getDeclaredField`. Instance
-    /// fields are already flattened down the hierarchy (offsets are relative to
-    /// the queried class); static fields are declared per class, so walk the
-    /// superclass chain and return the declaring owner that holds their slot.
-    /// Binary name (`java.lang.String`, `[B`, `int`) to a dex descriptor.
-    static func descriptor(forBinaryName name: String) -> String {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty { return trimmed }
-        if trimmed.hasPrefix("[") || trimmed.hasPrefix("L") { return trimmed }
-        if trimmed.count == 1, "VZBCSIJFD".contains(trimmed) { return trimmed }
-        return "L" + trimmed.replacingOccurrences(of: ".", with: "/") + ";"
+    /// Binary name (`java.lang.String`, `[Ljava.lang.String;`, `[I`) to a dex
+    /// descriptor; nil for names `Class.forName` rejects: primitive type
+    /// names, internal `/` names and malformed array names.
+    static func descriptor(forBinaryName name: String) -> String? {
+        guard !name.isEmpty, !name.contains("/") else { return nil }
+        guard name.hasPrefix("[") else { return "L" + name.replacingOccurrences(of: ".", with: "/") + ";" }
+        let descriptor = name.replacingOccurrences(of: ".", with: "/")
+        let component = descriptor.drop { $0 == "[" }
+        if component.count == 1, let primitive = component.first, "ZBCSIJFD".contains(primitive) { return descriptor }
+        guard component.count > 2, component.hasPrefix("L"), component.hasSuffix(";") else { return nil }
+        return descriptor
     }
 
-    static func forName(_ runtime: VMRuntime, _ binaryName: String, initialize: Bool) throws -> VMValue {
-        let descriptor = descriptor(forBinaryName: binaryName)
-        guard let cls = runtime.findClass(descriptor) else {
+    static func forName(_ runtime: VMRuntime, _ name: VMValue, initialize: Bool) throws -> VMValue {
+        guard let binaryName = runtime.stringValue(name) else {
+            throw VMJavaException("Ljava/lang/NullPointerException;", "name")
+        }
+        guard let descriptor = descriptor(forBinaryName: binaryName), let cls = runtime.findClass(descriptor) else {
             throw VMJavaException("Ljava/lang/ClassNotFoundException;", binaryName)
         }
         if initialize {
@@ -1728,9 +2164,10 @@ enum JavaCore {
         return runtime.classObject(cls)
     }
 
-    /// Parameter descriptors of a `Class[]`; nil when the array is null.
+    /// Parameter descriptors of a `Class[]` (null means no parameters, as in
+    /// `getMethod`); nil when an element is not a class, which matches nothing.
     static func parameterDescriptors(_ runtime: VMRuntime, _ array: VMValue) -> [String]? {
-        guard array.bits != 0 else { return nil }
+        guard array.bits != 0 else { return [] }
         var descriptors: [String] = []
         for index in 0..<runtime.arrayLength(array) {
             guard let type: VMClass = runtime.payload(runtime.arrayElement(array, index), as: VMClass.self) else {
@@ -1741,36 +2178,19 @@ enum JavaCore {
         return descriptors
     }
 
-    /// Resolves a reflected method by name and (optionally) exact parameter
-    /// types. `getMethod` also searches superclasses and interface defaults.
-    static func reflectedMethod(
-        in target: VMClass,
-        named name: String,
-        parameters: [String]?,
-        includeInherited: Bool
-    ) -> (VMClass, VMMethod)? {
-        var visited: Set<ObjectIdentifier> = []
-        var stack: [VMClass] = [target]
-        while let cls = stack.popLast() {
-            guard visited.insert(ObjectIdentifier(cls)).inserted else { continue }
-            // Native hosts may declare an instance and a static method under one
-            // key; `getMethod`/`getDeclaredMethod` see both, instance first.
-            let match: (Dictionary<String, VMMethod>.Values) -> VMMethod? = { methods in
-                for method in methods where method.name == name {
-                    if let parameters, method.parameterTypes != parameters { continue }
-                    return method
-                }
-                return nil
-            }
-            if let method = match(cls.methods.values) ?? match(cls.staticMethods.values) {
-                return (cls, method)
-            }
-            if includeInherited {
-                if let superclass = cls.superclass { stack.append(superclass) }
-                stack.append(contentsOf: cls.interfaces)
+    /// `NoSuchMethodException` text: `pkg.Type.name(param,types)`.
+    private static func missingMethod(_ runtime: VMRuntime, _ type: VMClass, _ name: String, _ parameters: VMValue) -> VMJavaException {
+        var names: [String] = []
+        if parameters.bits != 0 {
+            for index in 0..<runtime.arrayLength(parameters) {
+                let element = runtime.arrayElement(parameters, index)
+                names.append(runtime.payload(element, as: VMClass.self).map { runtime.javaName($0) } ?? "null")
             }
         }
-        return nil
+        return VMJavaException(
+            "Ljava/lang/NoSuchMethodException;",
+            "\(runtime.javaName(type)).\(name)(\(names.joined(separator: ",")))"
+        )
     }
 
     /// APK asset path for `Class.getResource`. Absolute names are resolved from
@@ -1795,175 +2215,272 @@ enum JavaCore {
         return url
     }
 
-    private static func reflectedField(in target: VMClass, named name: String) -> (VMClass, VMField)? {
-        if let field = target.instanceFields.last(where: { $0.name == name }) {
-            return (target, field)
-        }
-        var cursor: VMClass? = target
-        while let cls = cursor {
-            if let field = cls.staticFields.first(where: { $0.name == name }) {
-                return (cls, field)
-            }
-            cursor = cls.superclass
-        }
-        return nil
-    }
-
     private static func classClass() -> [NativeClass] {
-        let cls = NativeClass("Ljava/lang/Class;")
+        let cls = NativeClass(
+            "Ljava/lang/Class;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: [
+                "Ljava/io/Serializable;", "Ljava/lang/reflect/GenericDeclaration;",
+                "Ljava/lang/reflect/Type;", "Ljava/lang/reflect/AnnotatedElement;",
+            ],
+            access: DexAccess.isPublic | DexAccess.isFinal
+        )
+        func target(_ runtime: VMRuntime, _ value: VMValue) throws -> VMClass {
+            try runtime.payloadBox(value)
+        }
+        func classArgument(_ runtime: VMRuntime, _ value: VMValue) throws -> VMClass {
+            guard value.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return try runtime.payloadBox(value)
+        }
+        func nameArgument(_ runtime: VMRuntime, _ value: VMValue) throws -> String {
+            guard let name = runtime.stringValue(value) else { throw VMJavaException("Ljava/lang/NullPointerException;", "name") }
+            return name
+        }
+
+        // MARK: Names and kinds
         cls.method("getName", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            return runtime.newString(target.displayName)
+            runtime.newString(runtime.javaName(try target(runtime, args[0])))
         }
         cls.method("getSimpleName", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let display = target.displayName
-            return runtime.newString(display.split(separator: ".").last.map(String.init) ?? display)
+            runtime.newString(runtime.javaSimpleName(try target(runtime, args[0])))
         }
         cls.method("getCanonicalName", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            return runtime.newString(target.displayName)
+            runtime.javaCanonicalName(try target(runtime, args[0])).map { runtime.newString($0) } ?? .null
+        }
+        cls.method("getTypeName", "()Ljava/lang/String;") { runtime, args, _ in
+            runtime.newString(runtime.javaTypeName(try target(runtime, args[0])))
         }
         cls.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            return runtime.newString("class \(target.displayName)")
+            let type = try target(runtime, args[0])
+            let kind = type.isInterface ? "interface " : (runtime.isPrimitiveClass(type) ? "" : "class ")
+            return runtime.newString(kind + runtime.javaName(type))
         }
         cls.method("isInstance", "(Ljava/lang/Object;)Z") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .boolean(false) }
-            return .boolean(runtime.isInstance(args[1], of: target))
+            .boolean(runtime.isJavaInstance(args[1], of: try target(runtime, args[0])))
         }
         cls.method("isAssignableFrom", "(Ljava/lang/Class;)Z") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self),
-                  let other: VMClass = runtime.payload(args[1], as: VMClass.self) else { return .boolean(false) }
-            return .boolean(other.isSubclass(of: target))
+            let type = try target(runtime, args[0])
+            return .boolean(runtime.isJavaAssignable(try classArgument(runtime, args[1]), to: type))
+        }
+        cls.method("cast", "(Ljava/lang/Object;)Ljava/lang/Object;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            guard args[1].bits == 0 || runtime.isJavaInstance(args[1], of: type) else {
+                let actual = runtime.classOf(args[1]).map { runtime.javaName($0) } ?? "null"
+                throw VMJavaException("Ljava/lang/ClassCastException;", "Cannot cast \(actual) to \(runtime.javaName(type))")
+            }
+            return args[1]
         }
         cls.method("isInterface", "()Z") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .boolean(false) }
-            return .boolean(target.isInterface)
+            .boolean(try target(runtime, args[0]).isInterface)
         }
         cls.method("isArray", "()Z") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .boolean(false) }
-            return .boolean(target.isArray)
+            .boolean(try target(runtime, args[0]).isArray)
         }
+        cls.method("isPrimitive", "()Z") { runtime, args, _ in
+            .boolean(runtime.isPrimitiveClass(try target(runtime, args[0])))
+        }
+        cls.method("isAnnotation", "()Z") { runtime, args, _ in
+            .boolean(try target(runtime, args[0]).access & DexAccess.isAnnotation != 0)
+        }
+        cls.method("isSynthetic", "()Z") { runtime, args, _ in
+            .boolean(try target(runtime, args[0]).access & DexAccess.isSynthetic != 0)
+        }
+        cls.method("isEnum", "()Z") { runtime, args, _ in
+            .boolean(runtime.isEnumClass(try target(runtime, args[0])))
+        }
+        cls.method("isAnonymousClass", "()Z") { runtime, args, _ in
+            if case .anonymous = runtime.classNesting(try target(runtime, args[0])) { return .boolean(true) }
+            return .boolean(false)
+        }
+        cls.method("isLocalClass", "()Z") { runtime, args, _ in
+            if case .local = runtime.classNesting(try target(runtime, args[0])) { return .boolean(true) }
+            return .boolean(false)
+        }
+        cls.method("isMemberClass", "()Z") { runtime, args, _ in
+            if case .member = runtime.classNesting(try target(runtime, args[0])) { return .boolean(true) }
+            return .boolean(false)
+        }
+        cls.method("getModifiers", "()I") { runtime, args, _ in
+            .int32(runtime.classModifiers(try target(runtime, args[0])))
+        }
+        cls.method("getComponentType", "()Ljava/lang/Class;") { runtime, args, _ in
+            guard let component = try target(runtime, args[0]).arrayComponent else { return .null }
+            return runtime.classObject(try runtime.linkClass(component))
+        }
+        cls.method("getEnumConstants", "()[Ljava/lang/Object;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            guard runtime.isEnumClass(type) else { return .null }
+            try runtime.ensureInitialized(type)
+            if let values = type.staticMethods["values()[" + type.descriptor] {
+                return try runtime.invokeCompact(values, [])
+            }
+            let constants = type.staticFields
+                .filter { $0.type == type.descriptor }
+                .map { type.staticValue($0) }
+                .filter { $0.bits != 0 }
+            return runtime.typeArray(constants, component: type.descriptor)
+        }
+        cls.method("desiredAssertionStatus", "()Z") { _, _, _ in .boolean(false) }
         cls.method("hashCode", "()I") { runtime, args, _ in .int32(runtime.javaIdentityHash(args[0])) }
         cls.method("equals", "(Ljava/lang/Object;)Z") { _, args, _ in .boolean(args[0].bits == args[1].bits) }
         cls.method("getClassLoader", "()Ljava/lang/ClassLoader;") { runtime, _, _ in
             runtime.makeNative("Ljava/lang/ClassLoader;", payload: NSNull())
         }
         cls.staticMethod("forName", "(Ljava/lang/String;)Ljava/lang/Class;") { runtime, args, _ in
-            try forName(runtime, runtime.stringValue(args[0]) ?? "", initialize: true)
+            try forName(runtime, args[0], initialize: true)
         }
         cls.staticMethod("forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;") { runtime, args, _ in
-            try forName(runtime, runtime.stringValue(args[0]) ?? "", initialize: args[1].asBoolean)
+            try forName(runtime, args[0], initialize: args[1].asBoolean)
         }
+
+        // MARK: Hierarchy, nesting and generics
         cls.method("getSuperclass", "()Ljava/lang/Class;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self),
-                  let superclass = target.superclass else { return .null }
+            let type = try target(runtime, args[0])
+            guard !type.isInterface, let superclass = type.superclass else { return .null }
             return runtime.classObject(superclass)
         }
         cls.method("getInterfaces", "()[Ljava/lang/Class;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let array = runtime.newArray(component: "Ljava/lang/Class;", count: target.interfaces.count)
-            for (index, proto) in target.interfaces.enumerated() {
-                runtime.setArrayElement(array, index: index, value: runtime.classObject(proto))
-            }
-            return array
+            runtime.classArray(try target(runtime, args[0]).interfaces)
         }
+        cls.method("getGenericSuperclass", "()Ljava/lang/reflect/Type;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            guard !type.isInterface, let superclass = type.superclass else { return .null }
+            if let signature = try runtime.classSignature(type) {
+                return try runtime.genericTypeObject(signature.superclass, scope: .type(type))
+            }
+            return runtime.classObject(superclass)
+        }
+        cls.method("getGenericInterfaces", "()[Ljava/lang/reflect/Type;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            if let signature = try runtime.classSignature(type) {
+                return runtime.typeArray(try signature.interfaces.map { try runtime.genericTypeObject($0, scope: .type(type)) })
+            }
+            return runtime.typeArray(type.interfaces.map { runtime.classObject($0) })
+        }
+        cls.method("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;") { runtime, args, _ in
+            try runtime.typeVariableArray(.type(try target(runtime, args[0])))
+        }
+        cls.method("getEnclosingClass", "()Ljava/lang/Class;") { runtime, args, _ in
+            runtime.enclosingClass(of: try target(runtime, args[0])).map { runtime.classObject($0) } ?? .null
+        }
+        cls.method("getDeclaringClass", "()Ljava/lang/Class;") { runtime, args, _ in
+            runtime.declaringClass(of: try target(runtime, args[0])).map { runtime.classObject($0) } ?? .null
+        }
+        cls.method("getEnclosingMethod", "()Ljava/lang/reflect/Method;") { runtime, args, _ in
+            guard let method = runtime.enclosingMethod(try target(runtime, args[0])), !method.isConstructor else { return .null }
+            return runtime.reflectedExecutable(method)
+        }
+        cls.method("getEnclosingConstructor", "()Ljava/lang/reflect/Constructor;") { runtime, args, _ in
+            guard let method = runtime.enclosingMethod(try target(runtime, args[0])), method.isConstructor else { return .null }
+            return runtime.reflectedExecutable(method)
+        }
+        cls.method("getDeclaredClasses", "()[Ljava/lang/Class;") { runtime, args, _ in
+            runtime.classArray(try runtime.declaredClasses(try target(runtime, args[0])))
+        }
+
+        // MARK: Resources
         cls.method("getResource", "(Ljava/lang/String;)Ljava/net/URL;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let name = runtime.stringValue(args[1]) ?? ""
-            return resourceURL(runtime, name: name, relativeTo: target)
+            let type = try target(runtime, args[0])
+            return resourceURL(runtime, name: try nameArgument(runtime, args[1]), relativeTo: type)
         }
         cls.method("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let name = runtime.stringValue(args[1]) ?? ""
-            guard let path = resourcePath(name, relativeTo: target), let data = runtime.assetLoader?(path) else {
+            let type = try target(runtime, args[0])
+            let name = try nameArgument(runtime, args[1])
+            guard let path = resourcePath(name, relativeTo: type), let data = runtime.assetLoader?(path) else {
                 return .null
             }
             return runtime.makeNative("Ljava/io/ByteArrayInputStream;", payload: data)
         }
-        for (name, signature) in [
-            ("getDeclaredMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"),
-            ("getMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"),
-        ] {
-            let includeInherited = name == "getMethod"
-            cls.method(name, signature) { runtime, args, _ in
-                guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-                let methodName = runtime.stringValue(args[1]) ?? ""
-                let parameters = parameterDescriptors(runtime, args[2])
-                guard let resolved = reflectedMethod(
-                    in: target, named: methodName,
-                    parameters: parameters, includeInherited: includeInherited
-                ) else {
-                    throw VMJavaException("Ljava/lang/NoSuchMethodException;", "\(target.displayName).\(methodName)")
+
+        // MARK: Members
+        cls.method("getDeclaredMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            let name = try nameArgument(runtime, args[1])
+            let parameters = parameterDescriptors(runtime, args[2])
+            guard let method = runtime.matchingMethod(runtime.declaredMethods(type), name: name, parameters: parameters) else {
+                throw missingMethod(runtime, type, name, args[2])
+            }
+            return runtime.reflectedExecutable(method, owner: type)
+        }
+        cls.method("getMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            let name = try nameArgument(runtime, args[1])
+            let parameters = parameterDescriptors(runtime, args[2])
+            guard let method = runtime.matchingMethod(runtime.publicMethods(type), name: name, parameters: parameters) else {
+                throw missingMethod(runtime, type, name, args[2])
+            }
+            return runtime.reflectedExecutable(method, owner: type)
+        }
+        cls.method("getDeclaredMethods", "()[Ljava/lang/reflect/Method;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            let methods = runtime.declaredMethods(type).map { runtime.reflectedExecutable($0, owner: type) }
+            return runtime.typeArray(methods, component: "Ljava/lang/reflect/Method;")
+        }
+        cls.method("getMethods", "()[Ljava/lang/reflect/Method;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            let methods = runtime.publicMethods(type).map { runtime.reflectedExecutable($0, owner: type) }
+            return runtime.typeArray(methods, component: "Ljava/lang/reflect/Method;")
+        }
+        for (name, publicOnly) in [("getDeclaredConstructor", false), ("getConstructor", true)] {
+            cls.method(name, "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") { runtime, args, _ in
+                let type = try target(runtime, args[0])
+                let parameters = parameterDescriptors(runtime, args[1])
+                let candidates = runtime.declaredConstructors(type).filter {
+                    !publicOnly || $0.access & DexAccess.isPublic != 0
                 }
-                return runtime.makeNative(
-                    "Ljava/lang/reflect/Method;",
-                    payload: VMMethodRefPayload(owner: resolved.0, method: resolved.1)
-                )
+                guard let constructor = runtime.matchingMethod(candidates, name: "<init>", parameters: parameters) else {
+                    throw missingMethod(runtime, type, "<init>", args[1])
+                }
+                return runtime.reflectedExecutable(constructor, owner: type)
             }
         }
-        cls.method("getDeclaredConstructor", "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let parameters = parameterDescriptors(runtime, args[1])
-            guard let resolved = reflectedMethod(in: target, named: "<init>", parameters: parameters, includeInherited: false) else {
-                throw VMJavaException("Ljava/lang/NoSuchMethodException;", "\(target.displayName).<init>")
+        for (name, publicOnly) in [("getDeclaredConstructors", false), ("getConstructors", true)] {
+            cls.method(name, "()[Ljava/lang/reflect/Constructor;") { runtime, args, _ in
+                let type = try target(runtime, args[0])
+                let constructors = runtime.declaredConstructors(type)
+                    .filter { !publicOnly || $0.access & DexAccess.isPublic != 0 }
+                    .map { runtime.reflectedExecutable($0, owner: type) }
+                return runtime.typeArray(constructors, component: "Ljava/lang/reflect/Constructor;")
             }
-            return runtime.makeNative("Ljava/lang/reflect/Constructor;", payload: VMMethodRefPayload(owner: resolved.0, method: resolved.1))
+        }
+        cls.method("newInstance", "()Ljava/lang/Object;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            guard !type.isAbstract, !type.isArray, !runtime.isPrimitiveClass(type),
+                  let constructor = runtime.declaredConstructors(type).first(where: { $0.parameterTypes.isEmpty }) else {
+                throw VMJavaException("Ljava/lang/InstantiationException;", runtime.javaName(type))
+            }
+            try runtime.ensureInitialized(type)
+            let object = VMValue.reference(runtime.allocateObject(type))
+            // Unlike `Constructor.newInstance`, exceptions propagate unwrapped.
+            _ = try runtime.invokeCompact(constructor, [object])
+            return object
         }
         cls.method("getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let name = runtime.stringValue(args[1]) ?? ""
-            guard let resolved = reflectedField(in: target, named: name) else {
-                throw VMJavaException("Ljava/lang/NoSuchFieldException;", "\(target.displayName).\(name)")
-            }
-            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: resolved.0, field: resolved.1))
-        }
-        cls.method("getField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let name = runtime.stringValue(args[1]) ?? ""
-            guard let resolved = reflectedField(in: target, named: name) else {
+            let type = try target(runtime, args[0])
+            let name = try nameArgument(runtime, args[1])
+            guard let field = runtime.declaredFields(type).first(where: { $0.name == name }) else {
                 throw VMJavaException("Ljava/lang/NoSuchFieldException;", name)
             }
-            return runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: resolved.0, field: resolved.1))
+            return runtime.reflectedFieldValue(type, field)
+        }
+        cls.method("getField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;") { runtime, args, _ in
+            let type = try target(runtime, args[0])
+            let name = try nameArgument(runtime, args[1])
+            guard let (owner, field) = runtime.publicField(type, named: name) else {
+                throw VMJavaException("Ljava/lang/NoSuchFieldException;", name)
+            }
+            return runtime.reflectedFieldValue(owner, field)
         }
         cls.method("getDeclaredFields", "()[Ljava/lang/reflect/Field;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            let fields = target.instanceFields + target.staticFields
-            let array = runtime.newArray(component: "Ljava/lang/reflect/Field;", count: fields.count)
-            for (index, field) in fields.enumerated() {
-                runtime.setArrayElement(array, index: index, value: runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: target, field: field)))
-            }
-            return array
+            let type = try target(runtime, args[0])
+            let fields = runtime.declaredFields(type).map { runtime.reflectedFieldValue(type, $0) }
+            return runtime.typeArray(fields, component: "Ljava/lang/reflect/Field;")
         }
-        cls.method("getDeclaredConstructor", "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") { _, _, _ in .null }
         cls.method("getFields", "()[Ljava/lang/reflect/Field;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            var result: [(VMClass, VMField)] = []
-            var seen: Set<String> = []
-            var cursor: VMClass? = target
-            while let current = cursor {
-                for field in current.instanceFields + current.staticFields where seen.insert(field.name).inserted {
-                    result.append((current, field))
-                }
-                cursor = current.superclass
-            }
-            let array = runtime.newArray(component: "Ljava/lang/reflect/Field;", count: result.count)
-            for (index, entry) in result.enumerated() {
-                runtime.setArrayElement(
-                    array, index: index,
-                    value: runtime.makeNative("Ljava/lang/reflect/Field;", payload: VMFieldRefPayload(owner: entry.0, field: entry.1))
-                )
-            }
-            return array
+            let fields = runtime.publicFields(try target(runtime, args[0])).map { runtime.reflectedFieldValue($0.0, $0.1) }
+            return runtime.typeArray(fields, component: "Ljava/lang/reflect/Field;")
         }
-        cls.method("getConstructors", "()[Ljava/lang/reflect/Constructor;") { runtime, _, _ in
-            runtime.newArray(component: "Ljava/lang/reflect/Constructor;", count: 0)
-        }
-        cls.method("getSimpleName", "()Ljava/lang/String;") { runtime, args, _ in
-            guard let target: VMClass = runtime.payload(args[0], as: VMClass.self) else { return .null }
-            return runtime.newString(target.displayName.split(separator: ".").last.map(String.init) ?? target.displayName)
-        }
+        AnnotationRuntime.addAnnotatedElementMethods(cls, inherited: true)
         return [cls]
     }
 
@@ -1999,6 +2516,10 @@ enum JavaCore {
         cls.staticMethod("sleep", "(J)V") { _, _, _ in .zero }
         cls.staticMethod("currentThread", "()Ljava/lang/Thread;") { runtime, _, _ in
             runtime.makeNative("Ljava/lang/Thread;", payload: VMThreadPayload())
+        }
+        cls.staticMethod("holdsLock", "(Ljava/lang/Object;)Z") { runtime, args, _ in
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return .boolean((runtime.heldMonitors[args[0].bits] ?? 0) > 0)
         }
         return [cls]
     }
@@ -2114,37 +2635,104 @@ enum JavaCore {
 
     private static func reflectArrayClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/lang/reflect/Array;")
-        cls.staticMethod("getLength", "(Ljava/lang/Object;)I") { runtime, args, _ in
-            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
-            guard let descriptor = runtime.classOf(args[0])?.descriptor, descriptor.hasPrefix("[") else {
-                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "argument type mismatch")
+        func component(_ runtime: VMRuntime, _ array: VMValue) throws -> String {
+            guard array.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            guard let type = runtime.classOf(array)?.arrayComponent else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Argument is not an array")
             }
+            return type
+        }
+        func checkedComponent(_ runtime: VMRuntime, _ array: VMValue, _ index: Int) throws -> String {
+            let type = try component(runtime, array)
+            guard index >= 0, index < runtime.arrayLength(array) else {
+                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "\(index)")
+            }
+            return type
+        }
+        func widen(_ runtime: VMRuntime, _ value: VMValue, from: String, to: String) throws -> VMValue {
+            do { return try runtime.convertPrimitive(value, from: from, to: to) }
+            catch { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "argument type mismatch") }
+        }
+        func allocate(_ runtime: VMRuntime, _ classValue: VMValue, _ dimensions: [Int]) throws -> VMValue {
+            guard let type: VMClass = runtime.payload(classValue, as: VMClass.self) else {
+                throw VMJavaException("Ljava/lang/NullPointerException;")
+            }
+            let existingRank = type.descriptor.prefix(while: { $0 == "[" }).count
+            guard type.descriptor != "V", !dimensions.isEmpty, existingRank + dimensions.count <= 255 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;")
+            }
+            for count in dimensions where count < 0 {
+                throw VMJavaException("Ljava/lang/NegativeArraySizeException;", "\(count)")
+            }
+            func level(_ depth: Int) -> VMValue {
+                let element = String(repeating: "[", count: dimensions.count - depth - 1) + type.descriptor
+                let array = runtime.newArray(component: element, count: dimensions[depth])
+                if depth + 1 < dimensions.count {
+                    for index in 0..<dimensions[depth] {
+                        runtime.setArrayElement(array, index: index, value: level(depth + 1))
+                    }
+                }
+                return array
+            }
+            return level(0)
+        }
+        cls.staticMethod("getLength", "(Ljava/lang/Object;)I") { runtime, args, _ in
+            _ = try component(runtime, args[0])
             return .int32(Int32(runtime.arrayLength(args[0])))
         }
         cls.staticMethod("get", "(Ljava/lang/Object;I)Ljava/lang/Object;") { runtime, args, _ in
-            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
             let index = Int(args[1].asInt32)
-            guard index >= 0, index < runtime.arrayLength(args[0]) else {
-                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "\(index)")
-            }
-            return runtime.arrayElement(args[0], index)
+            let type = try checkedComponent(runtime, args[0], index)
+            let value = runtime.arrayElement(args[0], index)
+            if DexDescriptor.isReference(type) { return value }
+            return try runtime.boxPrimitive(value, type: type)
         }
         cls.staticMethod("set", "(Ljava/lang/Object;ILjava/lang/Object;)V") { runtime, args, _ in
-            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
             let index = Int(args[1].asInt32)
-            guard index >= 0, index < runtime.arrayLength(args[0]) else {
-                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "\(index)")
+            let type = try checkedComponent(runtime, args[0], index)
+            let value: VMValue
+            if DexDescriptor.isReference(type) {
+                if args[2].bits != 0 {
+                    let target = try runtime.linkClass(type)
+                    guard runtime.isInstance(args[2], of: target) else {
+                        throw VMJavaException("Ljava/lang/IllegalArgumentException;", "array element type mismatch")
+                    }
+                }
+                value = args[2]
+            } else {
+                guard args[2].bits != 0,
+                      let held = runtime.classOf(args[2]).flatMap({ VMRuntime.wrapperPrimitive[$0.descriptor] }) else {
+                    throw VMJavaException("Ljava/lang/IllegalArgumentException;", "argument type mismatch")
+                }
+                let primitive = try runtime.unboxPrimitive(args[2], to: held)
+                value = try widen(runtime, primitive, from: held, to: type)
             }
-            runtime.setArrayElement(args[0], index: index, value: args[2])
+            runtime.setArrayElement(args[0], index: index, value: value)
             return .zero
         }
-        cls.staticMethod("newInstance", "(Ljava/lang/Class;I)Ljava/lang/Object;") { runtime, args, _ in
-            guard let component: VMClass = runtime.payload(args[0], as: VMClass.self) else {
-                throw VMJavaException("Ljava/lang/NullPointerException;")
+        for (name, type) in [("Boolean", "Z"), ("Byte", "B"), ("Short", "S"), ("Char", "C"),
+                             ("Int", "I"), ("Long", "J"), ("Float", "F"), ("Double", "D")] {
+            cls.staticMethod("get\(name)", "(Ljava/lang/Object;I)\(type)") { runtime, args, _ in
+                let index = Int(args[1].asInt32)
+                let held = try checkedComponent(runtime, args[0], index)
+                return try widen(runtime, runtime.arrayElement(args[0], index), from: held, to: type)
             }
-            let count = Int(args[1].asInt32)
-            guard count >= 0 else { throw VMJavaException("Ljava/lang/NegativeArraySizeException;", "\(count)") }
-            return runtime.newArray(component: component.descriptor, count: count)
+            cls.staticMethod("set\(name)", "(Ljava/lang/Object;I\(type))V") { runtime, args, _ in
+                let index = Int(args[1].asInt32)
+                let target = try checkedComponent(runtime, args[0], index)
+                let value = try widen(runtime, args[2], from: type, to: target)
+                runtime.setArrayElement(args[0], index: index, value: value)
+                return .zero
+            }
+        }
+        cls.staticMethod("newInstance", "(Ljava/lang/Class;I)Ljava/lang/Object;") { runtime, args, _ in
+            try allocate(runtime, args[0], [Int(args[1].asInt32)])
+        }
+        cls.staticMethod("newInstance", "(Ljava/lang/Class;[I)Ljava/lang/Object;") { runtime, args, _ in
+            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let rank = runtime.arrayLength(args[1])
+            guard rank > 0, rank <= 255 else { throw VMJavaException("Ljava/lang/IllegalArgumentException;") }
+            return try allocate(runtime, args[0], (0..<rank).map { Int(runtime.arrayElement(args[1], $0).asInt32) })
         }
         return [cls]
     }
@@ -2238,20 +2826,62 @@ enum JavaCore {
     private static func exceptionClasses() -> [[NativeClass]] {
         let root = NativeClass("Ljava/lang/Throwable;")
         root.field("detailMessage", "Ljava/lang/String;")
-        root.method("<init>", "()V") { _, _, _ in .zero }
-        root.method("<init>", "(Ljava/lang/String;)V") { _, args, _ in
-            if let pointer = args[0].object {
-                VMObjectLayout.slot(pointer, 0).pointee = args[1]
+        // `cause` holds the throwable itself until a cause is set, as in
+        // `java.lang.Throwable`, so `initCause` can tell "unset" from "null".
+        root.field("cause", "Ljava/lang/Throwable;")
+        root.field("suppressedExceptions", "Ljava/util/List;")
+        // Captured frames (a host payload) and the array `setStackTrace`
+        // installed, which takes precedence when present.
+        root.field("backtrace", "Ljava/lang/Object;")
+        root.field("stackTrace", "[Ljava/lang/StackTraceElement;")
+        /// Every constructor stores message and cause, then calls the
+        /// (overridable) `fillInStackTrace`, as `java.lang.Throwable` does.
+        /// Disabled suppression or an unwritable trace is marked by the
+        /// throwable itself in the corresponding slot.
+        func construct(
+            _ runtime: VMRuntime,
+            _ this: VMValue,
+            message: VMValue,
+            cause: VMValue?,
+            enableSuppression: Bool = true,
+            writableStackTrace: Bool = true
+        ) {
+            guard let pointer = this.object else { return }
+            VMObjectLayout.slot(pointer, 0).pointee = message
+            VMObjectLayout.slot(pointer, 1).pointee = cause ?? this
+            if !enableSuppression { VMObjectLayout.slot(pointer, 2).pointee = this }
+            if !writableStackTrace {
+                VMObjectLayout.slot(pointer, 3).pointee = this
+                return
             }
+            _ = runtime.callVirtual(this, "fillInStackTrace()Ljava/lang/Throwable;", [])
+        }
+        func messageOf(_ runtime: VMRuntime, cause: VMValue) -> VMValue {
+            cause.bits == 0 ? .null : runtime.javaToString(cause)
+        }
+        root.method("<init>", "()V") { runtime, args, _ in
+            construct(runtime, args[0], message: .null, cause: nil)
             return .zero
         }
-        root.method("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V") { _, args, _ in
-            if let pointer = args[0].object {
-                VMObjectLayout.slot(pointer, 0).pointee = args[1]
-            }
+        root.method("<init>", "(Ljava/lang/String;)V") { runtime, args, _ in
+            construct(runtime, args[0], message: args[1], cause: nil)
             return .zero
         }
-        root.method("<init>", "(Ljava/lang/Throwable;)V") { _, _, _ in .zero }
+        root.method("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V") { runtime, args, _ in
+            construct(runtime, args[0], message: args[1], cause: args[2])
+            return .zero
+        }
+        root.method("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;ZZ)V") { runtime, args, _ in
+            construct(
+                runtime, args[0], message: args[1], cause: args[2],
+                enableSuppression: args[3].asBoolean, writableStackTrace: args[4].asBoolean
+            )
+            return .zero
+        }
+        root.method("<init>", "(Ljava/lang/Throwable;)V") { runtime, args, _ in
+            construct(runtime, args[0], message: messageOf(runtime, cause: args[1]), cause: args[1])
+            return .zero
+        }
         root.method("getMessage", "()Ljava/lang/String;") { _, args, _ in
             guard let pointer = args[0].object else { return .null }
             return VMObjectLayout.slot(pointer, 0).pointee
@@ -2263,28 +2893,110 @@ enum JavaCore {
         root.method("toString", "()Ljava/lang/String;") { runtime, args, _ in
             guard let pointer = args[0].object else { return runtime.newString("null") }
             let name = VMObjectLayout.cls(pointer).displayName
-            let message = VMObjectLayout.slot(pointer, 0).pointee
+            // `toString` reports `getLocalizedMessage()`, which a subclass
+            // may override.
+            let message = runtime.callVirtual(args[0], "getLocalizedMessage()Ljava/lang/String;", [])
+                ?? VMObjectLayout.slot(pointer, 0).pointee
             if let text = runtime.stringValue(message) {
                 return runtime.newString("\(name): \(text)")
             }
             return runtime.newString(name)
         }
-        root.method("getStackTrace", "()[Ljava/lang/StackTraceElement;") { runtime, _, _ in
-            runtime.newArray(component: "Ljava/lang/StackTraceElement;", count: 0)
+        func frames(_ runtime: VMRuntime, _ pointer: VMPointer) -> [VMStackTracePayload] {
+            runtime.payload(VMObjectLayout.slot(pointer, 3).pointee, as: VMBacktracePayload.self)?.frames ?? []
+        }
+        root.method("getStackTrace", "()[Ljava/lang/StackTraceElement;") { runtime, args, _ in
+            guard let pointer = args[0].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let installed = VMObjectLayout.slot(pointer, 4).pointee
+            if installed.bits != 0 {
+                let count = runtime.arrayLength(installed)
+                let copy = runtime.newArray(component: "Ljava/lang/StackTraceElement;", count: count)
+                for index in 0..<count { runtime.setArrayElement(copy, index: index, value: runtime.arrayElement(installed, index)) }
+                return copy
+            }
+            let captured = frames(runtime, pointer)
+            let array = runtime.newArray(component: "Ljava/lang/StackTraceElement;", count: captured.count)
+            for (index, frame) in captured.enumerated() {
+                runtime.setArrayElement(array, index: index, value: runtime.makeNative("Ljava/lang/StackTraceElement;", payload: frame))
+            }
+            return array
+        }
+        root.method("setStackTrace", "([Ljava/lang/StackTraceElement;)V") { runtime, args, _ in
+            guard args[1].bits != 0, let pointer = args[0].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let count = runtime.arrayLength(args[1])
+            let copy = runtime.newArray(component: "Ljava/lang/StackTraceElement;", count: count)
+            for index in 0..<count {
+                let element = runtime.arrayElement(args[1], index)
+                guard element.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;", "stackTrace[\(index)]") }
+                runtime.setArrayElement(copy, index: index, value: element)
+            }
+            // An unwritable stack trace (marked by the throwable itself in
+            // the backtrace slot) ignores `setStackTrace`.
+            if VMObjectLayout.slot(pointer, 3).pointee.bits != args[0].bits {
+                VMObjectLayout.slot(pointer, 4).pointee = copy
+            }
+            return .zero
         }
         root.method("printStackTrace", "()V") { runtime, args, _ in
-            runtime.standardOutput?(runtime.stringValue(runtime.javaToString(args[0])) ?? "")
+            // `toString`, one `\tat` line per frame, then the cause chain.
+            var lines: [String] = []
+            var current = args[0]
+            var seen: Set<UInt64> = []
+            var prefix = ""
+            while let pointer = current.object, seen.insert(current.bits).inserted {
+                lines.append(prefix + (runtime.stringValue(runtime.javaToString(current)) ?? ""))
+                for frame in frames(runtime, pointer) {
+                    let location = frame.fileName.map { frame.lineNumber >= 0 ? "\($0):\(frame.lineNumber)" : $0 } ?? "Unknown Source"
+                    lines.append("\tat \(frame.className).\(frame.methodName)(\(location))")
+                }
+                let cause = VMObjectLayout.slot(pointer, 1).pointee
+                current = cause.bits == current.bits ? .null : cause
+                prefix = "Caused by: "
+            }
+            runtime.standardOutput?(lines.joined(separator: "\n"))
             return .zero
         }
-        root.method("fillInStackTrace", "()Ljava/lang/Throwable;") { _, args, _ in args[0] }
-        root.method("getCause", "()Ljava/lang/Throwable;") { _, _, _ in .null }
-        root.method("initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;") { _, args, _ in args[0] }
-        root.method("addSuppressed", "(Ljava/lang/Throwable;)V") { _, args, _ in
-            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        root.method("fillInStackTrace", "()Ljava/lang/Throwable;") { runtime, args, _ in
+            runtime.recordBacktrace(args[0])
+            return args[0]
+        }
+        root.method("getCause", "()Ljava/lang/Throwable;") { _, args, _ in
+            guard let pointer = args[0].object else { return .null }
+            let cause = VMObjectLayout.slot(pointer, 1).pointee
+            return cause.bits == args[0].bits ? .null : cause
+        }
+        root.method("initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;") { runtime, args, _ in
+            guard let pointer = args[0].object else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let current = VMObjectLayout.slot(pointer, 1).pointee
+            guard current.bits == args[0].bits else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "Can't overwrite cause")
+            }
+            guard args[1].bits != args[0].bits else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Self-causation not permitted")
+            }
+            VMObjectLayout.slot(pointer, 1).pointee = args[1]
+            return args[0]
+        }
+        root.method("addSuppressed", "(Ljava/lang/Throwable;)V") { runtime, args, _ in
+            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;", "Cannot suppress a null exception.") }
+            guard args[1].bits != args[0].bits else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "Self-suppression not permitted")
+            }
+            guard let pointer = args[0].object else { return .zero }
+            if VMObjectLayout.slot(pointer, 2).pointee.bits == args[0].bits { return .zero }
+            var list = VMObjectLayout.slot(pointer, 2).pointee
+            if list.bits == 0 {
+                list = runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload([]))
+                VMObjectLayout.slot(pointer, 2).pointee = list
+            }
+            runtime.listPayload(list)?.items.append(args[1])
             return .zero
         }
-        root.method("getSuppressed", "()[Ljava/lang/Throwable;") { runtime, _, _ in
-            runtime.newArray(component: "Ljava/lang/Throwable;", count: 0)
+        root.method("getSuppressed", "()[Ljava/lang/Throwable;") { runtime, args, _ in
+            let items = args[0].object.flatMap { runtime.listPayload(VMObjectLayout.slot($0, 2).pointee)?.items } ?? []
+            let array = runtime.newArray(component: "Ljava/lang/Throwable;", count: items.count)
+            for (index, item) in items.enumerated() { runtime.setArrayElement(array, index: index, value: item) }
+            return array
         }
 
         let declarations: [(String, String)] = [
@@ -2302,20 +3014,28 @@ enum JavaCore {
             ("Ljava/lang/ArithmeticException;", "Ljava/lang/RuntimeException;"),
             ("Ljava/lang/ArrayStoreException;", "Ljava/lang/RuntimeException;"),
             ("Ljava/lang/NegativeArraySizeException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/IllegalMonitorStateException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/InstantiationError;", "Ljava/lang/IncompatibleClassChangeError;"),
+            ("Ljava/lang/IllegalAccessError;", "Ljava/lang/IncompatibleClassChangeError;"),
+            ("Ljava/lang/BootstrapMethodError;", "Ljava/lang/LinkageError;"),
+            ("Ljava/lang/invoke/WrongMethodTypeException;", "Ljava/lang/RuntimeException;"),
+            ("Ljava/lang/invoke/LambdaConversionException;", "Ljava/lang/Exception;"),
+            ("Ljava/lang/invoke/StringConcatException;", "Ljava/lang/Exception;"),
             ("Ljava/lang/ClassNotFoundException;", "Ljava/lang/Exception;"),
             ("Ljava/lang/InterruptedException;", "Ljava/lang/Exception;"),
             ("Ljava/lang/CloneNotSupportedException;", "Ljava/lang/Exception;"),
             ("Ljava/lang/Error;", "Ljava/lang/Throwable;"),
             ("Ljava/lang/AssertionError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/NoSuchFieldError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/NoSuchMethodError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/AbstractMethodError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/VerifyError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/IncompatibleClassChangeError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/StackOverflowError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/OutOfMemoryError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/NoSuchFieldError;", "Ljava/lang/IncompatibleClassChangeError;"),
+            ("Ljava/lang/NoSuchMethodError;", "Ljava/lang/IncompatibleClassChangeError;"),
+            ("Ljava/lang/AbstractMethodError;", "Ljava/lang/IncompatibleClassChangeError;"),
+            ("Ljava/lang/VerifyError;", "Ljava/lang/LinkageError;"),
+            ("Ljava/lang/IncompatibleClassChangeError;", "Ljava/lang/LinkageError;"),
+            ("Ljava/lang/VirtualMachineError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/StackOverflowError;", "Ljava/lang/VirtualMachineError;"),
+            ("Ljava/lang/OutOfMemoryError;", "Ljava/lang/VirtualMachineError;"),
             ("Ljava/lang/LinkageError;", "Ljava/lang/Error;"),
-            ("Ljava/lang/NoClassDefFoundError;", "Ljava/lang/Error;"),
+            ("Ljava/lang/NoClassDefFoundError;", "Ljava/lang/LinkageError;"),
             ("Ljava/lang/ExceptionInInitializerError;", "Ljava/lang/LinkageError;"),
             ("Ljava/io/IOException;", "Ljava/lang/Exception;"),
             ("Ljava/io/EOFException;", "Ljava/io/IOException;"),
@@ -2328,6 +3048,12 @@ enum JavaCore {
             ("Ljava/lang/SecurityException;", "Ljava/lang/RuntimeException;"),
             ("Ljava/lang/ReflectiveOperationException;", "Ljava/lang/Exception;"),
             ("Ljava/lang/NoSuchMethodException;", "Ljava/lang/ReflectiveOperationException;"),
+            ("Ljava/lang/NoSuchFieldException;", "Ljava/lang/ReflectiveOperationException;"),
+            ("Ljava/util/IllegalFormatException;", "Ljava/lang/IllegalArgumentException;"),
+            ("Ljava/util/IllegalFormatPrecisionException;", "Ljava/util/IllegalFormatException;"),
+            ("Ljava/util/IllegalFormatCodePointException;", "Ljava/util/IllegalFormatException;"),
+            ("Ljava/util/UnknownFormatConversionException;", "Ljava/util/IllegalFormatException;"),
+            ("Ljava/util/MissingFormatArgumentException;", "Ljava/util/IllegalFormatException;"),
             ("Ljava/lang/IllegalAccessException;", "Ljava/lang/ReflectiveOperationException;"),
             ("Ljava/lang/InstantiationException;", "Ljava/lang/ReflectiveOperationException;"),
             ("Ljava/lang/reflect/InvocationTargetException;", "Ljava/lang/ReflectiveOperationException;"),
@@ -2345,22 +3071,58 @@ enum JavaCore {
         var result: [[NativeClass]] = [[root]]
         for (descriptor, parent) in declarations {
             let cls = NativeClass(descriptor, superclass: parent)
-            cls.method("<init>", "()V") { _, _, _ in .zero }
-            cls.method("<init>", "(Ljava/lang/String;)V") { _, args, _ in
-                if let pointer = args[0].object,
-                   let field = VMObjectLayout.cls(pointer).field(named: "detailMessage") {
-                    VMObjectLayout.slot(pointer, field.offset).pointee = args[1]
-                }
-                return .zero
+            // Every throwable constructor stores message and cause the way
+            // `Throwable`'s does.
+            for constructor in root.methods where constructor.name == "<init>" {
+                cls.method(constructor.name, constructor.signature, constructor.body)
             }
-            cls.method("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V") { _, args, _ in
-                if let pointer = args[0].object,
-                   let field = VMObjectLayout.cls(pointer).field(named: "detailMessage") {
-                    VMObjectLayout.slot(pointer, field.offset).pointee = args[1]
+            if descriptor == "Ljava/lang/AssertionError;" {
+                for type in ["Ljava/lang/Object;", "Z", "C", "I", "J", "F", "D"] {
+                    cls.method("<init>", "(" + type + ")V") { runtime, args, _ in
+                        let message: VMValue
+                        if DexDescriptor.isReference(type) {
+                            message = runtime.javaToString(args[1])
+                        } else {
+                            message = runtime.javaToString(try runtime.boxPrimitive(args[1], type: type))
+                        }
+                        let cause: VMValue?
+                        if DexDescriptor.isReference(type), runtime.isInstance(args[1], of: try runtime.linkClass("Ljava/lang/Throwable;")) {
+                            cause = args[1]
+                        } else {
+                            cause = nil
+                        }
+                        construct(runtime, args[0], message: message, cause: cause)
+                        return .zero
+                    }
                 }
-                return .zero
             }
-            cls.method("<init>", "(Ljava/lang/Throwable;)V") { _, _, _ in .zero }
+            if descriptor == "Ljava/lang/ExceptionInInitializerError;" {
+                cls.method("<init>", "(Ljava/lang/Throwable;)V") { runtime, args, _ in
+                    construct(runtime, args[0], message: .null, cause: args[1])
+                    return .zero
+                }
+                cls.method("getException", "()Ljava/lang/Throwable;") { _, args, _ in
+                    guard let pointer = args[0].object else { return .null }
+                    let cause = VMObjectLayout.slot(pointer, 1).pointee
+                    return cause.bits == args[0].bits ? .null : cause
+                }
+            }
+            if descriptor == "Ljava/io/UncheckedIOException;" {
+                cls.method("<init>", "(Ljava/io/IOException;)V") { runtime, args, _ in
+                    guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                    construct(runtime, args[0], message: messageOf(runtime, cause: args[1]), cause: args[1])
+                    return .zero
+                }
+                cls.method("<init>", "(Ljava/lang/String;Ljava/io/IOException;)V") { runtime, args, _ in
+                    guard args[2].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                    construct(runtime, args[0], message: args[1], cause: args[2])
+                    return .zero
+                }
+                cls.method("getCause", "()Ljava/io/IOException;") { _, args, _ in
+                    guard let pointer = args[0].object else { return .null }
+                    return VMObjectLayout.slot(pointer, 1).pointee
+                }
+            }
             if descriptor == "Ljava/lang/StringIndexOutOfBoundsException;" {
                 cls.method("<init>", "(I)V") { runtime, args, _ in
                     if let pointer = args[0].object,

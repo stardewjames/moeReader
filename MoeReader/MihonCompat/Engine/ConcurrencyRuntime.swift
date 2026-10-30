@@ -307,7 +307,7 @@ enum ConcurrencyRuntime {
             runtime.makeNative("Ljava/util/concurrent/locks/Condition;", payload: NSNull())
         }
         result.append(lock)
-        let condition = NativeClass("Ljava/util/concurrent/locks/Condition;", superclass: "Ljava/lang/Object;")
+        let condition = NativeClass("Ljava/util/concurrent/locks/Condition;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         condition.method("await", "()V") { _, _, _ in .zero }
         condition.method("awaitNanos", "(J)J") { _, _, _ in .int64(0) }
         condition.method("signal", "()V") { _, _, _ in .zero }

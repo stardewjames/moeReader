@@ -34,7 +34,7 @@ class CloudflareInterceptor : Interceptor {
             synchronized(solveLock) {
                 Host.services.solveChallenge(request.url.toString(), userAgent)
             }
-        if (!solved) throw IOException("Failed to bypass the browser check at ${request.url.host}")
+        if (!solved) throw CloudflareBypassException(request.url.host)
         return chain.proceed(request)
     }
 
@@ -67,3 +67,10 @@ class CloudflareInterceptor : Interceptor {
         }
     }
 }
+
+/**
+ * The browser check could not be cleared, so the request cannot succeed. Thrown
+ * instead of a bare IOException so the app can name the failure: the bridge
+ * reports the exception's class, and extensions see an IOException as before.
+ */
+class CloudflareBypassException(host: String) : IOException("Failed to bypass the browser check at $host")

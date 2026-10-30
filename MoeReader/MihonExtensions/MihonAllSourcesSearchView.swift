@@ -124,7 +124,7 @@ struct MihonAllSourcesSearchView: View {
                                             library: library
                                         )
                                     } label: {
-                                        resultRow(manga)
+                                        resultRow(manga, entry: group.entry)
                                     }
                                 }
                             }
@@ -168,13 +168,19 @@ struct MihonAllSourcesSearchView: View {
         }
     }
 
-    private func resultRow(_ manga: MihonManga) -> some View {
+    private func resultRow(_ manga: MihonManga, entry: MihonAvailableSource) -> some View {
         HStack(spacing: 12) {
             MihonRemoteImageView(
                 url: manga.coverURL,
                 headers: manga.coverHeaders,
                 maxPixelSize: 180,
-                contentMode: .fill
+                contentMode: .fill,
+                sourceFetch: manga.coverURL.map { url -> (@Sendable () async throws -> Data) in
+                    let headers = manga.coverHeaders
+                    let runtime = entry.runtime
+                    let source = entry.source
+                    return { try await runtime.coverImage(url: url, headers: headers, source: source) }
+                }
             )
             .frame(width: 46, height: 66)
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))

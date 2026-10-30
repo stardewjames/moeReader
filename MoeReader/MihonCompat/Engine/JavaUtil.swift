@@ -216,6 +216,12 @@ final class VMValuesViewPayload: VMListPayload {
     }
 }
 
+/// Executable native SAM adapters retain their delegates just as Java lambdas do.
+final class VMJavaSAMPayload {
+    let body: (VMRuntime, [VMValue]) throws -> VMValue
+    init(_ body: @escaping (VMRuntime, [VMValue]) throws -> VMValue) { self.body = body }
+}
+
 enum JavaUtil {
     static let listClassDescriptor = "Ljava/util/ArrayList;"
     static let mapClassDescriptor = "Ljava/util/LinkedHashMap;"
@@ -292,6 +298,19 @@ enum JavaUtil {
         ] {
             list.method(name, signature) { _, _, _ in .zero }
         }
+        for arity in 0...10 {
+            list.staticMethod("of", "(" + String(repeating: "Ljava/lang/Object;", count: arity) + ")Ljava/util/List;") { runtime, args, _ in
+                let items = (0..<arity).map { args[$0] }
+                guard items.allSatisfy({ $0.bits != 0 }) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                return runtime.makeNative(listClassDescriptor, payload: VMListPayload(items, immutable: true))
+            }
+        }
+        list.staticMethod("of", "([Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let items = (0..<runtime.arrayLength(args[0])).map { runtime.arrayElement(args[0], $0) }
+            guard items.allSatisfy({ $0.bits != 0 }) else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return runtime.makeNative(listClassDescriptor, payload: VMListPayload(items, immutable: true))
+        }
 
         let set = NativeClass("Ljava/util/Set;", superclass: nil, interfaces: ["Ljava/util/Collection;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         set.method("add", "(Ljava/lang/Object;)Z") { _, _, _ in .zero }
@@ -326,22 +345,66 @@ enum JavaUtil {
         mapEntry.method("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;") { _, args, _ in args[1] }
 
         let comparator = NativeClass("Ljava/util/Comparator;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
-        comparator.method("compare", "(Ljava/lang/Object;Ljava/lang/Object;)I") { _, _, _ in .int32(0) }
+        abstractSAM(comparator, "compare", "(Ljava/lang/Object;Ljava/lang/Object;)I")
         comparator.method("reversed", "()Ljava/util/Comparator;") { runtime, args, _ in
             runtime.makeNative("Lmihoncompat/ReversedComparator;", payload: args[0])
         }
+        for reverse in [false, true] {
+            comparator.staticMethod(reverse ? "reverseOrder" : "naturalOrder", "()Ljava/util/Comparator;") { runtime, _, _ in
+                makeSAM(runtime, "Lmihoncompat/JavaComparator;") { runtime, values in
+                    .int32(try compareValues(runtime, values[reverse ? 1 : 0], values[reverse ? 0 : 1]))
+                }
+            }
+        }
+        comparator.staticMethod("comparing", "(Ljava/util/function/Function;)Ljava/util/Comparator;") { runtime, args, _ in
+            try keyComparator(runtime, extractor: args[0], key: "apply(Ljava/lang/Object;)Ljava/lang/Object;")
+        }
+        comparator.staticMethod("comparing", "(Ljava/util/function/Function;Ljava/util/Comparator;)Ljava/util/Comparator;") { runtime, args, _ in
+            guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return try keyComparator(runtime, extractor: args[0], key: "apply(Ljava/lang/Object;)Ljava/lang/Object;", comparator: args[1])
+        }
+        comparator.method("thenComparing", "(Ljava/util/Comparator;)Ljava/util/Comparator;") { runtime, args, _ in
+            try chainedComparator(runtime, first: args[0], second: args[1])
+        }
+        comparator.method("thenComparing", "(Ljava/util/function/Function;)Ljava/util/Comparator;") { runtime, args, _ in
+            let second = try keyComparator(runtime, extractor: args[1], key: "apply(Ljava/lang/Object;)Ljava/lang/Object;")
+            return try chainedComparator(runtime, first: args[0], second: second)
+        }
+        comparator.method("thenComparing", "(Ljava/util/function/Function;Ljava/util/Comparator;)Ljava/util/Comparator;") { runtime, args, _ in
+            guard args[2].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            let second = try keyComparator(runtime, extractor: args[1], key: "apply(Ljava/lang/Object;)Ljava/lang/Object;", comparator: args[2])
+            return try chainedComparator(runtime, first: args[0], second: second)
+        }
+        for (name, type) in [("Int", "I"), ("Long", "J"), ("Double", "D")] {
+            let signature = "(Ljava/util/function/To\(name)Function;)Ljava/util/Comparator;"
+            let key = "applyAs\(name)(Ljava/lang/Object;)\(type)"
+            comparator.staticMethod("comparing\(name)", signature) { runtime, args, _ in
+                try keyComparator(runtime, extractor: args[0], key: key, primitive: type)
+            }
+            comparator.method("thenComparing\(name)", signature) { runtime, args, _ in
+                let second = try keyComparator(runtime, extractor: args[1], key: key, primitive: type)
+                return try chainedComparator(runtime, first: args[0], second: second)
+            }
+        }
 
         let function = NativeClass("Ljava/util/function/Function;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
-        function.method("apply", "(Ljava/lang/Object;)Ljava/lang/Object;") { _, _, _ in .null }
-        function.method("andThen", "(Ljava/util/function/Function;)Ljava/util/function/Function;") { runtime, _, _ in
-            runtime.makeNative("Ljava/util/function/Function;", payload: NSNull())
+        abstractSAM(function, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        for compose in [false, true] {
+            function.method(compose ? "compose" : "andThen", "(Ljava/util/function/Function;)Ljava/util/function/Function;") { runtime, args, _ in
+                guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                let first = args[compose ? 1 : 0], second = args[compose ? 0 : 1]
+                return makeSAM(runtime, "Lmihoncompat/JavaFunction;") { runtime, values in
+                    let middle = try callSAM(runtime, first, key: "apply(Ljava/lang/Object;)Ljava/lang/Object;", values: values)
+                    return try callSAM(runtime, second, key: "apply(Ljava/lang/Object;)Ljava/lang/Object;", values: [middle])
+                }
+            }
         }
-        function.method("compose", "(Ljava/util/function/Function;)Ljava/util/function/Function;") { runtime, _, _ in
-            runtime.makeNative("Ljava/util/function/Function;", payload: NSNull())
+        function.staticMethod("identity", "()Ljava/util/function/Function;") { runtime, _, _ in
+            makeSAM(runtime, "Lmihoncompat/JavaFunction;") { _, values in values[0] }
         }
 
         let supplier = NativeClass("Ljava/util/function/Supplier;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
-        supplier.method("get", "()Ljava/lang/Object;") { _, _, _ in .null }
+        abstractSAM(supplier, "get", "()Ljava/lang/Object;")
 
         let listIterator = NativeClass("Ljava/util/ListIterator;", superclass: nil, interfaces: ["Ljava/util/Iterator;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
         listIterator.method("hasPrevious", "()Z") { _, _, _ in .boolean(false) }
@@ -349,13 +412,150 @@ enum JavaUtil {
 
         let randomAccess = NativeClass("Ljava/util/RandomAccess;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
 
-        return [collection, list, set, map, mapEntry, comparator, function, supplier, listIterator, randomAccess]
+        return [collection, list, set, map, mapEntry, comparator, function, supplier, listIterator, randomAccess,
+                samAdapter("Lmihoncompat/JavaFunction;", interface: function.descriptor, name: "apply", signature: "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                samAdapter("Lmihoncompat/JavaComparator;", interface: comparator.descriptor, name: "compare", signature: "(Ljava/lang/Object;Ljava/lang/Object;)I")]
+            + primitiveFunctionInterfaces()
+    }
+
+    private static func abstractSAM(_ cls: NativeClass, _ name: String, _ signature: String) {
+        cls.methods.append(NativeMethod(name: name, signature: signature, access: DexAccess.isPublic | DexAccess.isAbstract,
+            body: { _, _, _ in throw VMJavaException("Ljava/lang/AbstractMethodError;", name + signature) }))
+    }
+
+    private static func makeSAM(_ runtime: VMRuntime, _ descriptor: String, _ body: @escaping (VMRuntime, [VMValue]) throws -> VMValue) -> VMValue {
+        runtime.makeNative(descriptor, payload: VMJavaSAMPayload(body))
+    }
+
+    private static func samAdapter(_ descriptor: String, interface: String, name: String, signature: String) -> NativeClass {
+        let cls = NativeClass(descriptor, superclass: "Ljava/lang/Object;", interfaces: [interface])
+        cls.method(name, signature) { runtime, args, count in
+            guard let payload: VMJavaSAMPayload = runtime.payload(args[0], as: VMJavaSAMPayload.self) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "missing SAM delegate")
+            }
+            let values = Array(UnsafeBufferPointer(start: args.advanced(by: 1), count: count - 1))
+            return try payload.body(runtime, values)
+        }
+        return cls
+    }
+
+    private static func callSAM(_ runtime: VMRuntime, _ receiver: VMValue, key: String, values: [VMValue]) throws -> VMValue {
+        guard receiver.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        guard let method = runtime.classOf(receiver)?.lookupVirtual(key: key) else {
+            throw VMJavaException("Ljava/lang/AbstractMethodError;", key)
+        }
+        return try runtime.invokeCompact(method, [receiver] + values)
+    }
+
+    static func compareValues(_ runtime: VMRuntime, _ left: VMValue, _ right: VMValue, comparator: VMValue = .null) throws -> Int32 {
+        if comparator.bits != 0 {
+            return try callSAM(runtime, comparator, key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I", values: [left, right]).asInt32
+        }
+        guard left.bits != 0, right.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        guard let cls = runtime.classOf(left),
+              let comparable = runtime.findClass("Ljava/lang/Comparable;"), cls.isSubclass(of: comparable),
+              let method = cls.lookupVirtual(key: "compareTo(Ljava/lang/Object;)I") else {
+            throw VMJavaException("Ljava/lang/ClassCastException;", "not Comparable")
+        }
+        return try runtime.invokeCompact(method, [left, right]).asInt32
+    }
+
+    private static func keyComparator(_ runtime: VMRuntime, extractor: VMValue, key: String,
+                                      comparator: VMValue = .null, primitive: String? = nil) throws -> VMValue {
+        guard extractor.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        return makeSAM(runtime, "Lmihoncompat/JavaComparator;") { runtime, values in
+            let left = try callSAM(runtime, extractor, key: key, values: [values[0]])
+            let right = try callSAM(runtime, extractor, key: key, values: [values[1]])
+            if let primitive {
+                return .int32(try arrayOrder(runtime, left, right, component: primitive, comparator: .null))
+            }
+            return .int32(try compareValues(runtime, left, right, comparator: comparator))
+        }
+    }
+
+    private static func chainedComparator(_ runtime: VMRuntime, first: VMValue, second: VMValue) throws -> VMValue {
+        guard second.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        return makeSAM(runtime, "Lmihoncompat/JavaComparator;") { runtime, values in
+            let order = try compareValues(runtime, values[0], values[1], comparator: first)
+            if order != 0 { return .int32(order) }
+            return .int32(try compareValues(runtime, values[0], values[1], comparator: second))
+        }
+    }
+
+    private static func primitiveFunctionInterfaces() -> [NativeClass] {
+        var result: [NativeClass] = []
+        for (name, type) in [("Int", "I"), ("Long", "J"), ("Double", "D")] {
+            func sam(_ suffix: String, _ method: String, _ signature: String) -> NativeClass {
+                let cls = NativeClass("Ljava/util/function/\(name)\(suffix);", superclass: nil,
+                    access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+                abstractSAM(cls, method, signature)
+                result.append(cls)
+                return cls
+            }
+            _ = sam("BinaryOperator", "applyAs\(name)", "(\(type)\(type))\(type)")
+            _ = sam("Function", "apply", "(\(type))Ljava/lang/Object;")
+            _ = sam("Supplier", "getAs\(name)", "()\(type)")
+            let consumer = sam("Consumer", "accept", "(\(type))V")
+            let consumerAdapter = "Lmihoncompat/\(name)Consumer;"
+            result.append(samAdapter(consumerAdapter, interface: consumer.descriptor, name: "accept", signature: "(\(type))V"))
+            consumer.method("andThen", "(\(consumer.descriptor))\(consumer.descriptor)") { runtime, args, _ in
+                guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                let first = args[0], second = args[1]
+                return makeSAM(runtime, consumerAdapter) { runtime, values in
+                    _ = try callSAM(runtime, first, key: "accept(\(type))V", values: values)
+                    _ = try callSAM(runtime, second, key: "accept(\(type))V", values: values)
+                    return .zero
+                }
+            }
+            let predicate = sam("Predicate", "test", "(\(type))Z")
+            let predicateAdapter = "Lmihoncompat/\(name)Predicate;"
+            result.append(samAdapter(predicateAdapter, interface: predicate.descriptor, name: "test", signature: "(\(type))Z"))
+            predicate.method("negate", "()\(predicate.descriptor)") { runtime, args, _ in
+                let delegate = args[0]
+                return makeSAM(runtime, predicateAdapter) { runtime, values in
+                    .boolean(try callSAM(runtime, delegate, key: "test(\(type))Z", values: values).asInt32 == 0)
+                }
+            }
+            for conjunction in [false, true] {
+                predicate.method(conjunction ? "and" : "or", "(\(predicate.descriptor))\(predicate.descriptor)") { runtime, args, _ in
+                    guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                    let first = args[0], second = args[1]
+                    return makeSAM(runtime, predicateAdapter) { runtime, values in
+                        let value = try callSAM(runtime, first, key: "test(\(type))Z", values: values).asInt32 != 0
+                        if value != conjunction { return .boolean(value) }
+                        return try callSAM(runtime, second, key: "test(\(type))Z", values: values)
+                    }
+                }
+            }
+            let toFunction = NativeClass("Ljava/util/function/To\(name)Function;", superclass: nil,
+                access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+            abstractSAM(toFunction, "applyAs\(name)", "(Ljava/lang/Object;)\(type)")
+            result.append(toFunction)
+            let unary = sam("UnaryOperator", "applyAs\(name)", "(\(type))\(type)")
+            let adapter = "Lmihoncompat/\(name)UnaryOperator;"
+            let key = "applyAs\(name)(\(type))\(type)"
+            result.append(samAdapter(adapter, interface: unary.descriptor, name: "applyAs\(name)", signature: "(\(type))\(type)"))
+            unary.staticMethod("identity", "()\(unary.descriptor)") { runtime, _, _ in
+                makeSAM(runtime, adapter) { _, values in values[0] }
+            }
+            for compose in [false, true] {
+                unary.method(compose ? "compose" : "andThen", "(\(unary.descriptor))\(unary.descriptor)") { runtime, args, _ in
+                    guard args[1].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                    let first = args[compose ? 1 : 0], second = args[compose ? 0 : 1]
+                    return makeSAM(runtime, adapter) { runtime, values in
+                        let middle = try callSAM(runtime, first, key: key, values: values)
+                        return try callSAM(runtime, second, key: key, values: [middle])
+                    }
+                }
+            }
+        }
+        return result
     }
 
     // MARK: - java.util.ArrayList
 
     private static func arrayListClasses() -> [NativeClass] {
-        let cls = NativeClass("Ljava/util/ArrayList;", superclass: "Ljava/util/AbstractList;", interfaces: ["Ljava/util/List;", "Ljava/io/Serializable;"])
+        let cls = NativeClass("Ljava/util/ArrayList;", superclass: "Ljava/util/AbstractList;", interfaces: ["Ljava/util/List;", "Ljava/util/RandomAccess;", "Ljava/lang/Cloneable;", "Ljava/io/Serializable;"])
         cls.method("<init>", "()V") { runtime, args, _ in
             runtime.setPayload(args[0], VMListPayload())
             return .zero
@@ -1859,11 +2059,21 @@ enum JavaUtil {
         return [cls]
     }
 
-    /// `Arrays.fill(array, from, to, value)` with the JDK's index checks.
+    /// Shared range checks used by Arrays' range overloads.
+    private static func arrayRange(_ runtime: VMRuntime, _ array: VMValue, from: Int, to: Int) throws {
+        guard array.bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+        guard from <= to else { throw VMJavaException("Ljava/lang/IllegalArgumentException;", "fromIndex > toIndex") }
+        guard from >= 0, to <= runtime.arrayLength(array) else {
+            throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;")
+        }
+    }
+
     static func fillArray(_ runtime: VMRuntime, _ array: VMValue, from: Int, to: Int, value: VMValue) throws {
-        let count = runtime.arrayLength(array)
-        guard from >= 0, to <= count, from <= to else {
-            throw VMJavaException("Ljava/lang/IllegalArgumentException;", "fromIndex \(from) > toIndex \(to)")
+        try arrayRange(runtime, array, from: from, to: to)
+        let component = runtime.classOf(array)?.arrayComponent ?? "Ljava/lang/Object;"
+        if from < to, DexDescriptor.isReference(component), value.bits != 0 {
+            let target = try runtime.linkClass(component)
+            guard runtime.isInstance(value, of: target) else { throw VMJavaException("Ljava/lang/ArrayStoreException;") }
         }
         for index in from..<to {
             runtime.setArrayElement(array, index: index, value: value)
@@ -1872,133 +2082,225 @@ enum JavaUtil {
 
     private static func arraysClass() -> [NativeClass] {
         let cls = NativeClass("Ljava/util/Arrays;")
+        let components = ["Z", "B", "S", "C", "I", "J", "F", "D", "Ljava/lang/Object;"]
         cls.staticMethod("asList", "([Ljava/lang/Object;)Ljava/util/List;") { runtime, args, _ in
-            let count = runtime.arrayLength(args[0])
-            return runtime.makeNative(
-                "Ljava/util/Arrays$ArrayList;",
-                payload: VMArrayViewList(array: args[0], offset: 0, count: count)
-            )
+            guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+            return runtime.makeNative("Ljava/util/Arrays$ArrayList;",
+                payload: VMArrayViewList(array: args[0], offset: 0, count: runtime.arrayLength(args[0])))
         }
-        cls.staticMethod("toString", "([Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
-            runtime.arrayToString(args[0])
-        }
-        cls.staticMethod("toString", "([I)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
-        cls.staticMethod("toString", "([J)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
-        cls.staticMethod("copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;") { runtime, args, _ in
-            runtime.copyArray(args[0], count: Int(args[1].asInt32), component: "Ljava/lang/Object;")
-        }
-        cls.staticMethod("copyOf", "([II)[I") { runtime, args, _ in
-            runtime.copyArray(args[0], count: Int(args[1].asInt32), component: "I")
-        }
-        cls.staticMethod("copyOfRange", "([Ljava/lang/Object;II)[Ljava/lang/Object;") { runtime, args, _ in
-            runtime.copyArrayRange(args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), component: "Ljava/lang/Object;")
-        }
-        cls.staticMethod("fill", "([Ljava/lang/Object;Ljava/lang/Object;)V") { runtime, args, _ in
-            let count = runtime.arrayLength(args[0])
-            for index in 0..<count { runtime.setArrayElement(args[0], index: index, value: args[1]) }
-            return .zero
-        }
-        cls.staticMethod("equals", "([Ljava/lang/Object;[Ljava/lang/Object;)Z") { runtime, args, _ in
-            let left = runtime.arrayLength(args[0]), right = runtime.arrayLength(args[1])
-            guard left == right else { return .boolean(false) }
-            for index in 0..<left where !runtime.javaEquals(runtime.arrayElement(args[0], index), runtime.arrayElement(args[1], index)) {
-                return .boolean(false)
+        for component in components {
+            let arrayType = "[" + component
+            cls.staticMethod("toString", "(\(arrayType))Ljava/lang/String;") { runtime, args, _ in
+                var active: Set<UInt64> = []
+                return runtime.newString(try arrayDescription(runtime, args[0], deep: false, active: &active))
             }
-            return .boolean(true)
+            cls.staticMethod("equals", "(\(arrayType)\(arrayType))Z") { runtime, args, _ in
+                .boolean(arrayEquals(runtime, args[0], args[1], component: component, deep: false))
+            }
+            cls.staticMethod("hashCode", "(\(arrayType))I") { runtime, args, _ in
+                .int32(arrayHash(runtime, args[0], component: component, deep: false))
+            }
+            cls.staticMethod("copyOf", "(\(arrayType)I)\(arrayType)") { runtime, args, _ in
+                let count = Int(args[1].asInt32)
+                guard count >= 0 else { throw VMJavaException("Ljava/lang/NegativeArraySizeException;") }
+                guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                let actualComponent = runtime.classOf(args[0])?.arrayComponent ?? component
+                return runtime.copyArray(args[0], count: count, component: actualComponent)
+            }
+            cls.staticMethod("copyOfRange", "(\(arrayType)II)\(arrayType)") { runtime, args, _ in
+                let from = Int(args[1].asInt32), to = Int(args[2].asInt32)
+                guard from <= to else { throw VMJavaException("Ljava/lang/IllegalArgumentException;") }
+                guard args[0].bits != 0 else { throw VMJavaException("Ljava/lang/NullPointerException;") }
+                guard from >= 0, from <= runtime.arrayLength(args[0]) else {
+                    throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;")
+                }
+                let actualComponent = runtime.classOf(args[0])?.arrayComponent ?? component
+                let result = runtime.newArray(component: actualComponent, count: to - from)
+                for index in 0..<min(to - from, runtime.arrayLength(args[0]) - from) {
+                    runtime.setArrayElement(result, index: index, value: runtime.arrayElement(args[0], from + index))
+                }
+                return result
+            }
+            cls.staticMethod("fill", "(\(arrayType)\(component))V") { runtime, args, _ in
+                try fillArray(runtime, args[0], from: 0, to: runtime.arrayLength(args[0]), value: args[1])
+                return .zero
+            }
+            cls.staticMethod("fill", "(\(arrayType)II\(component))V") { runtime, args, _ in
+                try fillArray(runtime, args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), value: args[3])
+                return .zero
+            }
+            if component != "Z" {
+                for ranged in [false, true] {
+                    let range = ranged ? "II" : ""
+                    cls.staticMethod("sort", "(\(arrayType)\(range))V") { runtime, args, _ in
+                        let from = ranged ? Int(args[1].asInt32) : 0
+                        let to = ranged ? Int(args[2].asInt32) : runtime.arrayLength(args[0])
+                        try sortArray(runtime, args[0], from: from, to: to, component: component, comparator: .null)
+                        return .zero
+                    }
+                    cls.staticMethod("binarySearch", "(\(arrayType)\(range)\(component))I") { runtime, args, _ in
+                        let from = ranged ? Int(args[1].asInt32) : 0
+                        let to = ranged ? Int(args[2].asInt32) : runtime.arrayLength(args[0])
+                        return .int32(try searchArray(runtime, args[0], from: from, to: to,
+                            key: args[ranged ? 3 : 1], component: component, comparator: .null))
+                    }
+                }
+            }
         }
-        cls.staticMethod("hashCode", "([Ljava/lang/Object;)I") { runtime, args, _ in
-            var hash: Int32 = 1
-            for index in 0..<runtime.arrayLength(args[0]) { hash = 31 &* hash &+ runtime.javaHashCode(runtime.arrayElement(args[0], index)) }
-            return .int32(hash)
+        for ranged in [false, true] {
+            let range = ranged ? "II" : ""
+            cls.staticMethod("sort", "([Ljava/lang/Object;\(range)Ljava/util/Comparator;)V") { runtime, args, _ in
+                let from = ranged ? Int(args[1].asInt32) : 0
+                let to = ranged ? Int(args[2].asInt32) : runtime.arrayLength(args[0])
+                try sortArray(runtime, args[0], from: from, to: to, component: "Ljava/lang/Object;", comparator: args[ranged ? 3 : 1])
+                return .zero
+            }
+            cls.staticMethod("binarySearch", "([Ljava/lang/Object;\(range)Ljava/lang/Object;Ljava/util/Comparator;)I") { runtime, args, _ in
+                let from = ranged ? Int(args[1].asInt32) : 0
+                let to = ranged ? Int(args[2].asInt32) : runtime.arrayLength(args[0])
+                return .int32(try searchArray(runtime, args[0], from: from, to: to,
+                    key: args[ranged ? 3 : 1], component: "Ljava/lang/Object;", comparator: args[ranged ? 4 : 2]))
+            }
+        }
+        cls.staticMethod("deepEquals", "([Ljava/lang/Object;[Ljava/lang/Object;)Z") { runtime, args, _ in
+            .boolean(arrayEquals(runtime, args[0], args[1], component: "Ljava/lang/Object;", deep: true))
+        }
+        cls.staticMethod("deepHashCode", "([Ljava/lang/Object;)I") { runtime, args, _ in
+            .int32(arrayHash(runtime, args[0], component: "Ljava/lang/Object;", deep: true))
+        }
+        cls.staticMethod("deepToString", "([Ljava/lang/Object;)Ljava/lang/String;") { runtime, args, _ in
+            var active: Set<UInt64> = []
+            return runtime.newString(try arrayDescription(runtime, args[0], deep: true, active: &active))
         }
         cls.staticMethod("stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;") { _, _, _ in
             throw VMJavaException("Ljava/lang/UnsupportedOperationException;", "Arrays.stream")
         }
-        for letter in ["B", "C", "D", "F", "J", "S", "Z"] {
-            cls.staticMethod("copyOf", "([\(letter)I)[\(letter)") { runtime, args, _ in
-                let count = Int(args[1].asInt32)
-                guard count >= 0 else { throw VMJavaException("Ljava/lang/NegativeArraySizeException;", "\(count)") }
-                return runtime.copyArray(args[0], count: count, component: letter)
-            }
-        }
-        cls.staticMethod("copyOfRange", "([BII)[B") { runtime, args, _ in
-            let total = runtime.arrayLength(args[0])
-            let from = Int(args[1].asInt32)
-            let to = Int(args[2].asInt32)
-            guard from >= 0, from <= total else {
-                throw VMJavaException("Ljava/lang/ArrayIndexOutOfBoundsException;", "from \(from), length \(total)")
-            }
-            guard from <= to else {
-                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "from(\(from)) > to(\(to))")
-            }
-            return runtime.copyArrayRange(args[0], from: from, to: to, component: "B")
-        }
-        cls.staticMethod("equals", "([B[B)Z") { runtime, args, _ in
-            let left = runtime.arrayLength(args[0]), right = runtime.arrayLength(args[1])
-            guard left == right else { return .boolean(false) }
-            if args[0].bits == args[1].bits { return .boolean(true) }
-            for index in 0..<left where runtime.arrayElement(args[0], index).asInt32 != runtime.arrayElement(args[1], index).asInt32 {
-                return .boolean(false)
-            }
-            return .boolean(true)
-        }
-        cls.staticMethod("hashCode", "([B)I") { runtime, args, _ in
-            var hash: Int32 = 1
-            for index in 0..<runtime.arrayLength(args[0]) {
-                hash = 31 &* hash &+ runtime.arrayElement(args[0], index).asInt32
-            }
-            return .int32(hash)
-        }
-        cls.staticMethod("hashCode", "([I)I") { runtime, args, _ in
-            var hash: Int32 = 1
-            for index in 0..<runtime.arrayLength(args[0]) {
-                hash = 31 &* hash &+ runtime.arrayElement(args[0], index).asInt32
-            }
-            return .int32(hash)
-        }
-        cls.staticMethod("fill", "([BB)V") { runtime, args, _ in
-            try fillArray(runtime, args[0], from: 0, to: runtime.arrayLength(args[0]), value: args[1])
-            return .zero
-        }
-        cls.staticMethod("fill", "([BIIB)V") { runtime, args, _ in
-            try fillArray(runtime, args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), value: args[3])
-            return .zero
-        }
-        cls.staticMethod("fill", "([II)V") { runtime, args, _ in
-            try fillArray(runtime, args[0], from: 0, to: runtime.arrayLength(args[0]), value: args[1])
-            return .zero
-        }
-        cls.staticMethod("fill", "([IIII)V") { runtime, args, _ in
-            try fillArray(runtime, args[0], from: Int(args[1].asInt32), to: Int(args[2].asInt32), value: args[3])
-            return .zero
-        }
-        cls.staticMethod("sort", "([C)V") { runtime, args, _ in
-            let count = runtime.arrayLength(args[0])
-            let units = (0..<count).map { UInt16(truncatingIfNeeded: runtime.arrayElement(args[0], $0).asInt32) }.sorted()
-            for (index, unit) in units.enumerated() {
-                runtime.setArrayElement(args[0], index: index, value: .int32(Int32(unit)))
-            }
-            return .zero
-        }
-        cls.staticMethod("toString", "([B)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
-        cls.staticMethod("toString", "([D)Ljava/lang/String;") { runtime, args, _ in
-            var parts: [String] = []
-            parts.reserveCapacity(runtime.arrayLength(args[0]))
-            for index in 0..<runtime.arrayLength(args[0]) {
-                parts.append(String(runtime.arrayElement(args[0], index).asDouble))
-            }
-            return runtime.newString("[" + parts.joined(separator: ", ") + "]")
-        }
-        cls.staticMethod("toString", "([F)Ljava/lang/String;") { runtime, args, _ in
-            var parts: [String] = []
-            parts.reserveCapacity(runtime.arrayLength(args[0]))
-            for index in 0..<runtime.arrayLength(args[0]) {
-                parts.append(String(runtime.arrayElement(args[0], index).asFloat))
-            }
-            return runtime.newString("[" + parts.joined(separator: ", ") + "]")
-        }
-        cls.staticMethod("toString", "([S)Ljava/lang/String;") { runtime, args, _ in runtime.arrayToString(args[0]) }
         return [cls]
+    }
+
+    private static func primitiveHash(_ value: VMValue, component: String) -> Int32 {
+        switch component {
+        case "Z": return value.asInt32 == 0 ? 1237 : 1231
+        case "B": return Int32(Int8(truncatingIfNeeded: value.asInt32))
+        case "S": return Int32(Int16(truncatingIfNeeded: value.asInt32))
+        case "C": return Int32(UInt16(truncatingIfNeeded: value.asInt32))
+        case "J": return Int32(truncatingIfNeeded: value.bits ^ (value.bits >> 32))
+        case "F": return Int32(bitPattern: value.asFloat.isNaN ? 0x7fc00000 : value.asFloat.bitPattern)
+        case "D":
+            let bits = value.asDouble.isNaN ? UInt64(0x7ff8000000000000) : value.asDouble.bitPattern
+            return Int32(truncatingIfNeeded: bits ^ (bits >> 32))
+        default: return value.asInt32
+        }
+    }
+
+    private static func arrayEquals(_ runtime: VMRuntime, _ left: VMValue, _ right: VMValue, component: String, deep: Bool) -> Bool {
+        if left.bits == right.bits { return true }
+        guard left.bits != 0, right.bits != 0, runtime.arrayLength(left) == runtime.arrayLength(right) else { return false }
+        for index in 0..<runtime.arrayLength(left) {
+            let a = runtime.arrayElement(left, index), b = runtime.arrayElement(right, index)
+            if DexDescriptor.isReference(component) {
+                if deep, a.bits != 0, b.bits != 0,
+                   let ac = runtime.classOf(a)?.arrayComponent, let bc = runtime.classOf(b)?.arrayComponent {
+                    let references = DexDescriptor.isReference(ac) && DexDescriptor.isReference(bc)
+                    if !references && ac != bc { return false }
+                    if !arrayEquals(runtime, a, b, component: ac, deep: true) { return false }
+                } else if !runtime.javaEquals(a, b) { return false }
+            } else if component == "D" {
+                let x = a.asDouble, y = b.asDouble
+                if !(x.isNaN && y.isNaN) && x.bitPattern != y.bitPattern { return false }
+            } else if component == "J" {
+                if a.asInt64 != b.asInt64 { return false }
+            } else if primitiveHash(a, component: component) != primitiveHash(b, component: component) { return false }
+        }
+        return true
+    }
+
+    private static func arrayHash(_ runtime: VMRuntime, _ array: VMValue, component: String, deep: Bool) -> Int32 {
+        guard array.bits != 0 else { return 0 }
+        var hash: Int32 = 1
+        for index in 0..<runtime.arrayLength(array) {
+            let value = runtime.arrayElement(array, index)
+            let elementHash: Int32
+            if DexDescriptor.isReference(component) {
+                if deep, value.bits != 0, let nested = runtime.classOf(value)?.arrayComponent {
+                    elementHash = arrayHash(runtime, value, component: nested, deep: true)
+                } else { elementHash = runtime.javaHashCode(value) }
+            } else { elementHash = primitiveHash(value, component: component) }
+            hash = 31 &* hash &+ elementHash
+        }
+        return hash
+    }
+
+    private static func arrayDescription(_ runtime: VMRuntime, _ array: VMValue, deep: Bool, active: inout Set<UInt64>) throws -> String {
+        guard array.bits != 0 else { return "null" }
+        if active.contains(array.bits) { return "[...]" }
+        active.insert(array.bits)
+        defer { active.remove(array.bits) }
+        let component = runtime.classOf(array)?.arrayComponent ?? "Ljava/lang/Object;"
+        var result = "["
+        for index in 0..<runtime.arrayLength(array) {
+            if index > 0 { result += ", " }
+            let value = runtime.arrayElement(array, index)
+            if deep, DexDescriptor.isReference(component), value.bits != 0, runtime.classOf(value)?.isArray == true {
+                result += try arrayDescription(runtime, value, deep: true, active: &active)
+            } else {
+                switch component {
+                case "Z": result += value.asInt32 == 0 ? "false" : "true"
+                case "C": result += String(decoding: [UInt16(truncatingIfNeeded: value.asInt32)], as: UTF16.self)
+                case "B", "S", "I": result += String(primitiveHash(value, component: component))
+                case "J": result += String(value.asInt64)
+                case "F", "D":
+                    let wrapper = try runtime.linkClass(component == "F" ? "Ljava/lang/Float;" : "Ljava/lang/Double;")
+                    guard let method = wrapper.lookupStatic(key: "toString(\(component))Ljava/lang/String;") else {
+                        throw VMJavaException("Ljava/lang/NoSuchMethodError;", "toString")
+                    }
+                    result += runtime.stringValue(try runtime.invokeCompact(method, [value])) ?? ""
+                default: result += runtime.stringValue(runtime.javaToString(value)) ?? "null"
+                }
+            }
+        }
+        return result + "]"
+    }
+
+    private static func arrayOrder(_ runtime: VMRuntime, _ left: VMValue, _ right: VMValue, component: String, comparator: VMValue) throws -> Int32 {
+        switch component {
+        case "F":
+            let a = left.asFloat, b = right.asFloat
+            if a < b { return -1 }; if a > b { return 1 }
+            let x = primitiveHash(left, component: "F"), y = primitiveHash(right, component: "F")
+            return x == y ? 0 : (x < y ? -1 : 1)
+        case "D":
+            let a = left.asDouble, b = right.asDouble
+            if a < b { return -1 }; if a > b { return 1 }
+            let x = Int64(bitPattern: a.isNaN ? 0x7ff8000000000000 : a.bitPattern)
+            let y = Int64(bitPattern: b.isNaN ? 0x7ff8000000000000 : b.bitPattern)
+            return x == y ? 0 : (x < y ? -1 : 1)
+        case "J": return left.asInt64 == right.asInt64 ? 0 : (left.asInt64 < right.asInt64 ? -1 : 1)
+        case "B", "S", "C", "I":
+            let x = primitiveHash(left, component: component), y = primitiveHash(right, component: component)
+            return x == y ? 0 : (x < y ? -1 : 1)
+        default: return try compareValues(runtime, left, right, comparator: comparator)
+        }
+    }
+
+    private static func sortArray(_ runtime: VMRuntime, _ array: VMValue, from: Int, to: Int, component: String, comparator: VMValue) throws {
+        try arrayRange(runtime, array, from: from, to: to)
+        var items = (from..<to).map { runtime.arrayElement(array, $0) }
+        try items.sort { try arrayOrder(runtime, $0, $1, component: component, comparator: comparator) < 0 }
+        for (index, value) in items.enumerated() { runtime.setArrayElement(array, index: from + index, value: value) }
+    }
+
+    private static func searchArray(_ runtime: VMRuntime, _ array: VMValue, from: Int, to: Int, key: VMValue, component: String, comparator: VMValue) throws -> Int32 {
+        try arrayRange(runtime, array, from: from, to: to)
+        var low = from, high = to - 1
+        while low <= high {
+            let mid = low + (high - low) / 2
+            let order = try arrayOrder(runtime, runtime.arrayElement(array, mid), key, component: component, comparator: comparator)
+            if order < 0 { low = mid + 1 }
+            else if order > 0 { high = mid - 1 }
+            else { return Int32(mid) }
+        }
+        return -Int32(low) - 1
     }
 
     private static func textClasses() -> [NativeClass] {
@@ -3302,12 +3604,10 @@ enum JavaUtil {
 
         let reversed = NativeClass("Lmihoncompat/ReversedComparator;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/util/Comparator;"])
         reversed.method("compare", "(Ljava/lang/Object;Ljava/lang/Object;)I") { runtime, args, _ in
-            let delegate = runtime.payload(args[0], as: VMValue.self) ?? .null
-            guard delegate.bits != 0, let method = runtime.classOf(delegate)?.lookupVirtual(key: "compare(Ljava/lang/Object;Ljava/lang/Object;)I") else {
-                return .int32(0)
+            guard let delegate: VMValue = runtime.payload(args[0], as: VMValue.self) else {
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "missing comparator delegate")
             }
-            let order = try runtime.invoke(method, [delegate, args[1], args[2]])
-            return .int32(-order.asInt32)
+            return .int32(try compareValues(runtime, args[2], args[1], comparator: delegate))
         }
         reversed.method("toString", "()Ljava/lang/String;") { runtime, _, _ in runtime.newString("reversed") }
         result.append(reversed)

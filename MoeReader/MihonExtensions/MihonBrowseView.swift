@@ -195,7 +195,7 @@ struct MihonBrowseView: View {
                                     library: library
                                 )
                             } label: {
-                                MihonMangaCard(manga: manga)
+                                MihonMangaCard(manga: manga, source: source, runtime: runtime)
                             }
                             .buttonStyle(.plain)
                             .onAppear {
@@ -343,6 +343,8 @@ private enum FeedMode: String, CaseIterable, Identifiable {
 
 private struct MihonMangaCard: View {
     let manga: MihonManga
+    let source: MihonSource
+    let runtime: any MihonSourceRuntime
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -350,7 +352,11 @@ private struct MihonMangaCard: View {
                 url: manga.coverURL,
                 headers: manga.coverHeaders,
                 maxPixelSize: 480,
-                contentMode: .fill
+                contentMode: .fill,
+                sourceFetch: manga.coverURL.map { url -> (@Sendable () async throws -> Data) in
+                    let headers = manga.coverHeaders
+                    return { try await runtime.coverImage(url: url, headers: headers, source: source) }
+                }
             )
                 .frame(height: 168)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))

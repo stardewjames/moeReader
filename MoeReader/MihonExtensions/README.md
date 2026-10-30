@@ -50,7 +50,11 @@ destination (from Settings and the home Library), the runtime picker in
   estimated release cadence beside the cover; its truncated description opens
   in a full-text sheet. Source preferences are edited in a sheet, including
   text, single-choice, toggle, and multi-select controls; only changed keys are
-  written. Covers use the source's request headers over the shared cookie jar.
+  written. Covers load through `runtime.coverImage`, the source's own client,
+  so a source whose interceptors serve or rewrite covers (placeholder cover
+  URLs answered from an interceptor) works the way Mihon and Suwayomi load
+  them; the browse grid, the manga header, all-sources search, and the saved
+  entry's cover refresh all route through it.
 - **One reader.** Extension chapters open in the same `ReaderView` as local
   books. `MihonReaderPageSource` feeds `runtime.pageImage` into the reader's
   image-provider seam, so the extension's interceptors apply while paging,

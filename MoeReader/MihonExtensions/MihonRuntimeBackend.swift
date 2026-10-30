@@ -70,6 +70,26 @@ final class MihonRuntimeSelection {
         active.runtime(for: installed, apkURL: apkURL)
     }
 
+    /// Resolves the source (and the active backend's runtime) a library entry
+    /// points at, matching by id then name as its saved identity may vary.
+    /// Nil when the extension is missing, disabled or no longer offers it.
+    @MainActor
+    func resolve(entry: RemoteMangaEntry) async -> (source: MihonSource, runtime: any MihonSourceRuntime)? {
+        let installed = await MihonCompatStore.shared.installedSnapshot()
+        guard let installedExtension = installed.first(where: { $0.packageName == entry.packageName }),
+              installedExtension.isEnabled,
+              let source = installedExtension.sources.first(where: {
+                  $0.id == entry.sourceID && $0.language == entry.sourceLanguage
+              }) ?? installedExtension.sources.first(where: { $0.id == entry.sourceID })
+                  ?? installedExtension.sources.first(where: {
+                      $0.name == entry.sourceName && $0.language == entry.sourceLanguage
+                  }) ?? installedExtension.sources.first(where: { $0.name == entry.sourceName })
+        else { return nil }
+        let apkURL = MihonCompatStore.shared.apkURL(for: installedExtension)
+        guard FileManager.default.fileExists(atPath: apkURL.path) else { return nil }
+        return (source, runtime(for: installedExtension, apkURL: apkURL))
+    }
+
     /// Every backend may hold state for a package, not only the active one.
     func evict(packageName: String) {
         for backend in backends {

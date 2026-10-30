@@ -117,8 +117,18 @@ struct SuwayomiDirectories: Sendable {
 }
 
 struct SuwayomiFailure: Error, LocalizedError, Sendable {
+    /// `browserCheck`: the host hit a Cloudflare-style interstitial it could not clear.
+    enum Kind: Sendable {
+        case failure
+        case browserCheck
+    }
+
     let message: String
-    init(_ message: String) { self.message = message }
+    let kind: Kind
+    init(_ message: String, kind: Kind = .failure) {
+        self.message = message
+        self.kind = kind
+    }
     var errorDescription: String? { message }
 }
 
@@ -244,13 +254,14 @@ final class SuwayomiJVM: @unchecked Sendable {
         if try reader.u8() == 0 { return reader }
         let type = try reader.string() ?? "error"
         let message = try reader.string() ?? type
-        throw SuwayomiFailure(Self.display(type: type, message: message))
+        let kind: SuwayomiFailure.Kind = type.hasSuffix("CloudflareBypassException") ? .browserCheck : .failure
+        throw SuwayomiFailure(Self.display(type: type, message: message), kind: kind)
     }
 
     private static func display(type: String, message: String) -> String {
         let simple = type.split(separator: ".").last.map(String.init) ?? type
         switch simple {
-        case "IOException", "SocketTimeoutException", "UnknownHostException":
+        case "IOException", "SocketTimeoutException", "UnknownHostException", "CloudflareBypassException":
             return message
         default:
             return "\(simple): \(message)"

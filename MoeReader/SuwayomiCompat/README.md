@@ -100,7 +100,7 @@ it stays resident (idle, its heap trimmed) until the app exits.
 |---|---|
 | HTTP (`Native.fetch`) | `SuwayomiTransport`: an ephemeral `URLSession` that follows no redirects and handles no cookies (OkHttp does both), strips `Content-Encoding`/`Content-Length` of the decoded body, and splits Foundation's folded `Set-Cookie` header back into one header per cookie |
 | Cookies | `HTTPCookieStorage.shared`, the same storage the Swift engine, cover loading and the challenge solver use; the host's `PersistentCookieStore` and `android.webkit.CookieManager` read and write it |
-| Browser checks | The host's `CloudflareInterceptor` recognises the interstitial and asks the app; `MihonChallengeSolver` (from `MihonCompat`) clears it in an off-screen `WKWebView` with the user agent the retry sends |
+| Browser checks | The host's `CloudflareInterceptor` recognises the interstitial and asks the app; `MihonChallengeSolver` (from `MihonCompat`) clears it in an off-screen `WKWebView` with the user agent the retry sends. When it cannot clear the check, the host throws `CloudflareBypassException` and the call fails with a `SuwayomiFailure` whose `kind` is `.browserCheck` |
 | `app.cash.quickjs.QuickJs` | One `JSContext` per instance (`SuwayomiScripts`) |
 | Logging | `print` in Debug builds or with `SUWAYOMI_LOG` set |
 

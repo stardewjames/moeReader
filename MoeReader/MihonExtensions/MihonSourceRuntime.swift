@@ -228,6 +228,11 @@ protocol MihonSourceRuntime: Sendable {
     /// Bytes of one reader page. Routed through the extension's own client so
     /// its image interceptors (descrambling, merging, text pages) run.
     func pageImage(page: MihonPage, chapter: MihonChapter, source: MihonSource) async throws -> Data
+    /// Bytes of a manga cover. Routed through the extension's own client like
+    /// `pageImage`: some sources answer their placeholder cover URLs from an
+    /// interceptor, so the plain image loader would fail where Mihon and
+    /// Suwayomi load the cover.
+    func coverImage(url: URL, headers: [String: String], source: MihonSource) async throws -> Data
 }
 
 extension MihonSourceRuntime {
@@ -240,6 +245,18 @@ extension MihonSourceRuntime {
     /// source is marked NSFW unless it says so.
     func capabilities(source: MihonSource) async throws -> MihonSourceCapabilities {
         MihonSourceCapabilities()
+    }
+
+    /// Backends whose covers already pass through their host (a proxy that
+    /// applies the extension's client) keep the shared loader.
+    func coverImage(url: URL, headers: [String: String], source: MihonSource) async throws -> Data {
+        let response = try await MihonHTTPClient().fetch(
+            MihonHTTPRequest(url: url, headers: headers, maxBytes: 32 * 1024 * 1024)
+        )
+        guard response.isSuccess, !response.data.isEmpty else {
+            throw MihonError.httpStatus(response.statusCode)
+        }
+        return response.data
     }
 }
 

@@ -2,11 +2,13 @@
 //  Dex.swift
 //  MihonCompat
 //
-//  Zero-copy reader for Dalvik EXecutable files (`classes*.dex`).
+//  Reader for Dalvik EXecutable files (`classes*.dex`), versions 035 through
+//  041 (including the 041 container of several logical files).
 //
-//  Everything here is a view over the mapped APK bytes: no payload is copied,
-//  no whole-file decode is performed. Tables are materialised lazily and only
-//  the members the engine actually links are ever decoded.
+//  The dex bytes are copied once into a `DexBuffer`; instructions are read in
+//  place from it. Identifier tables (strings, types, protos, member refs,
+//  method handles) are decoded at load; class data, code items, call sites
+//  and annotations are decoded on first use.
 //
 
 import Foundation
@@ -64,6 +66,8 @@ struct DexCode {
     let insns: UnsafeRawPointer
     let insnUnits: Int
     let tries: [DexTryBlock]
+    /// `debug_info_item` offset (0 when the method has none).
+    var debugInfoOffset = 0
 
     @inline(__always) func unit(_ index: Int) -> UInt16 {
         UInt16(littleEndian: insns.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self))
@@ -142,6 +146,8 @@ struct DexClassDef {
     let instanceFields: [DexFieldDef]
     let directMethods: [DexMethodDef]
     let virtualMethods: [DexMethodDef]
+    /// `annotations_directory_item` offset; 0 when the class has none.
+    let annotationsOffset: Int
 
     var isInterface: Bool { access & DexAccess.isInterface != 0 }
     var isEnum: Bool { access & DexAccess.isEnum != 0 }
@@ -161,7 +167,8 @@ struct DexClassDef {
     }
 }
 
-/// A decoded `encoded_value`; only the forms used for field constants are kept.
+/// A decoded `encoded_value`. Every value type of the format is represented;
+/// references stay indices into the owning dex.
 enum DexValue {
     case byte(Int8)
     case short(Int16)
@@ -170,12 +177,74 @@ enum DexValue {
     case long(Int64)
     case float(UInt32)   // raw bits
     case double(UInt64)  // raw bits
+    case methodType(Int) // proto index
+    case methodHandle(Int) // method handle index
     case string(Int)     // dex string index
     case type(Int)       // dex type index
-    case boolean(Bool)
-    case null
+    case field(Int)      // field ref index
+    case method(Int)     // method ref index
+    case enumValue(Int)  // field ref index of the enum constant
     case array([DexValue])
-    case other(Int)      // type + any payload we don't interpret
+    case annotation(DexEncodedAnnotation)
+    case null
+    case boolean(Bool)
+}
+
+/// `encoded_annotation`: the annotation type and its explicitly written
+/// elements (defaults live in the annotation class's `AnnotationDefault`).
+struct DexEncodedAnnotation {
+    let type: String
+    let elements: [(name: String, value: DexValue)]
+
+    func element(_ name: String) -> DexValue? {
+        elements.first { $0.name == name }?.value
+    }
+}
+
+/// One `annotation_item`.
+struct DexAnnotation {
+    /// `VISIBILITY_BUILD` (0), `VISIBILITY_RUNTIME` (1) or `VISIBILITY_SYSTEM` (2).
+    let visibility: UInt8
+    let annotation: DexEncodedAnnotation
+
+    static let visibilityBuild: UInt8 = 0
+    static let visibilityRuntime: UInt8 = 1
+    static let visibilitySystem: UInt8 = 2
+
+    var type: String { annotation.type }
+}
+
+/// A decoded `annotations_directory_item`. Members are keyed the way the
+/// runtime keys them: fields by `name:type`, methods by `name(signature)`.
+struct DexAnnotationsDirectory {
+    var classAnnotations: [DexAnnotation] = []
+    var fieldAnnotations: [String: [DexAnnotation]] = [:]
+    var methodAnnotations: [String: [DexAnnotation]] = [:]
+    /// One annotation list per declared parameter.
+    var parameterAnnotations: [String: [[DexAnnotation]]] = [:]
+
+    static let empty = DexAnnotationsDirectory()
+}
+
+/// `method_handle_item`.
+struct DexMethodHandle {
+    enum Kind: UInt16 {
+        case staticPut = 0x00
+        case staticGet = 0x01
+        case instancePut = 0x02
+        case instanceGet = 0x03
+        case invokeStatic = 0x04
+        case invokeInstance = 0x05
+        case invokeConstructor = 0x06
+        case invokeDirect = 0x07
+        case invokeInterface = 0x08
+
+        var isFieldAccessor: Bool { rawValue <= 0x03 }
+    }
+
+    let kind: Kind
+    /// Field ref index for accessors, method ref index otherwise.
+    let memberIndex: Int
 }
 
 enum DexDescriptor {
@@ -203,6 +272,12 @@ enum DexDescriptor {
         descriptor.first == "L" || descriptor.first == "["
     }
 
+    static let primitiveDescriptors: Set<String> = ["V", "Z", "B", "S", "C", "I", "J", "F", "D"]
+
+    static func isPrimitive(_ descriptor: String) -> Bool {
+        primitiveDescriptors.contains(descriptor)
+    }
+
     static func isWide(_ descriptor: String) -> Bool {
         descriptor == "J" || descriptor == "D"
     }
@@ -214,6 +289,8 @@ enum DexDescriptor {
 
 final class DexFile: @unchecked Sendable {
     let name: String
+    /// Format version from the magic (`35` … `41`).
+    let version: Int
     private let buffer: DexBuffer
 
     private(set) var strings: [String] = []
@@ -221,9 +298,14 @@ final class DexFile: @unchecked Sendable {
     private var protos: [DexProto] = []
     private var fieldRefs: [DexFieldRef] = []
     private var methodRefs: [DexMethodRef] = []
+    private(set) var methodHandles: [DexMethodHandle] = []
+    private var callSiteOffsets: [Int] = []
+    private var methodKeys: [String?] = []
+    private var lineTables: [Int: [(address: Int, line: Int)]] = [:]
 
     private var classIndexOfDescriptor: [String: Int] = [:]
     private var classDefs: [Int: DexClassDef] = [:]
+    private var annotationDirectories: [Int: DexAnnotationsDirectory] = [:]
     private let classDefsOffset: Int
     private let classDefsCount: Int
 
@@ -233,28 +315,92 @@ final class DexFile: @unchecked Sendable {
     private let methodIdsOffset: Int
     private let stringIdsOffset: Int
 
-    init(data: Data, name: String = "classes.dex") throws {
-        self.name = name
+    static let endianConstant: UInt32 = 0x1234_5678
+    static let reverseEndianConstant: UInt32 = 0x7856_3412
+    /// Versions this reader implements: 035 (base), 037 (default methods),
+    /// 038 (method handles, call sites), 039 (`const-method-*`), 040 (wider
+    /// SimpleNames) and 041 (container).
+    static let supportedVersions: Set<Int> = [35, 37, 38, 39, 40, 41]
+    static let containerVersion = 41
+
+    /// Every logical dex in `data`. A version-041 container concatenates
+    /// several logical files that share one buffer (their offsets are relative
+    /// to the physical file); every earlier version holds exactly one.
+    static func load(data: Data, name: String = "classes.dex") throws -> [DexFile] {
         let buffer = DexBuffer(data: data)
+        let first = try DexFile(buffer: buffer, headerOffset: 0, name: name)
+        guard first.version >= containerVersion else { return [first] }
+        var files = [first]
+        var offset = Int(buffer.u32(0x20))
+        while offset < buffer.count {
+            guard offset > 0, files.count < 4_096 else { throw DexError("\(name): bad container layout") }
+            let next = try DexFile(buffer: buffer, headerOffset: offset, name: "\(name)#\(files.count)")
+            files.append(next)
+            offset += Int(buffer.u32(offset + 0x20))
+        }
+        return files
+    }
+
+    convenience init(data: Data, name: String = "classes.dex") throws {
+        try self.init(buffer: DexBuffer(data: data), headerOffset: 0, name: name)
+    }
+
+    private init(buffer: DexBuffer, headerOffset: Int, name: String) throws {
+        self.name = name
         self.buffer = buffer
+        let h = headerOffset
 
-        guard buffer.count >= 0x70, buffer.u8(0) == 0x64, buffer.u8(1) == 0x65,
-              buffer.u8(2) == 0x78, buffer.u8(3) == 0x0A, buffer.u8(7) == 0
+        guard h >= 0, h <= buffer.count - 0x70, buffer.u8(h) == 0x64, buffer.u8(h + 1) == 0x65,
+              buffer.u8(h + 2) == 0x78, buffer.u8(h + 3) == 0x0A, buffer.u8(h + 7) == 0
         else { throw DexError("\(name): not a dex file") }
+        let digits = (4...6).map { buffer.u8(h + $0) }
+        guard digits.allSatisfy({ (0x30...0x39).contains($0) }) else {
+            throw DexError("\(name): malformed dex version")
+        }
+        let version = digits.reduce(0) { $0 * 10 + Int($1 - 0x30) }
+        guard Self.supportedVersions.contains(version) else {
+            throw DexError("\(name): unsupported dex version \(String(format: "%03d", version))")
+        }
+        self.version = version
 
-        stringIdsOffset = Int(buffer.u32(0x3c))
-        typeIdsOffset = Int(buffer.u32(0x44))
-        protoIdsOffset = Int(buffer.u32(0x4c))
-        fieldIdsOffset = Int(buffer.u32(0x54))
-        methodIdsOffset = Int(buffer.u32(0x5c))
-        classDefsOffset = Int(buffer.u32(0x64))
-        classDefsCount = Int(buffer.u32(0x60))
+        let endian = buffer.u32(h + 0x28)
+        guard endian == Self.endianConstant else {
+            throw DexError(endian == Self.reverseEndianConstant
+                ? "\(name): byte-swapped dex files are not supported"
+                : "\(name): bad endian tag")
+        }
+        let headerSize = Int(buffer.u32(h + 0x24))
+        let fileSize = Int(buffer.u32(h + 0x20))
+        if version >= Self.containerVersion {
+            guard headerSize == 0x78, h <= buffer.count - headerSize else {
+                throw DexError("\(name): bad container header")
+            }
+            let containerSize = Int(buffer.u32(h + 0x70))
+            let declaredOffset = Int(buffer.u32(h + 0x74))
+            guard containerSize == buffer.count, declaredOffset == h,
+                  fileSize >= headerSize, fileSize <= buffer.count - h else {
+                throw DexError("\(name): container bounds do not match the file")
+            }
+        } else {
+            guard headerSize == 0x70, h == 0, fileSize == buffer.count else {
+                throw DexError("\(name): bad header size")
+            }
+        }
 
-        let stringCount = Int(buffer.u32(0x38))
-        let typeCount = Int(buffer.u32(0x40))
-        let protoCount = Int(buffer.u32(0x48))
-        let fieldCount = Int(buffer.u32(0x50))
-        let methodCount = Int(buffer.u32(0x58))
+        stringIdsOffset = Int(buffer.u32(h + 0x3c))
+        typeIdsOffset = Int(buffer.u32(h + 0x44))
+        protoIdsOffset = Int(buffer.u32(h + 0x4c))
+        fieldIdsOffset = Int(buffer.u32(h + 0x54))
+        methodIdsOffset = Int(buffer.u32(h + 0x5c))
+        classDefsOffset = Int(buffer.u32(h + 0x64))
+        classDefsCount = Int(buffer.u32(h + 0x60))
+
+        let stringCount = Int(buffer.u32(h + 0x38))
+        let typeCount = Int(buffer.u32(h + 0x40))
+        let protoCount = Int(buffer.u32(h + 0x48))
+        let fieldCount = Int(buffer.u32(h + 0x50))
+        let methodCount = Int(buffer.u32(h + 0x58))
+        let mapOffset = Int(buffer.u32(h + 0x34))
 
         guard stringCount >= 0, typeCount >= 0, protoCount >= 0, fieldCount >= 0,
               methodCount >= 0, classDefsCount >= 0
@@ -355,10 +501,78 @@ final class DexFile: @unchecked Sendable {
             let base = classDefsOffset + index * 32
             let classIndex = Int(buffer.u32(base))
             guard classIndex < typeCountSnapshot else { throw DexError("\(name): bad class def") }
-            classIndexOfDescriptor[types[classIndex]] = index
+            // A duplicate definition is invalid; the runtime uses the first.
+            if classIndexOfDescriptor[types[classIndex]] == nil {
+                classIndexOfDescriptor[types[classIndex]] = index
+            }
         }
 
+        if mapOffset != 0 {
+            try readMapList(at: mapOffset, fieldCount: fieldCount, methodCount: methodCount)
+        }
         try validateClassData()
+    }
+
+    /// Sections that only the `map_list` locates: `call_site_ids` (format 038)
+    /// and `method_handles` (038). Other map entries describe sections the
+    /// header already points at, or data reached through them.
+    private func readMapList(at offset: Int, fieldCount: Int, methodCount: Int) throws {
+        guard offset >= 0, offset <= buffer.count - 4, offset % 4 == 0 else {
+            throw DexError("\(name): bad map_list offset")
+        }
+        let entryCount = Int(buffer.u32(offset))
+        try Self.checkRange(offset: offset + 4, count: entryCount, element: 12, limit: buffer.count)
+        for entry in 0..<entryCount {
+            let base = offset + 4 + entry * 12
+            let type = buffer.u16(base)
+            let size = Int(buffer.u32(base + 4))
+            let sectionOffset = Int(buffer.u32(base + 8))
+            switch type {
+            case 0x0007: // call_site_id_item
+                try Self.checkRange(offset: sectionOffset, count: size, element: 4, limit: buffer.count)
+                callSiteOffsets = (0..<size).map { Int(buffer.u32(sectionOffset + $0 * 4)) }
+            case 0x0008: // method_handle_item
+                try Self.checkRange(offset: sectionOffset, count: size, element: 8, limit: buffer.count)
+                var handles: [DexMethodHandle] = []
+                handles.reserveCapacity(min(size, 4_096))
+                for index in 0..<size {
+                    let item = sectionOffset + index * 8
+                    guard let kind = DexMethodHandle.Kind(rawValue: buffer.u16(item)) else {
+                        throw DexError("\(name): bad method handle type \(buffer.u16(item))")
+                    }
+                    let member = Int(buffer.u16(item + 4))
+                    guard member < (kind.isFieldAccessor ? fieldCount : methodCount) else {
+                        throw DexError("\(name): method handle member out of range")
+                    }
+                    handles.append(DexMethodHandle(kind: kind, memberIndex: member))
+                }
+                methodHandles = handles
+            default:
+                continue
+            }
+        }
+    }
+
+    var callSiteCount: Int { callSiteOffsets.count }
+
+    /// The `encoded_array_item` of call site `index`: bootstrap method handle,
+    /// method name, method type, then the bootstrap's extra arguments.
+    func callSite(at index: Int) throws -> [DexValue] {
+        guard index >= 0, index < callSiteOffsets.count else {
+            throw DexError("\(name): call site \(index) out of range")
+        }
+        var cursor = callSiteOffsets[index]
+        guard cursor > 0, cursor < buffer.count else { throw DexError("\(name): bad call site offset") }
+        let values = try decodeEncodedArray(&cursor)
+        guard values.count >= 3, case .methodHandle = values[0], case .string = values[1],
+              case .methodType = values[2] else {
+            throw DexError("\(name): malformed call site \(index)")
+        }
+        return values
+    }
+
+    func methodHandle(at index: Int) -> DexMethodHandle? {
+        index >= 0 && index < methodHandles.count ? methodHandles[index] : nil
     }
 
     var classCount: Int { classDefsCount }
@@ -370,6 +584,15 @@ final class DexFile: @unchecked Sendable {
 
     func string(at index: Int) -> String {
         index >= 0 && index < strings.count ? strings[index] : ""
+    }
+
+    /// UTF-16 code units of string `index`, exactly as encoded (lone
+    /// surrogates included). `const-string` uses these; `string(at:)` is the
+    /// Swift view used for identifiers.
+    func stringUnits(at index: Int) -> [UInt16] {
+        guard index >= 0, index < strings.count else { return [] }
+        let offset = Int(buffer.u32(stringIdsOffset + index * 4))
+        return (try? Self.readMUTF8Units(buffer, offset: offset)) ?? Array(strings[index].utf16)
     }
 
     func type(at index: Int) -> String {
@@ -388,10 +611,16 @@ final class DexFile: @unchecked Sendable {
         index >= 0 && index < methodRefs.count ? methodRefs[index] : nil
     }
 
+    /// `name + signature` of method ref `index`, built once per ref: every
+    /// `invoke` looks its target up by this key.
     func methodKey(at index: Int) -> String {
         guard index >= 0, index < methodRefs.count else { return "" }
+        if methodKeys.isEmpty { methodKeys = Array(repeating: nil, count: methodRefs.count) }
+        if let cached = methodKeys[index] { return cached }
         let ref = methodRefs[index]
-        return ref.name + DexDescriptor.methodSignature(ref.proto)
+        let key = ref.name + DexDescriptor.methodSignature(ref.proto)
+        methodKeys[index] = key
+        return key
     }
 
     func fieldKey(at index: Int) -> String {
@@ -527,7 +756,8 @@ final class DexFile: @unchecked Sendable {
             staticFields: staticFields,
             instanceFields: instanceFields,
             directMethods: directMethods,
-            virtualMethods: virtualMethods
+            virtualMethods: virtualMethods,
+            annotationsOffset: Int(buffer.u32(base + 20))
         )
     }
 
@@ -596,7 +826,6 @@ final class DexFile: @unchecked Sendable {
         let outsSize = Int(buffer.u16(offset + 4))
         let triesSize = Int(buffer.u16(offset + 6))
         let debugInfoOffset = Int(buffer.u32(offset + 8))
-        _ = debugInfoOffset
         let insnsSize = Int(buffer.u32(offset + 12))
         guard insnsSize >= 0, insnsSize < 1 << 24,
               offset + 16 + insnsSize * 2 <= buffer.count
@@ -660,8 +889,69 @@ final class DexFile: @unchecked Sendable {
             outsSize: outsSize,
             insns: insns,
             insnUnits: insnsSize,
-            tries: tries
+            tries: tries,
+            debugInfoOffset: debugInfoOffset
         )
+    }
+
+    // MARK: - debug_info_item
+
+    /// Source line of code unit `pc`, from the `debug_info_item` line table
+    /// (decoded once per item). nil without debug info.
+    func lineNumber(debugInfoOffset offset: Int, pc: Int) -> Int? {
+        guard offset > 0, offset < buffer.count else { return nil }
+        let table: [(address: Int, line: Int)]
+        if let cached = lineTables[offset] {
+            table = cached
+        } else {
+            table = decodeLineTable(at: offset)
+            lineTables[offset] = table
+        }
+        var result: Int?
+        for entry in table {
+            if entry.address > pc { break }
+            result = entry.line
+        }
+        return result
+    }
+
+    /// Runs the debug state machine for positions only; local-variable
+    /// opcodes are parsed past and discarded.
+    private func decodeLineTable(at offset: Int) -> [(address: Int, line: Int)] {
+        var cursor = offset
+        var line = readUleb(&cursor)
+        let parameterCount = readUleb(&cursor)
+        for _ in 0..<min(parameterCount, 65_536) { _ = readUleb(&cursor) }
+        var address = 0
+        var rows: [(address: Int, line: Int)] = []
+        while cursor < buffer.count, rows.count < 1 << 20 {
+            let opcode = buffer.u8(cursor)
+            cursor += 1
+            switch opcode {
+            case 0x00: // DBG_END_SEQUENCE
+                return rows
+            case 0x01: // DBG_ADVANCE_PC
+                address += readUleb(&cursor)
+            case 0x02: // DBG_ADVANCE_LINE
+                line += readSleb(&cursor)
+            case 0x03: // DBG_START_LOCAL
+                _ = readUleb(&cursor); _ = readUleb(&cursor); _ = readUleb(&cursor)
+            case 0x04: // DBG_START_LOCAL_EXTENDED
+                _ = readUleb(&cursor); _ = readUleb(&cursor); _ = readUleb(&cursor); _ = readUleb(&cursor)
+            case 0x05, 0x06: // DBG_END_LOCAL, DBG_RESTART_LOCAL
+                _ = readUleb(&cursor)
+            case 0x07, 0x08: // DBG_SET_PROLOGUE_END, DBG_SET_EPILOGUE_BEGIN
+                continue
+            case 0x09: // DBG_SET_FILE
+                _ = readUleb(&cursor)
+            default: // special opcode: advance both, then emit a row
+                let adjusted = Int(opcode) - 0x0a
+                line += -4 + adjusted % 15
+                address += adjusted / 15
+                rows.append((address, line))
+            }
+        }
+        return rows
     }
 
     // MARK: - encoded_value
@@ -669,13 +959,31 @@ final class DexFile: @unchecked Sendable {
     private func decodeEncodedArray(_ cursor: inout Int, depth: Int = 0) throws -> [DexValue] {
         guard depth < 16 else { throw DexError("\(name): encoded array nesting too deep") }
         let count = readUleb(&cursor)
-        guard count < 4096 else { throw DexError("\(name): oversized encoded array") }
+        // Every value is at least its one header byte.
+        guard count <= buffer.count - cursor else { throw DexError("\(name): oversized encoded array") }
         var values: [DexValue] = []
-        values.reserveCapacity(count)
+        values.reserveCapacity(min(count, 4_096))
         for _ in 0..<count {
             values.append(try decodeEncodedValue(&cursor, depth: depth + 1))
         }
         return values
+    }
+
+    private func decodeEncodedAnnotation(_ cursor: inout Int, depth: Int) throws -> DexEncodedAnnotation {
+        guard depth < 16 else { throw DexError("\(name): annotation nesting too deep") }
+        let typeIndex = readUleb(&cursor)
+        let count = readUleb(&cursor)
+        guard typeIndex < types.count else { throw DexError("\(name): bad annotation type") }
+        // Every element is a name uleb plus a value header byte.
+        guard count <= (buffer.count - cursor) / 2 else { throw DexError("\(name): oversized annotation") }
+        var elements: [(name: String, value: DexValue)] = []
+        elements.reserveCapacity(count)
+        for _ in 0..<count {
+            let nameIndex = readUleb(&cursor)
+            guard nameIndex < strings.count else { throw DexError("\(name): bad annotation element name") }
+            elements.append((strings[nameIndex], try decodeEncodedValue(&cursor, depth: depth + 1)))
+        }
+        return DexEncodedAnnotation(type: types[typeIndex], elements: elements)
     }
 
     private func decodeEncodedValue(_ cursor: inout Int, depth: Int = 0) throws -> DexValue {
@@ -684,26 +992,133 @@ final class DexFile: @unchecked Sendable {
         cursor += 1
         let valueType = header & 0x1F
         let valueArg = Int(header >> 5)
-        switch valueType {
-        case 0x00: return .byte(Int8(bitPattern: UInt8(truncatingIfNeeded: readSigned(&cursor, size: valueArg + 1))))
-        case 0x02: return .short(Int16(bitPattern: UInt16(truncatingIfNeeded: readSigned(&cursor, size: valueArg + 1))))
-        case 0x03: return .char(UInt16(truncatingIfNeeded: readUnsigned(&cursor, size: valueArg + 1)))
-        case 0x04: return .int(Int32(truncatingIfNeeded: readSigned(&cursor, size: valueArg + 1)))
-        case 0x06: return .long(readSigned(&cursor, size: valueArg + 1))
-        case 0x10: return .float(Float32(bitPattern: UInt32(truncatingIfNeeded: readUnsigned(&cursor, size: 4))).bitPattern)
-        case 0x11: return .double(Float64(bitPattern: UInt64(truncatingIfNeeded: readUnsigned(&cursor, size: 8))).bitPattern)
-        case 0x17: return .string(Int(clamping: readUnsigned(&cursor, size: valueArg + 1)))
-        case 0x18: return .type(Int(clamping: readUnsigned(&cursor, size: valueArg + 1)))
-        case 0x1c: return .array(try decodeEncodedArray(&cursor, depth: depth))
-        case 0x1e: return .null
-        case 0x1f: return .boolean(valueArg != 0)
-        default:
-            // annotation/field/method/enum and other references: skip payload.
-            if valueType == 0x1b || valueType == 0x19 || valueType == 0x1a || valueType == 0x15 || valueType == 0x16 {
-                _ = readUnsigned(&cursor, size: valueArg + 1)
-            }
-            return .other(Int(valueType))
+        let size = valueArg + 1
+        func index(limit: Int) throws -> Int {
+            guard size <= 4 else { throw DexError("\(name): oversized index value") }
+            let value = Int(readUnsigned(&cursor, size: size))
+            guard value < limit else { throw DexError("\(name): encoded index out of range") }
+            return value
         }
+        switch valueType {
+        case 0x00:
+            guard valueArg == 0 else { throw DexError("\(name): bad byte value") }
+            return .byte(Int8(truncatingIfNeeded: readSigned(&cursor, size: 1)))
+        case 0x02:
+            guard size <= 2 else { throw DexError("\(name): bad short value") }
+            return .short(Int16(truncatingIfNeeded: readSigned(&cursor, size: size)))
+        case 0x03:
+            guard size <= 2 else { throw DexError("\(name): bad char value") }
+            return .char(UInt16(truncatingIfNeeded: readUnsigned(&cursor, size: size)))
+        case 0x04:
+            guard size <= 4 else { throw DexError("\(name): bad int value") }
+            return .int(Int32(truncatingIfNeeded: readSigned(&cursor, size: size)))
+        case 0x06:
+            return .long(readSigned(&cursor, size: size))
+        case 0x10:
+            // Floats and doubles are zero-extended to the right: the stored
+            // bytes are the high-order bytes of the bit pattern.
+            guard size <= 4 else { throw DexError("\(name): bad float value") }
+            let raw = UInt32(truncatingIfNeeded: readUnsigned(&cursor, size: size))
+            return .float(raw << UInt32((4 - size) * 8))
+        case 0x11:
+            let raw = readUnsigned(&cursor, size: size)
+            return .double(size == 8 ? raw : raw << UInt64((8 - size) * 8))
+        case 0x15: return .methodType(try index(limit: protos.count))
+        case 0x16: return .methodHandle(try index(limit: methodHandles.count))
+        case 0x17: return .string(try index(limit: strings.count))
+        case 0x18: return .type(try index(limit: types.count))
+        case 0x19: return .field(try index(limit: fieldRefs.count))
+        case 0x1a: return .method(try index(limit: methodRefs.count))
+        case 0x1b: return .enumValue(try index(limit: fieldRefs.count))
+        case 0x1c:
+            guard valueArg == 0 else { throw DexError("\(name): bad array value") }
+            return .array(try decodeEncodedArray(&cursor, depth: depth))
+        case 0x1d:
+            guard valueArg == 0 else { throw DexError("\(name): bad annotation value") }
+            return .annotation(try decodeEncodedAnnotation(&cursor, depth: depth))
+        case 0x1e:
+            guard valueArg == 0 else { throw DexError("\(name): bad null value") }
+            return .null
+        case 0x1f:
+            guard valueArg <= 1 else { throw DexError("\(name): bad boolean value") }
+            return .boolean(valueArg != 0)
+        default:
+            throw DexError("\(name): unknown encoded value type 0x\(String(valueType, radix: 16))")
+        }
+    }
+
+    // MARK: - Annotations
+
+    /// The decoded `annotations_directory_item` of `definition`, cached per
+    /// offset. A malformed directory reads as empty rather than failing the
+    /// class: annotations only ever feed reflection.
+    func annotations(for definition: DexClassDef) -> DexAnnotationsDirectory {
+        let offset = definition.annotationsOffset
+        guard offset != 0 else { return .empty }
+        if let cached = annotationDirectories[offset] { return cached }
+        let directory = (try? decodeAnnotationsDirectory(at: offset)) ?? .empty
+        annotationDirectories[offset] = directory
+        return directory
+    }
+
+    private func decodeAnnotationsDirectory(at offset: Int) throws -> DexAnnotationsDirectory {
+        guard offset > 0, offset <= buffer.count - 16 else { throw DexError("\(name): bad annotations directory") }
+        var directory = DexAnnotationsDirectory()
+        let classSet = Int(buffer.u32(offset))
+        let fieldCount = Int(buffer.u32(offset + 4))
+        let methodCount = Int(buffer.u32(offset + 8))
+        let parameterCount = Int(buffer.u32(offset + 12))
+        var cursor = offset + 16
+        try Self.checkRange(offset: cursor, count: fieldCount + methodCount + parameterCount, element: 8, limit: buffer.count)
+        if classSet != 0 { directory.classAnnotations = try decodeAnnotationSet(at: classSet) }
+        for _ in 0..<fieldCount {
+            let fieldIndex = Int(buffer.u32(cursor))
+            let set = Int(buffer.u32(cursor + 4))
+            cursor += 8
+            guard fieldIndex < fieldRefs.count else { throw DexError("\(name): bad field annotation") }
+            directory.fieldAnnotations[fieldKey(at: fieldIndex)] = try decodeAnnotationSet(at: set)
+        }
+        for _ in 0..<methodCount {
+            let methodIndex = Int(buffer.u32(cursor))
+            let set = Int(buffer.u32(cursor + 4))
+            cursor += 8
+            guard methodIndex < methodRefs.count else { throw DexError("\(name): bad method annotation") }
+            directory.methodAnnotations[methodKey(at: methodIndex)] = try decodeAnnotationSet(at: set)
+        }
+        for _ in 0..<parameterCount {
+            let methodIndex = Int(buffer.u32(cursor))
+            let list = Int(buffer.u32(cursor + 4))
+            cursor += 8
+            guard methodIndex < methodRefs.count, list > 0, list <= buffer.count - 4 else {
+                throw DexError("\(name): bad parameter annotation")
+            }
+            let size = Int(buffer.u32(list))
+            try Self.checkRange(offset: list + 4, count: size, element: 4, limit: buffer.count)
+            var parameters: [[DexAnnotation]] = []
+            parameters.reserveCapacity(size)
+            for item in 0..<size {
+                let set = Int(buffer.u32(list + 4 + item * 4))
+                parameters.append(set == 0 ? [] : try decodeAnnotationSet(at: set))
+            }
+            directory.parameterAnnotations[methodKey(at: methodIndex)] = parameters
+        }
+        return directory
+    }
+
+    private func decodeAnnotationSet(at offset: Int) throws -> [DexAnnotation] {
+        guard offset > 0, offset <= buffer.count - 4 else { throw DexError("\(name): bad annotation set") }
+        let size = Int(buffer.u32(offset))
+        try Self.checkRange(offset: offset + 4, count: size, element: 4, limit: buffer.count)
+        var result: [DexAnnotation] = []
+        result.reserveCapacity(size)
+        for item in 0..<size {
+            var cursor = Int(buffer.u32(offset + 4 + item * 4))
+            guard cursor > 0, cursor < buffer.count else { throw DexError("\(name): bad annotation item") }
+            let visibility = buffer.u8(cursor)
+            cursor += 1
+            result.append(DexAnnotation(visibility: visibility, annotation: try decodeEncodedAnnotation(&cursor, depth: 0)))
+        }
+        return result
     }
 
     // MARK: - Primitive helpers
@@ -803,6 +1218,12 @@ final class DexFile: @unchecked Sendable {
     }
 
     private static func readMUTF8(_ buffer: DexBuffer, offset: Int) throws -> String {
+        String(decoding: try readMUTF8Units(buffer, offset: offset), as: UTF16.self)
+    }
+
+    /// MUTF-8 is an encoding of UTF-16, not of scalars: an unpaired surrogate
+    /// is legal in a Java string and must reach the runtime unchanged.
+    private static func readMUTF8Units(_ buffer: DexBuffer, offset: Int) throws -> [UInt16] {
         guard offset >= 0, offset < buffer.count else { throw DexError("bad string offset") }
         var cursor = offset
         while cursor < buffer.count, buffer.u8(cursor) & 0x80 != 0 { cursor += 1 }
@@ -834,6 +1255,6 @@ final class DexFile: @unchecked Sendable {
                 cursor += 1
             }
         }
-        return String(decoding: units, as: UTF16.self)
+        return units
     }
 }
