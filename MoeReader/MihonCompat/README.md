@@ -460,7 +460,8 @@ wording and unspecified reflection ordering must not be mistaken for DEX bugs.
   parsing failures, boxed boolean identity, list bounds/typed `toArray`,
   `Map.Entry.setValue`, regex `next`/group ranges, okio byte-count/buffer
   semantics, delayed `Handler` work running from the event loop (and
-  `removeCallbacks` cancelling it), `withTimeout` running its block, and
+  `removeCallbacks` cancelling it), `Thread.sleep` and `delay` waiting for
+  real while that work runs, `withTimeout` running its block, and
   inline `launch` returning a completed job rather than an active one.
 - `MihonEngineArrayTests` runs directly constructed `DexCode` items through the
   interpreter: byte/char/short/boolean array widening and truncation,
@@ -617,7 +618,9 @@ wording and unspecified reflection ordering must not be mistaken for DEX bugs.
   synthetic hops: every hop carries the cookies stored from the preceding
   response, a merged `Set-Cookie` value lands as separate cookies while an
   `Expires` comma does not split, a `Location` path keeps its trailing slash,
-  and the five-hop cap plus HTTPS-downgrade rejection still hold. After the
+  and the five-hop cap plus HTTPS-downgrade rejection still hold;
+  `followRedirects(false)` returns the 3xx (its cookies stored) and the flag
+  survives `newBuilder()`. After the
   host followed redirects, `Response.request()` is the last hop's request, as
   in OkHttp, so a source can tell where it landed.
   `NetworkHelper.getCookieJar()` saves and loads through the shared jar. It
