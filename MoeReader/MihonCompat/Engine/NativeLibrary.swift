@@ -27,6 +27,7 @@ enum NativeLibrary {
         result += OkHttpRuntime.classes()
         result += JsoupRuntime.classes()
         result += MihonAPI.classes()
+        result += RxRuntime.classes()
         result += ReflectRuntime.classes()
         result += ConcurrencyRuntime.classes()
         result += SerializationRuntime.classes()

@@ -569,10 +569,23 @@ enum FileRuntime {
         byteString.method("sha256", "()Lokio/ByteString;") { runtime, args, _ in
             make(runtime, MihonDigest.sha256(payload(runtime, args[0])?.data ?? Data()))
         }
-        byteString.method("sha512", "()Lokio/ByteString;") { _, _, _ in
-            // No SHA-512 primitive is available to the engine yet; fail closed
-            // rather than returning a wrong digest.
-            throw VMJavaException("Ljava/security/NoSuchAlgorithmException;", "SHA-512")
+        byteString.method("sha1", "()Lokio/ByteString;") { runtime, args, _ in
+            make(runtime, Data(MihonHasher.hash(.sha1, Array(payload(runtime, args[0])?.data ?? Data()))))
+        }
+        byteString.method("sha512", "()Lokio/ByteString;") { runtime, args, _ in
+            make(runtime, Data(MihonHasher.hash(.sha512, Array(payload(runtime, args[0])?.data ?? Data()))))
+        }
+        // okio `hmacSha1`/`hmacSha256`/`hmacSha512(key)`: the receiver is the
+        // message, the argument the key. A null key is okio's NPE.
+        let hmacs: [(String, MihonHasherAlgorithm)] = [("hmacSha1", .sha1), ("hmacSha256", .sha256), ("hmacSha512", .sha512)]
+        for (name, algorithm) in hmacs {
+            byteString.method(name, "(Lokio/ByteString;)Lokio/ByteString;") { runtime, args, _ in
+                guard let key = payload(runtime, args[1]) else {
+                    throw VMJavaException("Ljava/lang/NullPointerException;", "key == null")
+                }
+                let message = Array(payload(runtime, args[0])?.data ?? Data())
+                return make(runtime, Data(MihonHMAC(algorithm: algorithm, key: Array(key.data)).authenticate(message)))
+            }
         }
         byteString.method("equals", "(Ljava/lang/Object;)Z") { runtime, args, _ in
             guard let other = payload(runtime, args[1]) else { return .boolean(false) }

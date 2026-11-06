@@ -43,6 +43,7 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/QuickJSRuntime.swift` | `app.cash.quickjs.QuickJs` over JavaScriptCore on Apple hosts; other hosts raise a typed `UnsupportedOperationException` |
 | `Engine/MihonAPI.swift` | `Source`, `HttpSource`, `ParsedHttpSource`, models, filters, `SourceFactory`, network helpers |
 | `Engine/MihonFilters.swift` | FilterList → plain filter tree, selection replay for searches |
+| `Engine/RxRuntime.swift` | RxJava 1 (`rx.Observable`, `rx.Single`, blocking views, subscribers/emitters, function interfaces, schedulers) as cold synchronous streams; Mihon's `awaitSingle` bridge |
 | `Engine/FileRuntime.swift` | `java.io.File`, `okio.ByteString`, okio file source/sink/buffer, `kotlin.io.FilesKt.resolve` |
 | `Engine/ZstdRuntime.swift` | `OkioZstd` sink/source over zstd frames (raw-block encoder, raw/RLE decoder) |
 | `Engine/JavaTimeRuntime.swift` | `java.time` subset used for chapter dates, including `DateTimeFormatterBuilder` optional sections |
@@ -59,7 +60,7 @@ engine takes the second path so idle cost can be driven to near zero:
 | `Engine/AnnotationRuntime.swift` | Runtime-visible annotation instances, defaults, inheritance, immutable array members, equality and hashing |
 | `Engine/InvokeRuntime.swift` | Method types/handles, polymorphic calls, bootstrap-linked call sites, lambda and string-concatenation factories |
 | `Engine/VarHandleRuntime.swift` | Signature-polymorphic field/array access modes within the single-threaded runtime |
-| `Engine/ConcurrencyRuntime.swift` | Atomic*, ConcurrentHashMap, `ReentrantLock`/`ReentrantReadWriteLock` |
+| `Engine/ConcurrencyRuntime.swift` | Atomic*, ConcurrentHashMap, `ReentrantLock`/`ReentrantReadWriteLock`, `Callable` |
 | `Engine/PlatformRuntime.swift` | `java.net` URL codecs, `TimeUnit`, `okhttp3.Cookie`/`CookieJar` over the shared jar, the Brotli interceptor, Android logging/bundle/build helpers |
 | `Engine/GraphicsRuntime.swift` | `android.graphics` (Bitmap, BitmapFactory, Canvas, Paint, Rect, Typeface) and `android.text` layout (StaticLayout, Layout, TextPaint) over CoreGraphics/ImageIO/CoreText |
 | `Engine/WebKitRuntime.swift` | `android.webkit`: CookieManager over the host transport's cookie storage, URLUtil, WebView over a `VMWebViewPlatform` (`WKWebView` on Apple hosts) with a JavaScript bridge, client/chrome callbacks and observed subresources, the virtual-display/`Presentation` surface, the `android.view` pieces a WebView needs, and the engine's host-event queue (platform callbacks and delayed `Handler` work) |
@@ -112,11 +113,14 @@ error instead of quietly falling back to the system resolver.
    inline; deferred waits drain platform events and scheduled `Handler` work
    until completion or the operation deadline. An unsupported asynchronous
    suspension is reported as an error instead of hanging.
-5. When a source does not override a suspend call, `HttpSource` supplies the
-   deprecated helper pipeline itself: build `*Request`, execute it with the
-   source client, then run `*Parse`. `ParsedHttpSource` supplies the selector
-   and `fromElement` parsers, so request/parse-style extensions keep working
-   without RxJava in the host.
+5. When a source does not override a suspend call, the suspend default awaits
+   the deprecated RxJava `fetch*` counterpart, as Mihon's does, so a
+   lib-1.4/1.5 source whose only override is `fetch*` (a deep-link search, an
+   API page list) is still reached. `getMangaUpdate` goes through
+   `getMangaDetails`/`getChapterList`, which a lib-1.5 source may override
+   directly. The `HttpSource.fetch*` defaults build `*Request`, execute it
+   with the source client when the stream is subscribed, then run `*Parse`;
+   `ParsedHttpSource` supplies the selector and `fromElement` parsers.
 6. Every source call runs under a wall-clock budget: 60 s by default, tunable
    with `MIHON_OP_TIMEOUT` (seconds). Interpreted code and native inner loops
    check the deadline, so a runaway selector or retry loop fails with
@@ -294,7 +298,8 @@ and the suspend lib-1.6 API in practice:
   for anything but an absolute `http`/`https` URL with a host, so sources that
   treat a parseable search query as a deep link only do so for real URLs.
 - **okio**: `okio.ByteString` (from `String` or `byte[]`, base64 and hex
-  codecs, `md5`/`sha256` digests, slicing and `substring`), `BufferedSource`,
+  codecs, `md5`/`sha1`/`sha256`/`sha512` digests and
+  `hmacSha1`/`hmacSha256`/`hmacSha512`, slicing and `substring`), `BufferedSource`,
   `BufferedSink`, `Source`, `Sink`, `Buffer` (`snapshot`, `read`/`writeAll`,
   `skip`, byte counts, EOF checks), `Okio.cipherSource` over a Java cipher, and
   `Okio` factories over `java.io.File`. A non-appending file sink truncates on
@@ -329,8 +334,34 @@ and the suspend lib-1.6 API in practice:
   `ParsedHttpSource`, `SourceFactory`, `SManga`/`SChapter` with copy helpers,
   `Page`, `MangasPage`, `SMangaUpdate`, filters and `FilterList` (including
   `displayValues`), `NetworkHelper`, `RequestsKt`
-  (`GET`/`POST`/`PUT`/`DELETE`), `OkHttpExtensionsKt`, `JsoupExtensionsKt`,
-  `AppInfo`.
+  (`GET`/`POST`/`PUT`/`DELETE`), `OkHttpExtensionsKt` (including the RxJava
+  `asObservable`/`asObservableSuccess`), `JsoupExtensionsKt`, `AppInfo`.
+  The lib-1.4/1.5 API is present beside the suspend one: `getMangaDetails`/
+  `getChapterList`, every deprecated `fetch*` method (`HttpSource` runs the
+  request/parse pipeline; the bare interfaces throw
+  `IllegalStateException("Not used")`), the `Source$DefaultImpls`/
+  `CatalogueSource$DefaultImpls` bridges older Kotlin compilers call, and an
+  extension's own `fetchImageUrl`, `fetchImage` or suspend `getImage` for
+  page images.
+- **RxJava 1**: `rx.Observable` factories (`just`, `from`, `fromCallable`,
+  `defer`, `error`, `empty`, `range`, `create`/`unsafeCreate` with
+  `Subscriber`/`Emitter`, `concat`/`merge`, `zip`, `combineLatest`) and
+  operators (`map`, `flatMap`/`concatMap`/`switchMap` and the iterable forms,
+  `filter`, `ofType`/`cast`, `compose`, `scan`, `buffer`, the `doOn*` hooks,
+  `onErrorReturn`/`onErrorResumeNext`/`onExceptionResumeNext`, `retry`,
+  `repeat`, `take`/`skip`/`takeWhile`/`takeUntil`/`elementAt`, `distinct`,
+  `defaultIfEmpty`/`switchIfEmpty`, `first`/`last`/`single` and their
+  `OrDefault` forms, `toList`/`toSortedList`, `reduce`, `count`, `isEmpty`/
+  `exists`/`all`/`contains`, `startWith`/`concatWith`/`mergeWith`/`zipWith`,
+  `cache`), `toBlocking()` (`first`, `last`, `single`, `toIterable`,
+  `forEach`, with `Exceptions.propagate` wrapping), `toSingle()`,
+  `subscribe` with actions, an `Observer` or a `Subscriber`, and `rx.Single`
+  with its blocking view. Every stream is cold and synchronous: an item
+  limit (`take`, `first`) stops the upstream, an error operator only handles
+  failures from above it, and `subscribeOn`/`observeOn`/`timeout`/`delay`
+  keep the stream as it is because the engine has one thread and no clock to
+  wait on. Operators whose result depends on elapsed time (`interval`,
+  `debounce`, `sample`, `buffer` by time) are not registered.
 
 Host-compat details are reproduced rather than approximated. For example
 Mihon's `HttpSource.headers` is delegated, so extensions replace
@@ -452,6 +483,15 @@ wording and unspecified reflection ordering must not be mistaken for DEX bugs.
   and property parsing.
 - `MihonAPIRemainingTests` covers immutable `FilterList` behavior and model copy
   helpers.
+- `MihonRxTests` covers the lib-1.4/1.5 bridges (a deep-link
+  `fetchSearchManga` override answered without a request while other queries
+  reach `super.fetchSearchManga`, a lazy `fromCallable` page list,
+  `getMangaUpdate` through `fetchMangaDetails` and a suspend `getChapterList`
+  override, `Not used` on bare interfaces, `asObservableSuccess` raising
+  `HttpException` on subscription) and RxJava semantics: operator order,
+  `take` stopping its upstream, error operators ignoring consumer failures,
+  `retry`, `awaitSingle` and blocking-view terminal errors with
+  `Exceptions.propagate`, and `create` emitters observing unsubscription.
 - `MihonSecurityBoundsTests` covers ZIP/ZIP64 truncation and overflow, DEX
   class-data validation, store rollback and shared-APK cleanup.
 - `MihonFilterStateTests` covers per-source filter persistence and reset.
@@ -669,7 +709,7 @@ lambdas directly instead of passing `Unit` as a continuation. Known gaps:
 | Browser-check interstitials | Detection trusts Cloudflare's `cf-mitigated: challenge` header on any status, and otherwise requires a Cloudflare/DDoS-Guard status (403/429/503) plus a protection server or interstitial marker. A hard block (Cloudflare error 1020 and the like) is classified but not solved, because no clearance unlocks it. The transport retries once: `MihonEngineHost` solves the check in one shared, serialised off-screen `WKWebView` that presents the request's own user agent and is seeded with the request's cookie jar. A non-GET request is solved on the site root; a clearance issued during the attempt is proof of success; every cookie for the host is copied into `HTTPCookieStorage` before the retry; and a failed attempt removes only the cookies it added. Detection and the retry bookkeeping are unit-tested; a headless host has no WebKit, so the clearance path itself is exercised only on a device. An interactive Turnstile challenge still needs the user: a source call has no UI surface to answer it. `CloudflareInterceptor` remains the transport's pass-through entry point (its constructors exist for extensions that build their own client). |
 | Apple-only frameworks | `android.graphics`/`android.text` pixel work (CoreGraphics/ImageIO/CoreText) and `app.cash.quickjs` (JavaScriptCore) exist only on Apple hosts; `android.webkit.WebView` needs WebKit or a host-supplied `VMWebViewPlatform`. Elsewhere each raises a typed `UnsupportedOperationException` naming the operation, so a source that needs them stops instead of receiving fabricated bytes. |
 | WebView request interception | WKWebView cannot hold a subresource request back, so `shouldInterceptRequest` sees subresources after they loaded and cannot substitute a response; only the main-frame request can be replaced. Page-side challenges a source solves by swapping a frame's content (an interactive captcha) therefore need the user, not the engine. |
-| RxJava-only sources | Extensions whose only fetch entry points are the RxJava `fetch*` overrides are not executed. Request/parse-style lib-1.4/1.5 sources and the suspend API run without RxJava. |
+| RxJava streams | `fetch*` overrides and RxJava pipelines run as cold synchronous streams. An `Observable.create` source that emits from a later callback (an `enqueue` the engine does not run inline, a timer) ends when its `call` returns, so those items are lost; time-based operators are not registered and fail with a linkage error. |
 | Zstd response bodies | `OkioZstd` reads only raw/RLE-block frames. Entropy-coded zstd (what servers send) fails closed with an `IOException`. |
 | Duplicate response headers | URLSession merges repeated `Set-Cookie` response headers into one value; the engine splits that value once when it enters from the transport, honouring `Expires` commas, so the jar and `Response.headers` see one cookie per header. Other repeated response headers stay merged. |
 | `NetworkHelper.cookieJar` | `getCookieJar` returns the shared jar: `saveFromResponse`/`loadForRequest` run over the same `HTTPCookieStorage` the transport and WebView use. `client` and `cloudflareClient` are also available. |

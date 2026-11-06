@@ -154,6 +154,25 @@ final class OkioOkHttpSurfaceTests: XCTestCase {
             runtime.stringValue(try invoke(runtime, sha256, "hex()Ljava/lang/String;")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         )
+        let sha1 = try invoke(runtime, abc, "sha1()Lokio/ByteString;")
+        XCTAssertEqual(runtime.stringValue(try invoke(runtime, sha1, "hex()Ljava/lang/String;")), "a9993e364706816aba3e25717850c26c9cd0d89d")
+        let sha512 = try invoke(runtime, abc, "sha512()Lokio/ByteString;")
+        XCTAssertEqual(
+            runtime.stringValue(try invoke(runtime, sha512, "hex()Ljava/lang/String;")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+                + "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        )
+        // RFC 4231 test case 2: the receiver is the message, the argument the key.
+        let message = try newByteString(runtime, Array("what do ya want for nothing?".utf8))
+        let key = try newByteString(runtime, Array("Jefe".utf8))
+        let hmac = try invoke(runtime, message, "hmacSha256(Lokio/ByteString;)Lokio/ByteString;", [key])
+        XCTAssertEqual(
+            runtime.stringValue(try invoke(runtime, hmac, "hex()Ljava/lang/String;")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        )
+        XCTAssertThrowsError(try invoke(runtime, message, "hmacSha256(Lokio/ByteString;)Lokio/ByteString;", [.null])) { error in
+            XCTAssertEqual((error as? VMJavaException)?.classDescriptor, "Ljava/lang/NullPointerException;")
+        }
     }
 
     func testByteStringEqualityAndSlicing() throws {

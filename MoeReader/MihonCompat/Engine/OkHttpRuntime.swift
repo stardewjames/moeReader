@@ -1483,14 +1483,13 @@ enum OkHttpRuntime {
                     _ = try runtime.invoke(method, [args[1], args[0], response])
                 }
             } catch let exception as VMJavaException {
+                // Only Java failures reach `onFailure`. Engine errors (the
+                // operation timeout, an unsupported API, a stream consumer's
+                // failure) are not exceptions the extension can observe, so
+                // they leave the call as they would leave a `catch` block.
                 if let cls = runtime.classOf(args[1]), let method = cls.lookupVirtual(key: "onFailure(Lokhttp3/Call;Ljava/io/IOException;)V") {
                     var object = exception.object
                     if object.bits == 0 { object = runtime.makeThrowable("Ljava/io/IOException;", message: exception.message) }
-                    _ = try? runtime.invoke(method, [args[1], args[0], object])
-                }
-            } catch {
-                if let cls = runtime.classOf(args[1]), let method = cls.lookupVirtual(key: "onFailure(Lokhttp3/Call;Ljava/io/IOException;)V") {
-                    let object = runtime.makeThrowable("Ljava/io/IOException;", message: String(describing: error))
                     _ = try? runtime.invoke(method, [args[1], args[0], object])
                 }
             }

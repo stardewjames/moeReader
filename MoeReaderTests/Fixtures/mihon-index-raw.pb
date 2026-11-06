@@ -1,6 +1,6 @@
 
 MoeReader Test RepoTEST@4df6ad27c7517695915334242404309f4f7d9b70689b05d7093c483c760a5e87"1
-https://example.comhttps://discord.gg/exampleªæ
+https://example.comhttps://invite.example/abcªæ
 º
 Test Sourcecom.moereader.test.extension%
 mihon-test.apkicon.pngªtest.jar"1.6(21.0.08BL¹`Test Sourceen"https://example.com*https://mirror.example.com:hellošunknown

@@ -130,11 +130,10 @@ enum MihonAPI {
         source.method("getLanguage", "()Ljava/lang/String;") { _, _, _ in .null }
         source.method("getSupportsLatest", "()Z") { _, _, _ in .boolean(true) }
         source.method("getFilterList", "()Leu/kanade/tachiyomi/source/model/FilterList;") { _, _, _ in .null }
-        source.method("getPopularManga", "(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .null }
-        source.method("getLatestUpdates", "(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .null }
-        source.method("getSearchManga", "(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .null }
-        source.method("getMangaUpdate", "(Leu/kanade/tachiyomi/source/model/SManga;Ljava/util/List;ZZLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .null }
-        source.method("getPageList", "(Leu/kanade/tachiyomi/source/model/SChapter;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .null }
+        installFetchBridges(source, bridges: sourceFetchBridges + catalogueFetchBridges)
+        source.method("getMangaUpdate", "(Leu/kanade/tachiyomi/source/model/SManga;Ljava/util/List;ZZLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try defaultMangaUpdate(runtime, source: args[0], args: [args[0], args[1], args[2], args[3], args[4]])
+        }
         result.append(source)
 
         let catalogue = NativeClass("Leu/kanade/tachiyomi/source/CatalogueSource;", superclass: nil, interfaces: ["Leu/kanade/tachiyomi/source/Source;"], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
@@ -146,10 +145,15 @@ enum MihonAPI {
             runtime.callVirtual(args[0], "getLang()Ljava/lang/String;", []) ?? runtime.newString("all")
         }
         defaultImpls.staticMethod("getSupportsLatest", "(Leu/kanade/tachiyomi/source/CatalogueSource;)Z") { _, _, _ in .boolean(true) }
+        installFetchBridges(defaultImpls, bridges: catalogueFetchBridges, receiver: "Leu/kanade/tachiyomi/source/CatalogueSource;")
         result.append(defaultImpls)
 
         let sourceDefaultImpls = NativeClass("Leu/kanade/tachiyomi/source/Source$DefaultImpls;")
         sourceDefaultImpls.staticMethod("getSupportsLatest", "(Leu/kanade/tachiyomi/source/Source;)Z") { _, _, _ in .boolean(true) }
+        installFetchBridges(sourceDefaultImpls, bridges: sourceFetchBridges, receiver: "Leu/kanade/tachiyomi/source/Source;")
+        sourceDefaultImpls.staticMethod("getMangaUpdate", "(Leu/kanade/tachiyomi/source/Source;Leu/kanade/tachiyomi/source/model/SManga;Ljava/util/List;ZZLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try defaultMangaUpdate(runtime, source: args[0], args: [args[0], args[1], args[2], args[3], args[4]])
+        }
         result.append(sourceDefaultImpls)
 
         let factory = NativeClass("Leu/kanade/tachiyomi/source/SourceFactory;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
@@ -168,6 +172,63 @@ enum MihonAPI {
         result.append(httpSourceKtClass())
         result.append(parsedHttpSourceClass())
         return result
+    }
+
+    /// One deprecated RxJava entry point and the suspend call that awaits it.
+    private struct FetchBridge {
+        let suspendName: String
+        let fetchName: String
+        /// Parameter descriptors without the receiver and the continuation.
+        let parameters: String
+        let argumentCount: Int
+
+        var suspendSignature: String { "(\(parameters)Lkotlin/coroutines/Continuation;)Ljava/lang/Object;" }
+        var fetchSignature: String { "(\(parameters))Lrx/Observable;" }
+        var fetchKey: String { fetchName + fetchSignature }
+    }
+
+    /// `Source`: details, chapters and pages.
+    private static let sourceFetchBridges = [
+        FetchBridge(suspendName: "getMangaDetails", fetchName: "fetchMangaDetails", parameters: "Leu/kanade/tachiyomi/source/model/SManga;", argumentCount: 1),
+        FetchBridge(suspendName: "getChapterList", fetchName: "fetchChapterList", parameters: "Leu/kanade/tachiyomi/source/model/SManga;", argumentCount: 1),
+        FetchBridge(suspendName: "getPageList", fetchName: "fetchPageList", parameters: "Leu/kanade/tachiyomi/source/model/SChapter;", argumentCount: 1),
+    ]
+
+    /// `CatalogueSource`: the browse feeds.
+    private static let catalogueFetchBridges = [
+        FetchBridge(suspendName: "getPopularManga", fetchName: "fetchPopularManga", parameters: "I", argumentCount: 1),
+        FetchBridge(suspendName: "getLatestUpdates", fetchName: "fetchLatestUpdates", parameters: "I", argumentCount: 1),
+        FetchBridge(
+            suspendName: "getSearchManga", fetchName: "fetchSearchManga",
+            parameters: "ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;", argumentCount: 3
+        ),
+    ]
+
+    /// Mihon's interface defaults: each suspend call awaits its deprecated
+    /// RxJava `fetch*` counterpart, so a lib-1.4/1.5 source that only
+    /// overrides `fetch*` is still reached through the suspend API, and the
+    /// bare `fetch*` defaults report that they are unused. With `receiver`,
+    /// the same bodies are registered as the static `DefaultImpls` bridges
+    /// older Kotlin compilers call; the argument layout is identical.
+    private static func installFetchBridges(_ cls: NativeClass, bridges: [FetchBridge], receiver: String? = nil, unusedFetch: Bool = true) {
+        for bridge in bridges {
+            let fetchKey = bridge.fetchKey
+            let count = bridge.argumentCount
+            let awaitBody: NativeBody = { runtime, args, _ in
+                let observable = try invoke(runtime, receiver: args[0], key: fetchKey, arguments: (0..<count).map { args[1 + $0] })
+                return try RxRuntime.awaitSingle(runtime, observable)
+            }
+            let unused: NativeBody = { _, _, _ in
+                throw VMJavaException("Ljava/lang/IllegalStateException;", "Not used")
+            }
+            if let receiver {
+                cls.staticMethod(bridge.suspendName, "(\(receiver)\(bridge.suspendSignature.dropFirst())", awaitBody)
+                if unusedFetch { cls.staticMethod(bridge.fetchName, "(\(receiver)\(bridge.fetchSignature.dropFirst())", unused) }
+            } else {
+                cls.method(bridge.suspendName, bridge.suspendSignature, awaitBody)
+                if unusedFetch { cls.method(bridge.fetchName, bridge.fetchSignature, unused) }
+            }
+        }
     }
 
     private static func httpSourceCompanionClass() -> NativeClass {
@@ -268,43 +329,83 @@ enum MihonAPI {
             runtime.callVirtual(args[0], "getLang()Ljava/lang/String;", []) ?? runtime.newString("all")
         }
         cls.method("getSupportsLatest", "()Z") { _, _, _ in .boolean(true) }
-        cls.method("getPopularManga", "(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
-            try MihonAPI.defaultMangaPage(
-                runtime, source: args[0],
-                requestKey: "popularMangaRequest(I)Lokhttp3/Request;",
-                requestArguments: [args[1]],
-                parseKey: "popularMangaParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;"
-            )
-        }
-        cls.method("getLatestUpdates", "(ILkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
-            try MihonAPI.defaultMangaPage(
-                runtime, source: args[0],
-                requestKey: "latestUpdatesRequest(I)Lokhttp3/Request;",
-                requestArguments: [args[1]],
-                parseKey: "latestUpdatesParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;"
-            )
-        }
-        cls.method("getSearchManga", "(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
-            try MihonAPI.defaultMangaPage(
-                runtime, source: args[0],
-                requestKey: "searchMangaRequest(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;)Lokhttp3/Request;",
-                requestArguments: [args[1], args[2], args[3]],
-                parseKey: "searchMangaParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;"
-            )
+        // As in Mihon, every suspend entry point awaits its deprecated RxJava
+        // `fetch*` counterpart, so a lib-1.4/1.5 source that overrides only
+        // `fetch*` (a deep-link search, an API page list) is reached through
+        // the suspend API. The `fetch*` defaults build the request, execute
+        // it with the source client when subscribed and parse the response.
+        installFetchBridges(cls, bridges: sourceFetchBridges + catalogueFetchBridges, unusedFetch: false)
+        let pipelines: [(fetch: String, request: String, parse: String?, arguments: Int, deferRequest: Bool, markInitialized: Bool)] = [
+            (
+                "fetchPopularManga(I)Lrx/Observable;",
+                "popularMangaRequest(I)Lokhttp3/Request;",
+                "popularMangaParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;",
+                1, false, false
+            ),
+            (
+                "fetchLatestUpdates(I)Lrx/Observable;",
+                "latestUpdatesRequest(I)Lokhttp3/Request;",
+                "latestUpdatesParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;",
+                1, false, false
+            ),
+            // Mihon wraps the search request in `Observable.defer`.
+            (
+                "fetchSearchManga(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;)Lrx/Observable;",
+                "searchMangaRequest(ILjava/lang/String;Leu/kanade/tachiyomi/source/model/FilterList;)Lokhttp3/Request;",
+                "searchMangaParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/MangasPage;",
+                3, true, false
+            ),
+            (
+                "fetchMangaDetails(Leu/kanade/tachiyomi/source/model/SManga;)Lrx/Observable;",
+                "mangaDetailsRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                "mangaDetailsParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/SManga;",
+                1, false, true
+            ),
+            (
+                "fetchChapterList(Leu/kanade/tachiyomi/source/model/SManga;)Lrx/Observable;",
+                "chapterListRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                "chapterListParse(Lokhttp3/Response;)Ljava/util/List;",
+                1, false, false
+            ),
+            (
+                "fetchPageList(Leu/kanade/tachiyomi/source/model/SChapter;)Lrx/Observable;",
+                "pageListRequest(Leu/kanade/tachiyomi/source/model/SChapter;)Lokhttp3/Request;",
+                "pageListParse(Lokhttp3/Response;)Ljava/util/List;",
+                1, false, false
+            ),
+            (
+                "fetchImageUrl(Leu/kanade/tachiyomi/source/model/Page;)Lrx/Observable;",
+                "imageUrlRequest(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;",
+                "imageUrlParse(Lokhttp3/Response;)Ljava/lang/String;",
+                1, false, false
+            ),
+            // `Observable<Response>` of the page image, checked for success.
+            (
+                "fetchImage(Leu/kanade/tachiyomi/source/model/Page;)Lrx/Observable;",
+                "imageRequest(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;",
+                nil,
+                1, false, false
+            ),
+        ]
+        for pipeline in pipelines {
+            let split = pipeline.fetch.firstIndex(of: "(") ?? pipeline.fetch.endIndex
+            cls.method(String(pipeline.fetch[..<split]), String(pipeline.fetch[split...])) { runtime, args, _ in
+                try fetchPipeline(
+                    runtime,
+                    source: args[0],
+                    requestKey: pipeline.request,
+                    arguments: (0..<pipeline.arguments).map { args[1 + $0] },
+                    parseKey: pipeline.parse,
+                    deferRequest: pipeline.deferRequest,
+                    markInitialized: pipeline.markInitialized
+                )
+            }
         }
         cls.method("getMangaUpdate", "(Leu/kanade/tachiyomi/source/model/SManga;Ljava/util/List;ZZLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
             try MihonAPI.defaultMangaUpdate(
                 runtime,
                 source: args[0],
                 args: [args[0], args[1], args[2], args[3], args[4]]
-            )
-        }
-        cls.method("getPageList", "(Leu/kanade/tachiyomi/source/model/SChapter;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
-            try MihonAPI.defaultList(
-                runtime, source: args[0],
-                requestKey: "pageListRequest(Leu/kanade/tachiyomi/source/model/SChapter;)Lokhttp3/Request;",
-                requestArguments: [args[1]],
-                parseKey: "pageListParse(Lokhttp3/Response;)Ljava/util/List;"
             )
         }
         cls.method("popularMangaRequest", "(I)Lokhttp3/Request;") { _, _, _ in
@@ -415,12 +516,19 @@ enum MihonAPI {
                let text = runtime.stringValue(imageUrl), !text.isEmpty {
                 return imageUrl
             }
-            let parseKey = "imageUrlParse(Lokhttp3/Response;)Ljava/lang/String;"
-            let documentKey = "imageUrlParse(Lorg/jsoup/nodes/Document;)Ljava/lang/String;"
             let hostBridges: Set<String> = [
                 "Leu/kanade/tachiyomi/source/online/HttpSource;",
                 "Leu/kanade/tachiyomi/source/online/ParsedHttpSource;",
             ]
+            // A lib-1.4/1.5 source that resolves image URLs in its own RxJava
+            // `fetchImageUrl` is awaited, as Mihon's `getImageUrl` does.
+            let fetchKey = "fetchImageUrl(Leu/kanade/tachiyomi/source/model/Page;)Lrx/Observable;"
+            if let cls = runtime.classOf(args[0]), cls.hasImplementation(key: fetchKey, excluding: hostBridges) {
+                let observable = try invoke(runtime, receiver: args[0], key: fetchKey, arguments: [args[1]])
+                return try RxRuntime.awaitSingle(runtime, observable)
+            }
+            let parseKey = "imageUrlParse(Lokhttp3/Response;)Ljava/lang/String;"
+            let documentKey = "imageUrlParse(Lorg/jsoup/nodes/Document;)Ljava/lang/String;"
             if let cls = runtime.classOf(args[0]),
                cls.hasImplementation(key: parseKey, excluding: hostBridges)
                 || cls.hasImplementation(key: documentKey, excluding: hostBridges) {
@@ -439,6 +547,17 @@ enum MihonAPI {
                   let url = runtime.stringValue(page.imageUrl.bits != 0 ? page.imageUrl : page.url) else { return .null }
             let headers = runtime.callVirtual(args[0], "getHeaders()Lokhttp3/Headers;", []) ?? .null
             return runtime.makeRequest(url: url, headers: headers, method: "GET", body: .null)
+        }
+        // lib 1.5 `suspend getImage(page): Response`: `imageRequest` through the
+        // source client, failing a non-2xx response like `awaitSuccess`. An
+        // override that delegates to `super.getImage` lands here.
+        cls.method("getImage", "(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            let request = try invoke(
+                runtime, receiver: args[0],
+                key: "imageRequest(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;",
+                arguments: [args[1]]
+            )
+            return try execute(runtime, source: args[0], request: request)
         }
         cls.method("getMangaUrl", "(Leu/kanade/tachiyomi/source/model/SManga;)Ljava/lang/String;") { runtime, args, _ in
             if let request = try? MihonAPI.invoke(
@@ -581,31 +700,51 @@ enum MihonAPI {
         return cls
     }
 
-    /// Runs a request/parse pair used by the deprecated `HttpSource` API.
-    static func defaultMangaPage(
+    /// `HttpSource.fetch*`: Mihon's deprecated pipeline,
+    /// `client.newCall(request).asObservableSuccess().map(parse)`. The request
+    /// is built when `fetch*` is called (inside the stream for a deferred
+    /// search) and executed when the stream is subscribed. Without `parseKey`
+    /// the stream carries the response itself.
+    static func fetchPipeline(
         _ runtime: VMRuntime,
         source: VMValue,
         requestKey: String,
-        requestArguments: [VMValue],
-        parseKey: String
+        arguments: [VMValue],
+        parseKey: String?,
+        deferRequest: Bool = false,
+        markInitialized: Bool = false
     ) throws -> VMValue {
-        let request = try invoke(runtime, receiver: source, key: requestKey, arguments: requestArguments)
-        let response = try execute(runtime, source: source, request: request)
-        return try invoke(runtime, receiver: source, key: parseKey, arguments: [response])
+        var eager: VMValue?
+        if !deferRequest { eager = try invoke(runtime, receiver: source, key: requestKey, arguments: arguments) }
+        let built = eager
+        return RxRuntime.make(runtime) { runtime, emit in
+            let request = try built ?? invoke(runtime, receiver: source, key: requestKey, arguments: arguments)
+            let response = try execute(runtime, source: source, request: request)
+            guard let parseKey else {
+                _ = try emit(response)
+                return
+            }
+            let parsed = try invoke(runtime, receiver: source, key: parseKey, arguments: [response])
+            if markInitialized { runtime.payload(parsed, as: VMMangaPayload.self)?.initialized = true }
+            _ = try emit(parsed)
+        }
     }
 
-    static func defaultList(
-        _ runtime: VMRuntime,
-        source: VMValue,
-        requestKey: String,
-        requestArguments: [VMValue],
-        parseKey: String
-    ) throws -> VMValue {
-        let request = try invoke(runtime, receiver: source, key: requestKey, arguments: requestArguments)
-        let response = try execute(runtime, source: source, request: request)
-        return try invoke(runtime, receiver: source, key: parseKey, arguments: [response])
+    /// Calls a suspend member with an engine continuation. Suspend calls
+    /// complete inline here, so a real suspension is an unsupported coroutine.
+    static func invokeSuspend(_ runtime: VMRuntime, receiver: VMValue, key: String, arguments: [VMValue]) throws -> VMValue {
+        let continuation = runtime.makeNative("Lmihoncompat/Continuation;", payload: NSNull())
+        let result = try invoke(runtime, receiver: receiver, key: key, arguments: arguments + [continuation])
+        guard result.bits != runtime.coroutineSuspended.bits else {
+            throw VMJavaException("Ljava/lang/IllegalStateException;", "coroutine suspension is not supported")
+        }
+        return result
     }
 
+    /// `getMangaUpdate` default: the details and chapter list come from the
+    /// source's own `getMangaDetails`/`getChapterList`, which an extension may
+    /// override directly (lib 1.5) or through `fetch*` (lib 1.4), and which
+    /// otherwise run the request/parse hooks.
     static func defaultMangaUpdate(_ runtime: VMRuntime, source: VMValue, args: [VMValue]) throws -> VMValue {
         let manga = args[1]
         let chapters = args[2]
@@ -615,33 +754,21 @@ enum MihonAPI {
         var updatedChapters = chapters
 
         if fetchDetails {
-            let request = try invoke(
+            let details = try invokeSuspend(
                 runtime, receiver: source,
-                key: "mangaDetailsRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                key: "getMangaDetails(Leu/kanade/tachiyomi/source/model/SManga;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
                 arguments: [manga]
             )
-            let response = try execute(runtime, source: source, request: request)
-            let parsed = try invoke(
-                runtime, receiver: source,
-                key: "mangaDetailsParse(Lokhttp3/Response;)Leu/kanade/tachiyomi/source/model/SManga;",
-                arguments: [response]
-            )
-            if let payload: VMMangaPayload = runtime.payload(parsed, as: VMMangaPayload.self) {
+            if let payload: VMMangaPayload = runtime.payload(details, as: VMMangaPayload.self) {
                 payload.initialized = true
             }
-            updatedManga = parsed
+            updatedManga = details
         }
         if fetchChapters {
-            let request = try invoke(
+            updatedChapters = try invokeSuspend(
                 runtime, receiver: source,
-                key: "chapterListRequest(Leu/kanade/tachiyomi/source/model/SManga;)Lokhttp3/Request;",
+                key: "getChapterList(Leu/kanade/tachiyomi/source/model/SManga;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
                 arguments: [manga]
-            )
-            let response = try execute(runtime, source: source, request: request)
-            updatedChapters = try invoke(
-                runtime, receiver: source,
-                key: "chapterListParse(Lokhttp3/Response;)Ljava/util/List;",
-                arguments: [response]
             )
         }
 
@@ -1554,6 +1681,25 @@ enum MihonAPI {
                 throw exception
             }
             return response
+        }
+        // RxJava views of a call (lib 1.4/1.5). The call executes when the
+        // stream is subscribed; `asObservableSuccess` fails a non-2xx
+        // response with `HttpException(code)`, like `awaitSuccess`.
+        for (name, requireSuccess) in [("asObservable", false), ("asObservableSuccess", true)] {
+            okhttpExtensions.staticMethod(name, "(Lokhttp3/Call;)Lrx/Observable;") { runtime, args, _ in
+                let call = args[0]
+                return RxRuntime.make(runtime) { runtime, emit in
+                    let response = try RxRuntime.call(runtime, call, "execute()Lokhttp3/Response;")
+                    if requireSuccess,
+                       let payload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self),
+                       !(200..<300).contains(payload.code) {
+                        var exception = VMJavaException("Leu/kanade/tachiyomi/network/HttpException;", "HTTP error \(payload.code)")
+                        exception.object = runtime.makeHttpException(payload.code)
+                        throw exception
+                    }
+                    _ = try emit(response)
+                }
+            }
         }
         result.append(okhttpExtensions)
 

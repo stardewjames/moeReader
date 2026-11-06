@@ -317,6 +317,14 @@ enum ConcurrencyRuntime {
         lockInterface.method("lock", "()V") { _, _, _ in .zero }
         lockInterface.method("unlock", "()V") { _, _, _ in .zero }
         result.append(lockInterface)
+        // `Callable`: the factory `Observable.fromCallable`/`Single.defer`
+        // take, and the task type executors accept.
+        let callable = NativeClass("Ljava/util/concurrent/Callable;", superclass: nil, interfaces: [], access: DexAccess.isPublic | DexAccess.isInterface | DexAccess.isAbstract)
+        callable.methods.append(NativeMethod(
+            name: "call", signature: "()Ljava/lang/Object;", access: DexAccess.isPublic | DexAccess.isAbstract,
+            body: { _, _, _ in throw VMJavaException("Ljava/lang/AbstractMethodError;", "call()") }
+        ))
+        result.append(callable)
 
         let readWrite = NativeClass("Ljava/util/concurrent/locks/ReentrantReadWriteLock;", superclass: "Ljava/lang/Object;", interfaces: ["Ljava/io/Serializable;"])
         readWrite.method("<init>", "()V") { runtime, args, _ in

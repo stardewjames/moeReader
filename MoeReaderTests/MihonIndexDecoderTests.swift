@@ -13,7 +13,7 @@ final class MihonIndexDecoderTests: XCTestCase {
         XCTAssertEqual(index.badgeLabel, "TEST")
         XCTAssertEqual(index.signingKey, "4df6ad27c7517695915334242404309f4f7d9b70689b05d7093c483c760a5e87")
         XCTAssertEqual(index.contact?.website, "https://example.com")
-        XCTAssertEqual(index.contact?.discord, "https://discord.gg/example")
+        XCTAssertEqual(index.contact?.discord, "https://invite.example/abc")
         XCTAssertEqual(index.extensions.count, 2)
 
         let extensionValue = try XCTUnwrap(index.extensions.first)

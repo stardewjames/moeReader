@@ -646,6 +646,26 @@ final class MihonEngine: @unchecked Sendable {
             }
         }
 
+        // lib 1.5 overrides the suspend `getImage(page): Response`, lib 1.4
+        // the RxJava `fetchImage(page): Observable<Response>`. The host
+        // defaults stand for the request path below, so only an extension's
+        // own implementation is taken.
+        if let cls = runtime.classOf(source) {
+            let hostBridges: Set<String> = [
+                "Leu/kanade/tachiyomi/source/online/HttpSource;",
+                "Leu/kanade/tachiyomi/source/online/ParsedHttpSource;",
+            ]
+            let suspendKey = "getImage(Leu/kanade/tachiyomi/source/model/Page;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"
+            let fetchKey = "fetchImage(Leu/kanade/tachiyomi/source/model/Page;)Lrx/Observable;"
+            if cls.hasImplementation(key: suspendKey, excluding: hostBridges) {
+                return try image(from: try callSuspend(source, suspendKey, [page]))
+            }
+            if cls.hasImplementation(key: fetchKey, excluding: hostBridges) {
+                let observable = try MihonAPI.invoke(runtime, receiver: source, key: fetchKey, arguments: [page])
+                return try image(from: try RxRuntime.awaitSingle(runtime, observable))
+            }
+        }
+
         var request: VMValue = .null
         if let method = runtime.classOf(source)?.lookupVirtual(key: "imageRequest(Leu/kanade/tachiyomi/source/model/Page;)Lokhttp3/Request;") {
             request = try runtime.invoke(method, [source, page])
@@ -664,7 +684,11 @@ final class MihonEngine: @unchecked Sendable {
         } else {
             client = runtime.defaultMihonClient()
         }
-        let response = try runtime.executeOkHttp(request: request, client: client)
+        return try image(from: try runtime.executeOkHttp(request: request, client: client))
+    }
+
+    /// Page bytes from an image response; a non-2xx status is an error.
+    private func image(from response: VMValue) throws -> MihonEngineImage {
         guard let responsePayload: VMResponsePayload = runtime.payload(response, as: VMResponsePayload.self) else {
             throw VMJavaException("Ljava/io/IOException;", "image request produced no response")
         }

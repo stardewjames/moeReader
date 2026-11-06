@@ -68,8 +68,10 @@ backend**, chosen in Settings → Extension runtime:
   bytecode and supplies the platform surface natively. Extensions whose API use
   falls inside that surface run without any site-specific Swift code;
   `MihonCompat/README.md` lists the exact surface and the known gaps
-  (RxJava-only fetch overrides, entropy-coded zstd response bodies, merged
-  duplicate response headers, and library surface that needs Apple frameworks).
+  (time-based RxJava operators, entropy-coded zstd response bodies, merged
+  duplicate response headers, and library surface that needs Apple
+  frameworks). Sources that only override the lib-1.4/1.5 RxJava `fetch*`
+  methods run on the engine's synchronous RxJava 1 surface.
 - **Suwayomi runtime** (`SuwayomiCompat` + `SuwayomiHost`) runs a cut-down
   Suwayomi-Server on an embedded, interpreter-only HotSpot Zero JVM. It starts
   on the first source call, sends every request through the app's `URLSession`,
