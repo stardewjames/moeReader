@@ -661,13 +661,16 @@ struct PinnedHTTPClient: @unchecked Sendable {
         self.totalTimeout = totalTimeout
     }
 
-    func send(_ request: PinnedHTTPRequest) throws -> PinnedHTTPResponse {
+    /// One request, following redirects unless `followRedirects` is false, in
+    /// which case a 3xx comes back as the response.
+    func send(_ request: PinnedHTTPRequest, followRedirects: Bool = true) throws -> PinnedHTTPResponse {
         guard Self.isTransportAvailable else {
             throw PinnedHTTPError.transportUnavailable(
                 "Network framework is not available on this host; refusing to fall back to the system resolver"
             )
         }
         let deadline = Date().addingTimeInterval(totalTimeout)
+        guard followRedirects else { return try perform(request, deadline: deadline) }
         return try Self.followRedirects(request) { current in
             try self.perform(current, deadline: deadline)
         }

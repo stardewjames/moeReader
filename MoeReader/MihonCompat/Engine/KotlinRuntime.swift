@@ -796,8 +796,19 @@ enum KotlinRuntime {
             let scope = runtime.makeNative("Lkotlinx/coroutines/CoroutineScopeImpl;", payload: NSNull())
             return try runtime.callSuspend(args[1], scope)
         }
-        buildScope.staticMethod("delay", "(JLjava/util/concurrent/TimeUnit;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .zero }
-        buildScope.staticMethod("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { _, _, _ in .zero }
+        // `delay`: suspends for the time given while host events keep running
+        // (see `VMRuntime.waitWhilePumpingEvents`), then resumes with Unit.
+        buildScope.staticMethod("delay", "(JLjava/util/concurrent/TimeUnit;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            let unit = runtime.payload(args[1], as: VMTimeUnitPayload.self)?.unit ?? 2
+            let nanosPerUnit: [Int64] = [1, 1_000, 1_000_000, 1_000_000_000, 60_000_000_000, 3_600_000_000_000, 86_400_000_000_000]
+            let nanos = args[0].asInt64.multipliedReportingOverflow(by: nanosPerUnit[max(0, min(unit, 6))])
+            try runtime.waitWhilePumpingEvents(milliseconds: nanos.overflow ? Int64.max / 1_000_000 : nanos.partialValue / 1_000_000)
+            return runtime.unitValue
+        }
+        buildScope.staticMethod("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try runtime.waitWhilePumpingEvents(milliseconds: args[0].asInt64)
+            return runtime.unitValue
+        }
         buildScope.staticMethod("launch$default", "(Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lkotlinx/coroutines/CoroutineStart;Lkotlin/jvm/functions/Function2;ILjava/lang/Object;)Lkotlinx/coroutines/Job;") { runtime, args, _ in
             runtime.launchedCoroutines += 1
             _ = try runtime.callSuspend(args[3], args[0])
@@ -919,11 +930,15 @@ enum KotlinRuntime {
         result.append(awaitKt)
 
         let delayKt = NativeClass("Lkotlinx/coroutines/DelayKt;")
-        delayKt.staticMethod("delay-VtjQ1oo", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, _, _ in
-            runtime.unitValue
+        // The engine's `kotlin.time.Duration` value is plain nanoseconds (every
+        // Duration operation is native, so the encoding never leaks).
+        delayKt.staticMethod("delay-VtjQ1oo", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try runtime.waitWhilePumpingEvents(milliseconds: args[0].asInt64 / 1_000_000)
+            return runtime.unitValue
         }
-        delayKt.staticMethod("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, _, _ in
-            runtime.unitValue
+        delayKt.staticMethod("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;") { runtime, args, _ in
+            try runtime.waitWhilePumpingEvents(milliseconds: args[0].asInt64)
+            return runtime.unitValue
         }
         result.append(delayKt)
 

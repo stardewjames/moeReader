@@ -198,6 +198,8 @@ enum MihonRedirectFollower {
             // `Expires` dates contain commas of their own.
             response.headers = VMCookieJar.splitSetCookieHeaders(response.headers)
             VMCookieJar.store(headers: response.headers, for: hopURL, storage: storage)
+            // OkHttp with `followRedirects(false)`: the 3xx is the response.
+            guard current.followRedirects else { return response }
             guard let next = try PinnedRedirectPolicy.follow(
                 request: PinnedHTTPRequest(url: hopURL, method: hop.method, body: hop.body),
                 status: response.code,
@@ -347,7 +349,7 @@ final class MihonEngineHost: VMHost {
         let client = PinnedHTTPClient(resolver: .shared, cookieStorage: cookieStorage())
         let response: PinnedHTTPResponse
         do {
-            response = try client.send(pinned)
+            response = try client.send(pinned, followRedirects: request.followRedirects)
         } catch let error as PinnedHTTPError {
             throw VMJavaException("Ljava/io/IOException;", "encrypted DNS transport: \(error.description)")
         } catch let error as DoHError {

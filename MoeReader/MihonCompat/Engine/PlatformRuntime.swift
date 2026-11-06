@@ -971,6 +971,12 @@ enum PlatformRuntime {
             let unit = runtime.payload(args[0], as: VMTimeUnitPayload.self)?.unit ?? 0
             return .int64(args[1].asInt64 &* factors[max(0, min(unit, 6))] / 1_000_000_000)
         }
+        timeUnit.method("sleep", "(J)V") { runtime, args, _ in
+            let unit = runtime.payload(args[0], as: VMTimeUnitPayload.self)?.unit ?? 0
+            let millis = args[1].asInt64.multipliedReportingOverflow(by: factors[max(0, min(unit, 6))])
+            try runtime.waitWhilePumpingEvents(milliseconds: millis.overflow ? Int64.max / 1_000_000 : millis.partialValue / 1_000_000)
+            return .zero
+        }
         timeUnit.method("convert", "(JLjava/util/concurrent/TimeUnit;)J") { runtime, args, _ in
             let source = runtime.payload(args[0], as: VMTimeUnitPayload.self)?.unit ?? 0
             let target = runtime.payload(args[2], as: VMTimeUnitPayload.self)?.unit ?? 0
@@ -1340,6 +1346,11 @@ enum PlatformRuntime {
         let systemClock = NativeClass("Landroid/os/SystemClock;", superclass: "Ljava/lang/Object;")
         systemClock.staticMethod("elapsedRealtime", "()J") { _, _, _ in .int64(Int64(Date().timeIntervalSince1970 * 1000)) }
         systemClock.staticMethod("uptimeMillis", "()J") { _, _, _ in .int64(Int64(Date().timeIntervalSince1970 * 1000)) }
+        // Android's uninterruptible sleep; see `VMRuntime.waitWhilePumpingEvents`.
+        systemClock.staticMethod("sleep", "(J)V") { runtime, args, _ in
+            try runtime.waitWhilePumpingEvents(milliseconds: args[0].asInt64)
+            return .zero
+        }
         result.append(systemClock)
 
         let bundle = NativeClass("Landroid/os/Bundle;", superclass: "Ljava/lang/Object;")

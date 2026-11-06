@@ -2511,9 +2511,28 @@ enum JavaCore {
         cls.method("getId", "()J") { runtime, args, _ in
             .int64(Int64(runtime.javaIdentityHash(args[0])))
         }
-        cls.staticMethod("join", "()V") { _, _, _ in .zero }
-        cls.staticMethod("join", "(J)V") { _, _, _ in .zero }
-        cls.staticMethod("sleep", "(J)V") { _, _, _ in .zero }
+        // `start()` runs the thread to completion inline, so it has always
+        // terminated by the time anything joins it.
+        cls.method("join", "()V") { _, _, _ in .zero }
+        cls.method("join", "(J)V") { _, _, _ in .zero }
+        // See `VMRuntime.waitWhilePumpingEvents`: other "threads" (WebView
+        // callbacks, delayed Handler work) keep running during the sleep.
+        cls.staticMethod("sleep", "(J)V") { runtime, args, _ in
+            guard args[0].asInt64 >= 0 else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "timeout value is negative")
+            }
+            try runtime.waitWhilePumpingEvents(milliseconds: args[0].asInt64)
+            return .zero
+        }
+        cls.staticMethod("sleep", "(JI)V") { runtime, args, _ in
+            // Native bodies get one cell per parameter, so the nanos are args[1].
+            guard args[0].asInt64 >= 0, (0...999_999).contains(args[1].asInt32) else {
+                throw VMJavaException("Ljava/lang/IllegalArgumentException;", "timeout value is negative or nanos out of range")
+            }
+            let millis = args[0].asInt64 + (args[1].asInt32 > 0 ? 1 : 0)
+            try runtime.waitWhilePumpingEvents(milliseconds: millis)
+            return .zero
+        }
         cls.staticMethod("currentThread", "()Ljava/lang/Thread;") { runtime, _, _ in
             runtime.makeNative("Ljava/lang/Thread;", payload: VMThreadPayload())
         }

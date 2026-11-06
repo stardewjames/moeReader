@@ -55,6 +55,9 @@ struct VMHTTPRequest {
     var method: String = "GET"
     var headers: [(String, String)] = []
     var body: Data?
+    /// OkHttp's `followRedirects`: when false the transport returns the 3xx
+    /// response itself (cookies from it are still stored).
+    var followRedirects = true
 }
 
 struct VMHTTPResponse {
@@ -778,6 +781,30 @@ final class VMRuntime: @unchecked Sendable {
         pumpingHostEvents = true
         defer { pumpingHostEvents = false }
         return hostEvents.drain(waitingUpTo: seconds)
+    }
+
+    /// `Thread.sleep` and coroutine `delay`. On Android the rest of the app
+    /// keeps running while one thread waits: the page in a WebView loads, a
+    /// delayed `Handler` post fires. The engine has one thread, so the wait
+    /// keeps running host events for its duration instead of returning at
+    /// once, which is what lets a source that polls a WebView with a short
+    /// sleep see the page finish. The operation deadline still bounds it.
+    func waitWhilePumpingEvents(milliseconds: Int64) throws {
+        guard milliseconds > 0 else { return }
+        let until = Date(timeIntervalSinceNow: Double(milliseconds) / 1000)
+        while true {
+            try checkOperationDeadline()
+            let remaining = until.timeIntervalSinceNow
+            guard remaining > 0 else { return }
+            let slice = min(remaining, 0.05)
+            // Inside a host callback the queue is already being drained;
+            // nesting a second drain is not allowed, so just let time pass.
+            if pumpingHostEvents {
+                Thread.sleep(forTimeInterval: slice)
+            } else {
+                pumpHostEvents(waitingUpTo: slice)
+            }
+        }
     }
 
     private static let hostEventPumpInterval = 64

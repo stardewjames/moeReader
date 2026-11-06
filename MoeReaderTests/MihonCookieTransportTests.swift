@@ -162,6 +162,42 @@ final class MihonCookieTransportTests: XCTestCase {
         }
     }
 
+    /// OkHttp's `followRedirects(false)`: the source reads the 3xx itself
+    /// (typically its `Location`), so the transport must not take the hop,
+    /// while the hop's cookies still reach the jar.
+    func testDisabledRedirectsReturnTheRedirectResponse() throws {
+        let storage = HTTPCookieStorage.shared
+        var start = VMHTTPRequest(url: "https://\(Self.hostName)/start")
+        start.followRedirects = false
+        var calls = 0
+        let response = try MihonRedirectFollower.follow(start, storage: storage) { request in
+            calls += 1
+            return VMHTTPResponse(
+                url: request.url,
+                code: 302,
+                headers: [("Location", "/next"), ("Set-Cookie", "hop=1; Path=/")],
+                body: Data()
+            )
+        }
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(response.code, 302)
+        let target = try XCTUnwrap(URL(string: "https://\(Self.hostName)/next"))
+        XCTAssertEqual(VMCookieJar.cookies(storage: storage, for: target).map(\.name), ["hop"])
+
+        let host = Host()
+        let runtime = VMRuntime(host: host)
+        let builder = try construct(runtime, "Lokhttp3/OkHttpClient$Builder;", "()V")
+        _ = try invoke(runtime, builder, "followRedirects(Z)Lokhttp3/OkHttpClient$Builder;", [.boolean(false)])
+        let client = try invoke(runtime, builder, "build()Lokhttp3/OkHttpClient;")
+        XCTAssertFalse(try invoke(runtime, client, "followRedirects()Z").asBoolean)
+        let rebuilt = try invoke(runtime, try invoke(runtime, client, "newBuilder()Lokhttp3/OkHttpClient$Builder;"), "build()Lokhttp3/OkHttpClient;")
+        let request = runtime.makeRequest(url: "https://\(Self.hostName)/start", headers: .null, method: "GET", body: .null)
+        _ = try runtime.executeOkHttp(request: request, client: rebuilt)
+        XCTAssertEqual(host.requests.last?.followRedirects, false)
+        _ = try runtime.executeOkHttp(request: request, client: runtime.defaultMihonClient())
+        XCTAssertEqual(host.requests.last?.followRedirects, true)
+    }
+
     /// Like OkHttp, `Response.request()` is the request of the last hop: a
     /// source that checks where a redirect landed (an interstitial, a login
     /// wall, a query parameter the server added) must see the final URL.

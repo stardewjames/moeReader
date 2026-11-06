@@ -1361,6 +1361,7 @@ enum OkHttpRuntime {
             let builder = VMClientPayload()
             builder.interceptors = payload?.interceptors ?? []
             builder.networkInterceptors = payload?.networkInterceptors ?? []
+            builder.followRedirects = payload?.followRedirects ?? true
             return runtime.makeNative("Lokhttp3/OkHttpClient$Builder;", payload: builder)
         }
         client.method("cookieJar", "()Lokhttp3/CookieJar;") { runtime, _, _ in
@@ -1376,6 +1377,9 @@ enum OkHttpRuntime {
         client.method("networkInterceptors", "()Ljava/util/List;") { runtime, args, _ in
             let payload = runtime.payload(args[0], as: VMClientPayload.self)
             return runtime.makeNative("Ljava/util/ArrayList;", payload: VMListPayload(payload?.networkInterceptors ?? [], immutable: true))
+        }
+        client.method("followRedirects", "()Z") { runtime, args, _ in
+            .boolean(runtime.payload(args[0], as: VMClientPayload.self)?.followRedirects ?? true)
         }
 
         let builder = NativeClass("Lokhttp3/OkHttpClient$Builder;", superclass: "Ljava/lang/Object;")
@@ -1418,7 +1422,12 @@ enum OkHttpRuntime {
         builder.method("connectionSpecs", "(Ljava/util/List;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("sslSocketFactory", "(Ljavax/net/ssl/SSLSocketFactory;Ljavax/net/ssl/X509TrustManager;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("sslSocketFactory$default", "(Lokhttp3/OkHttpClient$Builder;Ljavax/net/ssl/SSLSocketFactory;Ljavax/net/ssl/X509TrustManager;ILjava/lang/Object;)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
-        builder.method("followRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
+        builder.method("followRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { runtime, args, _ in
+            try runtime.payloadBox(args[0], as: VMClientPayload.self).followRedirects = args[1].asBoolean
+            return args[0]
+        }
+        // The transport never moves an HTTPS request onto plain HTTP, so the
+        // cross-scheme switch has nothing left to permit.
         builder.method("followSslRedirects", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("retryOnConnectionFailure", "(Z)Lokhttp3/OkHttpClient$Builder;") { _, args, _ in args[0] }
         builder.method("build", "()Lokhttp3/OkHttpClient;") { runtime, args, _ in
@@ -1426,6 +1435,7 @@ enum OkHttpRuntime {
             let result = VMClientPayload()
             result.interceptors = payload?.interceptors ?? []
             result.networkInterceptors = payload?.networkInterceptors ?? []
+            result.followRedirects = payload?.followRedirects ?? true
             return runtime.makeNative("Lokhttp3/OkHttpClient;", payload: result)
         }
 
@@ -2787,10 +2797,10 @@ extension VMRuntime {
             )
             return try invoke(method, [interceptor, chainValue])
         }
-        return try performHttp(request: request)
+        return try performHttp(request: request, followRedirects: client?.followRedirects ?? true)
     }
 
-    func performHttp(request: VMValue) throws -> VMValue {
+    func performHttp(request: VMValue, followRedirects: Bool = true) throws -> VMValue {
         guard let payload = payload(request, as: VMRequestPayload.self) else {
             throw VMJavaException("Ljava/lang/IllegalArgumentException;", "invalid request")
         }
@@ -2833,7 +2843,8 @@ extension VMRuntime {
             url: canonicalURL,
             method: payload.method,
             headers: headers,
-            body: body
+            body: body,
+            followRedirects: followRedirects
         )
         var response: VMHTTPResponse
         // The response's own URL is the final hop; storing against the original
@@ -2855,7 +2866,8 @@ extension VMRuntime {
                     url: canonicalURL,
                     method: payload.method,
                     headers: retryHeaders,
-                    body: body
+                    body: body,
+                    followRedirects: followRedirects
                 )
                 response = try host.performRequest(vmRequest)
                 storeResponseCookies(response)

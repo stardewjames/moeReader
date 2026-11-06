@@ -59,6 +59,48 @@ final class MihonRuntimeSemanticsTests: XCTestCase {
         XCTAssertEqual(runs, 2)
     }
 
+    /// `Thread.sleep` and coroutine `delay` wait for real, and other work keeps
+    /// running meanwhile, as on Android where only the sleeping thread blocks:
+    /// a source that polls (`while (!loaded) delay(100)`) sees a delayed
+    /// `Handler` post (or a WebView callback) complete during its wait.
+    func testSleepAndDelayWaitWhileRunningPostedWork() throws {
+        let runtime = VMRuntime()
+        var runs = 0
+        let runnableClass = NativeClass(
+            "Lmihoncompat/test/SleepRunnable;",
+            superclass: "Ljava/lang/Object;",
+            interfaces: ["Ljava/lang/Runnable;"]
+        )
+        runnableClass.method("run", "()V") { _, _, _ in
+            runs += 1
+            return .zero
+        }
+        runtime.nativeClasses[runnableClass.descriptor] = runnableClass
+        let runnable = runtime.makeNative(runnableClass.descriptor, payload: NSNull())
+        let handler = try allocate(runtime, "Landroid/os/Handler;")
+        _ = try invoke(runtime, handler, "<init>()V")
+
+        _ = try invoke(runtime, handler, "postDelayed(Ljava/lang/Runnable;J)Z", [runnable, .int64(30), .zero])
+        let thread = try runtime.linkClass("Ljava/lang/Thread;")
+        let sleep = try XCTUnwrap(thread.lookupStatic("sleep", "(J)V"))
+        let started = Date()
+        _ = try runtime.invoke(sleep, [.int64(120), .zero])
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.11)
+        XCTAssertEqual(runs, 1, "the delayed post ran while the caller slept")
+
+        _ = try invoke(runtime, handler, "postDelayed(Ljava/lang/Runnable;J)Z", [runnable, .int64(30), .zero])
+        let delayKt = try runtime.linkClass("Lkotlinx/coroutines/DelayKt;")
+        let delay = try XCTUnwrap(delayKt.lookupStatic("delay", "(JLkotlin/coroutines/Continuation;)Ljava/lang/Object;"))
+        let continuation = runtime.makeNative("Lmihoncompat/Continuation;", payload: NSNull())
+        let result = try runtime.invoke(delay, [.int64(120), .zero, continuation])
+        XCTAssertEqual(result.bits, runtime.unitValue.bits, "delay resumes with Unit, never COROUTINE_SUSPENDED")
+        XCTAssertEqual(runs, 2)
+
+        XCTAssertThrowsError(try runtime.invoke(sleep, [.int64(-1), .zero])) { error in
+            XCTAssertEqual((error as? VMJavaException)?.classDescriptor, "Ljava/lang/IllegalArgumentException;")
+        }
+    }
+
     /// `withTimeout(timeout, block)` runs the block; the caller's continuation
     /// (the last argument) must not be resumed in its place.
     func testWithTimeoutRunsTheBlockNotTheContinuation() throws {

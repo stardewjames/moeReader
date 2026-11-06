@@ -109,10 +109,16 @@ error instead of quietly falling back to the system resolver.
 3. The metadata class is instantiated. If it is a `SourceFactory`,
    `createSources()` is called; if it is itself a `Source`, it is used directly.
 4. Source calls run on the engine's serial queue. Suspend entry points are
-   driven synchronously: native HTTP, delay and context switches complete
-   inline; deferred waits drain platform events and scheduled `Handler` work
-   until completion or the operation deadline. An unsupported asynchronous
-   suspension is reported as an error instead of hanging.
+   driven synchronously: native HTTP and context switches complete inline;
+   deferred waits drain platform events and scheduled `Handler` work until
+   completion or the operation deadline. `delay`, `Thread.sleep`,
+   `TimeUnit.sleep` and `SystemClock.sleep` wait for the requested time and
+   keep draining those events meanwhile, as other Android threads would keep
+   running, so a source that polls a WebView with short sleeps sees the page
+   finish instead of spinning. An unsupported asynchronous suspension is
+   reported as an error instead of hanging. `OkHttpClient.Builder.followRedirects(false)`
+   reaches the transport: the 3xx comes back to the source (its cookies are
+   still stored) on both the URLSession and the encrypted-DNS path.
 5. When a source does not override a suspend call, the suspend default awaits
    the deprecated RxJava `fetch*` counterpart, as Mihon's does, so a
    lib-1.4/1.5 source whose only override is `fetch*` (a deep-link search, an
